@@ -302,6 +302,7 @@ static void guest_deaths_are_survived(const char *path) {
 		{ "ExitNow", "exited (status 7)" },
 		{ "UnknownSyscall", "system call 4242" },
 		{ "Deadlock", "deadlock" },
+		{ "GuardFault", "illegal instruction" },
 	};
 	char why[512];
 	for (size_t i = 0; i < sizeof deaths / sizeof deaths[0]; i++) {

@@ -324,6 +324,10 @@ void mb_tripguard_set_guest_fault_handler(mb_guest_fault_fn fn);
 void mb_tripguard_ensure_altstack(void);  /* per-thread; see tripguard.c */
 #endif
 void mb_tripguard_unregister(mb_block *b);
+/* Whether a host page may be read right now (guard pages: no). Raw syscalls
+ * only, no stdio or allocation: this runs inside the fault handler (see
+ * tripguard.c). */
+bool mb_page_readable(uintptr_t p);
 /* The live machine's layout, so an unhandled fault can name the region it
  * landed in rather than a page number somebody has to work out by hand. */
 void mb_tripguard_set_layout(const mb_layout *l);

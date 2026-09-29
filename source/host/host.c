@@ -10,6 +10,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#ifndef _WIN32
+#include <pthread.h>
+#include <unistd.h>
+#endif
 
 struct mb_host {
 	mb_fs *fs;
@@ -195,6 +199,24 @@ static bool record_death(mb_context *c, const char *fmt, va_list ap) {
 	}
 	if (c == NULL) return false;
 	c->dead = 1;
+	/* Death-site backtrace (host VA == guest VA). Pages are checked first:
+	 * a dying thread's rsp may point at a guard page, and a nested fault
+	 * in here would lose the report it is part of. */
+	{
+		uintptr_t rsp = c->guest_rsp;
+		uint32_t atid = h && h->threads ? mb_threads_active_tid(h->threads) : 0;
+		mb_diag("  active tid=%u rsp=%lx stack:", atid, (unsigned long)rsp);
+		char sb[2048]; size_t so = 0;
+		for (int i = 0; i < 96 && so + 20 < sizeof sb; i++) {
+			uintptr_t a = rsp + (uintptr_t)i * sizeof(uintptr_t);
+			/* pageStarts, not iteration counts: rsp is not page-aligned */
+			if ((i == 0 || (a & MB_PAGEMASK) == 0) && !mb_page_readable(a)) break;
+			so += (size_t)snprintf(sb + so, sizeof sb - so, " %lx",
+			                       (unsigned long)*(const uintptr_t *)a);
+		}
+		sb[so] = '\0';
+		mb_diag("%s\n", sb);
+	}
 	const bool escapable = c->esc_rsp != 0;
 	mb_diag(escapable
 		? "  the call returns to the host, and the machine runs nothing until a state is loaded\n"
@@ -769,13 +791,39 @@ void mb_host_destroy(mb_host *h) {
 
 uintptr_t mb_host_proc_addr_raw(mb_host *h, const char *name);
 
+/* Spin sampler (MB_SAMPLE_SECS=N). A helper thread prints the active green
+ * thread + guest rsp + stack top every N seconds. Racy reads are fine for
+ * diagnosis (may tear). Locates non-syscall spins. POSIX-only, env-gated,
+ * and unobservable by the guest. */
+#ifndef _WIN32
+static struct mb_host *sample_h;
+static pthread_t sample_thr;
+static int sample_started;
+static void *sample_fn(void *arg) {
+	(void)arg;
+	const char *e = getenv("MB_SAMPLE_SECS");
+	int secs = e ? atoi(e) : 0;
+	if (secs <= 0) return NULL;
+	for (;;) {
+		sleep((unsigned)secs);
+		struct mb_host *h = sample_h;
+		if (!h || !h->active) continue;
+		uint64_t *sp = (uint64_t *)h->context.guest_rsp;
+		fprintf(stderr, "[S] active=%u rsp=%lx stack:",
+		        mb_threads_active_tid(h->threads),
+		        (unsigned long)h->context.guest_rsp);
+		for (int i = 0; i < 12; i++) fprintf(stderr, " %lx", (unsigned long)sp[i]);
+		fprintf(stderr, "\n");
+	}
+	return NULL;
+}
+#endif
 void mb_host_activate(mb_host *h) {
 #ifndef _WIN32
 	/* guest code will run on THIS thread; make signal delivery on a faulting
 	 * tracked stack page possible (see tripguard.c) */
 	mb_tripguard_ensure_altstack();
-#endif
-	/* A guest that exports GuestFaultHandler wants to hear about faults on
+#endif	/* A guest that exports GuestFaultHandler wants to hear about faults on
 	 * pages it protected itself (see tripguard.c) - on BOTH platforms: the
 	 * Windows handler is the vectored one, and a guest whose handler is not
 	 * registered there dies on its first watched write. The RAW address: it
@@ -783,6 +831,13 @@ void mb_host_activate(mb_host *h) {
 	 * guest, so the host-to-guest adapter (a host thread entering) would
 	 * find no entry context to save. The guest ABI is spelled in the type. */
 	mb_tripguard_set_guest_fault_handler((mb_guest_fault_fn)mb_host_proc_addr_raw(h, "GuestFaultHandler"));
+#ifndef _WIN32
+	if (!sample_started && getenv("MB_SAMPLE_SECS")) {
+		sample_started = 1; sample_h = h;
+		pthread_create(&sample_thr, NULL, sample_fn, NULL);
+		pthread_detach(sample_thr);
+	}
+#endif
 	if (h->active) return;
 	mb_prepare_thread();
 	h->context.host_ptr = (uintptr_t)h;

@@ -15,6 +15,7 @@ uintptr_t mb_threads_exit(mb_threads *t, mb_context *c);
 uintptr_t mb_threads_yield(mb_threads *t, mb_context *c);
 uint32_t  mb_threads_set_tid_address(mb_threads *t, uintptr_t addr);
 uint32_t  mb_threads_get_tid(mb_threads *t);
+uint32_t  mb_threads_active_tid(mb_threads *t);
 
 bool          mb_threads_hold_stack_unmap(mb_threads *t, mb_range r);
 bool          mb_threads_take_held_unmap(mb_threads *t, mb_range *out);

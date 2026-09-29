@@ -140,6 +140,18 @@ static uintptr_t swap_to_next(mb_threads *t, mb_context *c, uintptr_t ret) {
 static uintptr_t park_me(mb_threads *t, mb_context *c, uintptr_t ret, uintptr_t addr) {
 	queue_push(get_or_make_queue(t, addr), t->active_tid);
 	find_thread(t, t->active_tid)->state = T_WAITING;
+	/* Wait-site backtrace (host VA == guest VA), debug only. Pages are
+	 * checked first: a parked thread's rsp is not trusted. */
+	if (mb_tdbg()) {
+		uint64_t *sp = (uint64_t *)c->guest_rsp;
+		fprintf(stderr, "[T] park tid=%u rsp=%lx stack:", t->active_tid, (unsigned long)c->guest_rsp);
+		for (int i = 0; i < 64; i++) {
+			uintptr_t a = (uintptr_t)&sp[i];
+			if ((i == 0 || (a & MB_PAGEMASK) == 0) && !mb_page_readable(a)) break;
+			fprintf(stderr, " %lx", (unsigned long)sp[i]);
+		}
+		fprintf(stderr, "\n");
+	}
 	return swap_to_next(t, c, ret);
 }
 static void park_other(mb_threads *t, uintptr_t addr, uint32_t tid) {
@@ -262,6 +274,7 @@ uint32_t mb_threads_set_tid_address(mb_threads *t, uintptr_t addr) {
 	return g->tid;
 }
 uint32_t mb_threads_get_tid(mb_threads *t) { return t->active_tid; }
+uint32_t mb_threads_active_tid(mb_threads *t) { return t ? t->active_tid : 0; }
 bool mb_threads_has_thread(mb_threads *t, uint32_t tid) { return find_thread(t, tid) != NULL; }
 void mb_threads_reset_active(mb_threads *t) { t->active_tid = 1; }
 uintptr_t mb_threads_yield(mb_threads *t, mb_context *c) { return swap_to_next(t, c, sok(0)); }
