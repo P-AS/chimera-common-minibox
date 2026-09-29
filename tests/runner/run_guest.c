@@ -385,6 +385,15 @@ int main(int argc, char **argv) {
 		CHECK(after_syscall == 0);
 		CHECK(after_extcall == 0);
 	}
+	/* calls that used to stop the machine (spec v2.2): each must answer
+	 * and leave the machine alive. */
+	{
+		typedef int (MB_GUEST_ABI *int_fn)(void);
+		CHECK(((int_fn)proc(h, "SigactionAccepted"))() == 1);
+		CHECK(((int_fn)proc(h, "PipeRefused"))() == 1);
+		CHECK(((int_fn)proc(h, "GetrusageZeroed"))() == 1);
+		CHECK(((int_fn)proc(h, "NullCloneRefused"))() == 1);
+	}
 	STAGE("Init returned");
 	seal_and_activate(h);
 
