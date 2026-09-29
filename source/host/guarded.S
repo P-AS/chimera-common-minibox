@@ -132,8 +132,16 @@ mb_guarded_call:
 	movq %rsp, CTX_ESC_RSP(%r10)
 	incq CTX_CALLS(%r10)
 
-	/* the host's %fs, where the syscall dispatcher and the way out both read it */
-	cmpb $0, CTX_FS_SWAP(%r10)
+	/* the host's %fs, where the syscall dispatcher and the way out both read
+	 * it - parked whenever the probe says the instructions exist, not only
+	 * for swapping guests: a repair may have installed the guest's thread
+	 * pointer meanwhile, and the way out must put the host's back. */
+#ifdef __ELF__
+	movq mb_fs_swap@GOTPCREL(%rip), %rax
+	cmpb $0, (%rax)
+#else
+	cmpb $0, mb_fs_swap(%rip)
+#endif
 	je 1f
 	rdfsbase %rax
 	movq %rax, CTX_HOST_FS(%r10)
@@ -159,7 +167,15 @@ mb_guarded_call:
 	movq FRAME_CTX(%rsp), %r10
 	movq FRAME_PREV_ESC(%rsp), %r11
 	movq %r11, CTX_ESC_RSP(%r10)
-	cmpb $0, CTX_FS_SWAP(%r10)
+	/* the host's %fs back, whenever entry parked it: what entry parked is
+	 * the truth, whether the guest ever swapped or a repair installed its
+	 * pointer. */
+#ifdef __ELF__
+	movq mb_fs_swap@GOTPCREL(%rip), %r11
+	cmpb $0, (%r11)
+#else
+	cmpb $0, mb_fs_swap(%rip)
+#endif
 	je 3f
 	movq %rax, %r11
 	movq CTX_HOST_FS(%r10), %rax

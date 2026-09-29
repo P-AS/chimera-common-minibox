@@ -212,16 +212,42 @@ static bool drop_fs_for_test(void) {
 	return cached == 1;
 }
 
+/* Is the faulting instruction itself an %fs access? That is a property of
+ * the bytes at rip, not of any register - which matters, because the
+ * register we would otherwise ask (%fs) is the one under suspicion in here.
+ * Legacy prefixes precede any REX, opcode or VEX/EVEX byte, so the first
+ * non-legacy byte ends the search. Pure reads, no libc - and no stack
+ * protector for the same reason as below. */
+__attribute__((no_stack_protector))
+static bool insn_has_fs_prefix(uintptr_t rip) {
+	const uint8_t *p = (const uint8_t *)rip;
+	for (int i = 0; i < 5; i++) {
+		uint8_t b = p[i];
+		if (b == 0x64) return true;
+		if (b == 0x65 || b == 0x66 || b == 0x67 || b == 0xF0 || b == 0xF2
+		    || b == 0xF3 || b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26)
+			continue;
+		return false;
+	}
+	return false;
+}
+
+/* Whether the bytes at rip can be read at all: same question as the maps
+ * scan, which needs no thread pointer. An unreadable rip is not a repair
+ * either way, it is a wild jump, and looking at it must not fault. */
+__attribute__((no_stack_protector))
+static bool rip_bytes_readable(uintptr_t rip) { return mb_page_readable(rip); }
+
 /* Leaving a fault handler back into guest code: install the guest's thread
- * pointer, whatever the register happens to hold now.
- *
- * The report has to be made from the HOST's %fs - fprintf reads its own thread
- * locals through %fs on Linux - which is why it is sandwiched here rather than
- * written where it reads more naturally. On Windows the host's is 0, and that
- * is the correct value to hold while host code runs there. */
+ * pointer, whatever the register happens to hold now. The install comes
+ * first, because at_fault may be 0 - a base the OS dropped - under which no
+ * libc call survives, including the diagnostic below; the install is what
+ * makes the rest safe. Reporting under the installed pointer is fine: it is
+ * mapped and stable, which is all fprintf needs. */
 __attribute__((no_stack_protector))
 static void mb_restore_guest_fs(uintptr_t at_fault) {
 	if (drop_fs_for_test()) at_fault = 0;
+	mb_wrfsbase(mb_guest_ctx->thread_area);
 	/* What %fs held WHEN THE GUEST FAULTED, sampled by the caller before it
 	 * swapped anything - reading it here would only report the handler's own
 	 * swap back to the host.
@@ -233,13 +259,11 @@ static void mb_restore_guest_fs(uintptr_t at_fault) {
 		static bool reported = false;
 		if (!reported) {   /* once: this path runs thousands of times a second */
 			reported = true;
-			mb_wrfsbase(mb_guest_ctx->host_fs);
 			fprintf(stderr, "miniBox: the OS does not keep the guest %%fs (it is "
 			                "lost at a context switch, not at a fault); reinstalling it\n");
 			fflush(stderr);
 		}
 	}
-	mb_wrfsbase(mb_guest_ctx->thread_area);
 }
 #endif
 
@@ -494,18 +518,43 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
 	 * frontend has many threads faulting for their own reasons, and one of
 	 * them must be left exactly as it arrived. Asking the rip rather than
 	 * rdfsbase also means this still works when %fs has already been lost -
-	 * see the Windows handler below, where that is the normal case. */
-	const bool guest_rip = mb_guest_ctx && mb_guest_ctx->fs_swap
+	 * see the Windows handler below, where that is the normal case.
+	 * No %fs instruction runs here unless the probe said they exist
+	 * (mb_fs_swap): on a host without them this whole block is skipped. */
+	const bool guest_rip = mb_fs_swap && mb_guest_ctx
 	                       && rip_in_guest((uintptr_t)((ucontext_t *)ucontext)
 	                                       ->uc_mcontext.gregs[REG_RIP]);
 	const uintptr_t fs_at_fault = guest_rip ? mb_rdfsbase() : 0;
 	if (guest_rip && mb_guest_ctx->host_fs) mb_wrfsbase(mb_guest_ctx->host_fs);
+	const uintptr_t fault = (uintptr_t)info->si_addr;
+	const uintptr_t rip = (uintptr_t)((ucontext_t *)ucontext)->uc_mcontext.gregs[REG_RIP];
+	/* A %fs access with the base already lost is the repair, not a fault to
+	 * handle: reinstall and resume the instruction, exactly as the Windows
+	 * path does. Three facts have to hold together: the base is neither the
+	 * live thread pointer nor its musl stand-in, the faulting instruction
+	 * actually reads through %fs, and its address belongs to no block - a
+	 * dropped base adds its displacement to nothing, so the address is
+	 * small or kernel-high, never a guest range. Anything else - including
+	 * every trip fault, which must reach trip() below - is normal handling,
+	 * not a repair. In particular neither the register nor the parked base
+	 * can name the loss on their own: where the OS hands the handler a
+	 * valid base anyway, a faulting %fs access reads TEB, and only the
+	 * instruction says what it was. A fault that arrives back with %fs
+	 * already correct is the guest's own and goes below as it always did -
+	 * which is what bounds the retry to one pass. */
+	if (guest_rip && fs_at_fault != mb_guest_ctx->thread_area
+	    && fs_at_fault != mb_early_tp && owner_of(fault) == NULL
+	    && rip_bytes_readable(rip) && insn_has_fs_prefix(rip)) {
+		mb_restore_guest_fs(fs_at_fault);
+		return;
+	}
 	handler_inner(sig, info, ucontext);
 	/* Back to the guest's, from the value the entry thunk recorded rather than
 	 * from whatever was in the register on the way in. Same value on a host
 	 * that preserves the base across a signal, and the right one on a host
-	 * that does not. */
-	if (guest_rip) mb_restore_guest_fs(fs_at_fault);
+	 * that does not. Only for guests that own %fs: the rest keep the host's,
+	 * and rewriting it here would trade it for the thread pointer. */
+	if (guest_rip && mb_guest_ctx->fs_swap) mb_restore_guest_fs(fs_at_fault);
 #else
 	handler_inner(sig, info, ucontext);
 #endif
@@ -850,20 +899,37 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS *ep) {
 __attribute__((no_stack_protector))
 static LONG CALLBACK veh_fs(EXCEPTION_POINTERS *ep) {
 #ifdef MB_HAVE_FSBASE
-	const bool guest_rip = mb_guest_ctx && mb_guest_ctx->fs_swap
+	const bool guest_rip = mb_fs_swap && mb_guest_ctx
 	                       && rip_in_guest((uintptr_t)ep->ContextRecord->Rip);
 	const uintptr_t fs_at_fault = guest_rip ? mb_rdfsbase() : 0;
+	const uintptr_t fault = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+	const uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
 	/* The real register, not drop_fs_for_test's pretend one: that hook forces
 	 * the answer unconditionally, and a forced answer here would re-fault into
 	 * the same retry for ever. The cost is that this path is exercised on
-	 * Windows only, which is also the only place it can happen. */
+	 * Windows only, which is also the only place it can happen.
+	 * Three facts have to hold together: the base is neither the live thread
+	 * pointer nor its musl stand-in, the faulting instruction actually reads
+	 * through %fs, and its address belongs to no block - a dropped base adds
+	 * its displacement to nothing, so the address is small or kernel-high,
+	 * never a guest range. Anything else - including every trip fault, which
+	 * must reach veh_inner below - is normal handling, not a repair. In
+	 * particular the register alone cannot name the loss: the handler runs
+	 * with a valid base of its own here, so a faulting %fs access reads TEB,
+	 * and only the instruction says what it was. A fault that arrives back
+	 * with %fs already correct is the guest's own and goes below as it
+	 * always did - which is what bounds the retry to one pass. */
 	if (guest_rip && fs_at_fault != mb_guest_ctx->thread_area
-	    && fs_at_fault != mb_early_tp) {
+	    && fs_at_fault != mb_early_tp && owner_of(fault) == NULL
+	    && rip_bytes_readable(rip) && insn_has_fs_prefix(rip)) {
 		mb_restore_guest_fs(fs_at_fault);
 		return EXCEPTION_CONTINUE_EXECUTION;
 	}
 	LONG r = veh_inner(ep);
-	if (guest_rip && r == EXCEPTION_CONTINUE_EXECUTION) mb_restore_guest_fs(fs_at_fault);
+	/* As above, for the fault a handled trip or ask leaves behind: only for
+	 * guests that own %fs, whose base this restores. */
+	if (guest_rip && mb_guest_ctx->fs_swap && r == EXCEPTION_CONTINUE_EXECUTION)
+		mb_restore_guest_fs(fs_at_fault);
 	return r;
 #else
 	return veh_inner(ep);

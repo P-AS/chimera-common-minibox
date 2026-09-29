@@ -5,6 +5,7 @@
  * file read), sealed/invisible memory, a guest->host callback, savestate
  * round-trip + determinism, and the error/poison paths. */
 #include "minibox.h"
+#include <assert.h>
 /* For the two checks on the fault handler's own state: what it would name a
  * region with, and (on Windows) pointing it somewhere it cannot read on
  * purpose. Both are internal to the host, and a test is the one caller. */
@@ -235,6 +236,103 @@ static int handler_does_not_recurse(const char *self, const char *guest) {
 }
 #endif
 
+#ifndef _WIN32
+/* Can this machine run a real guest-side drop (guest WRFSBASE(0))? Some
+ * kernels (WSL2) kill it despite the CPU flag - and the base is already 0
+ * when the fault arrives, so nothing libc may run until %fs is put back.
+ * Probed INLINE, not forked: forked children observably survive it here
+ * while the real path dies, so a fork probe would lie. Saves the live base
+ * with rdfsbase and restores it with a RAW arch_prctl (no libc call
+ * survives %fs = 0, not even the signal restore). */
+#include <sys/prctl.h>
+#ifndef ARCH_SET_FS
+#define ARCH_SET_FS 0x1002
+#endif
+static uintptr_t probe_live_fs;
+static sigjmp_buf probe_env;
+static volatile int probe_faulted;
+static void probe_restore_fs(void) {
+	__asm__ volatile ("mov $158, %%rax\n\t"   /* __NR_arch_prctl */
+	                  "mov %1, %%rdi\n\t"
+	                  "mov %0, %%rsi\n\t"
+	                  "syscall"
+	                  :: "r" (probe_live_fs), "i" (ARCH_SET_FS)
+	                  : "rax", "rdi", "rsi", "rcx", "r11", "memory");
+}
+static void probe_died(int sig) {
+	(void)sig;
+	probe_faulted = 1;
+	probe_restore_fs();
+	siglongjmp(probe_env, 1);
+}
+static bool guest_wrfsbase0_works(void) {
+	__asm__ volatile ("rdfsbase %0" : "=r" (probe_live_fs) :: "memory");
+	struct sigaction sa, old_segv, old_ill;
+	memset(&sa, 0, sizeof sa);
+	sa.sa_handler = probe_died;
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGSEGV, &sa, &old_segv);
+	sigaction(SIGILL, &sa, &old_ill);
+	bool ok = true;
+	probe_faulted = 0;
+	if (sigsetjmp(probe_env, 1) == 0) {
+		__asm__ volatile ("wrfsbase %0" :: "r" (0ul) : "memory");
+	}
+	/* A fault anywhere in there means this kernel cannot do a guest-side
+	 * drop, even if the write itself went through: the repair under test
+	 * needs the fault it causes, delivered cleanly. */
+	ok = !probe_faulted;
+	probe_restore_fs();
+	sigaction(SIGSEGV, &old_segv, NULL);
+	sigaction(SIGILL, &old_ill, NULL);
+	return ok;
+}
+
+/* The child half of the dropped-%fs check: what Windows does to the base at
+ * every scheduler quantum - the base reads 0 at a %fs access mid-guest, with
+ * the entry-parked host base still valid to check against. A fault in guest
+ * code must reinstall the live thread pointer and retry (once), even though
+ * this guest carries no PT_TLS and the host never swaps; the host's own base
+ * and the value read must be identical before and after. Then a genuine fault
+ * (WildWrite) must still kill the machine.
+ * Linux-only: the drop it simulates cannot happen here. */
+static int fs_repair_child(const char *guest) {
+	mb_return r;
+	if (!guest_wrfsbase0_works()) {
+		fprintf(stderr, "[fsrepair] SKIP: this kernel kills WRFSBASE(0); "
+		                "the test needs a real guest-side drop\n");
+		return 0;
+	}
+	mb_host *h = make_host(guest, 0xABCD);
+	wbx_activate_host(h, &r);
+	typedef uint64_t (MB_GUEST_ABI *u64_fn)(void);
+	typedef uint32_t (MB_GUEST_ABI *alive_fn)(void);
+	typedef void (MB_GUEST_ABI *void_fn)(void);
+	u64_fn FsProbe = (u64_fn)proc(h, "FsProbe");
+	u64_fn ClobberAndProbe = (u64_fn)proc(h, "ClobberAndProbe");
+	alive_fn Alive = (alive_fn)proc(h, "Alive");
+	uint64_t v1 = FsProbe();
+	CHECK(v1 != 0);
+	const uintptr_t f0 = host_fs_base();
+	CHECK(f0 != 0);
+	uint64_t v2 = ClobberAndProbe();
+	CHECK(Alive() == 0xA11FE);   /* survived: without the repair this is refused (0) */
+	uint64_t v3 = FsProbe();
+	CHECK(v3 == v1);             /* the host base, intact across the episode */
+	CHECK(host_fs_base() == f0); /* ...in the register too */
+	fprintf(stderr, "[fsrepair] v1=%llx v2=%llx v3=%llx\n",
+	        (unsigned long long)v1, (unsigned long long)v2, (unsigned long long)v3);
+	void *p = malloc(1024); CHECK(p != NULL); free(p);   /* host TLS works */
+	((void_fn)proc(h, "WildWrite"))();
+	char why[512];
+	wbx_get_death(h, why, sizeof why, &r);
+	CHECK(r.data == 1);
+	CHECK(Alive() == 0);   /* refused: a genuine fault still kills */
+	wbx_destroy_host(h, &r);
+	return fails != 0;
+}
+#endif
+
 /* A guest that aborts must leave its reason in the diagnostic log: the death
  * named as an abort, and what the guest last wrote to stderr. */
 static int guest_abort_is_reported(const char *self, const char *guest) {
@@ -302,7 +400,13 @@ static void guest_deaths_are_survived(const char *path) {
 		{ "ExitNow", "exited (status 7)" },
 		{ "UnknownSyscall", "system call 4242" },
 		{ "Deadlock", "deadlock" },
+#ifndef _WIN32
+		/* Linux-only: faulting with rsp in a guard page needs the fault
+		 * handler on an alternate signal stack to report anything at all.
+		 * VEH has no altstack - the nested fault takes the process with no
+		 * report - so this cannot pass on Windows by construction. */
 		{ "GuardFault", "illegal instruction" },
+#endif
 	};
 	char why[512];
 	for (size_t i = 0; i < sizeof deaths / sizeof deaths[0]; i++) {
@@ -343,9 +447,24 @@ int main(int argc, char **argv) {
 	if (argc > 2 && strcmp(argv[1], "--abort-child") == 0) return abort_child(argv[2]);
 #ifndef _WIN32
 	if (argc > 2 && strcmp(argv[1], "--host-fault-child") == 0) return host_fault_child(argv[2]);
+	if (argc > 2 && strcmp(argv[1], "--fs-repair-child") == 0) return fs_repair_child(argv[2]);
 #else
 	if (argc > 2 && strcmp(argv[1], "--handler-recursion-child") == 0) return handler_recursion_child(argv[2]);
 #endif
+	if (argc > 2 && strcmp(argv[1], "--probe-off") == 0) {
+		/* Probe forced off before anything initializes: the FSGSBASE
+		 * instructions must be unreachable, so the whole standard flow
+		 * below has to pass without them. Cross-platform (the Windows
+		 * suite runs this too). */
+#ifdef _WIN32
+		_putenv_s("MB_NO_FSGSBASE", "1");
+#else
+		setenv("MB_NO_FSGSBASE", "1", 1);
+#endif
+		assert(!mb_fsbase_ok());
+		assert(!mb_fs_swap);
+		argv[1] = argv[2]; argc--;   /* consume the flag; argv[0] stays self */
+	}
 	const char *path = argc > 1 ? argv[1] : "guest.wbx";
 	mb_return r;
 

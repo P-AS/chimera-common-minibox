@@ -739,7 +739,12 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 	 * it its own %fs; every C/C++ guest on the waterbox musl uses %gs and is
 	 * left exactly as it was. */
 #ifdef MB_HAVE_FSBASE
-	h->context.fs_swap = mb_elf_has_tls(h->elf) && mb_fsbase_ok() && !getenv("MB_NO_FS_SWAP");
+	/* Eager, not lazy: the global probe result gates the entry park and the
+	 * fault repair for EVERY guest, and C's && would otherwise never run it
+	 * for a guest with no PT_TLS - leaving the gates at their zero value
+	 * while the instructions would have worked. */
+	{ const bool fs_ok = mb_fsbase_ok();
+	  h->context.fs_swap = mb_elf_has_tls(h->elf) && fs_ok && !getenv("MB_NO_FS_SWAP"); }
 	/* Said once, unprompted, because it decides whether a guest carrying its own
 	 * thread locals can work at all - and when it is wrong the failure is a
 	 * crash with nothing to connect it to. A guest with no TLS says nothing. */
