@@ -66,6 +66,7 @@ enum { LINUX_ENOSYS = 38 };
 
 #define MAP_ANONYMOUS 0x20
 #define MAP_STACK 0x20000
+#define MAP_FIXED 0x10
 #define MAP_FIXED_NOREPLACE 0x100000
 #define MREMAP_MAYMOVE 1
 #define MREMAP_FIXED 2
@@ -377,8 +378,10 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			mb_range r = { a1, (a2 + 0xFFF) & ~(uintptr_t)0xFFF };
 			/* v3: a bare hint is honoured when those pages are Free, and the
 			 * call is placed best-fit otherwise (v2 keeps mapping it fixed).
-			 * MAP_FIXED_NOREPLACE keeps today's rule in both. */
-			if (mb_threads_spec(h->threads) == 3 && a1 != 0 && !no_replace && !mb_block_range_is_free(h->block, r)) r.start = 0;
+			 * MAP_FIXED is not a hint: it maps at the address, discarding
+			 * overlap, in both versions. MAP_FIXED_NOREPLACE keeps today's
+			 * rule in both. */
+			if (mb_threads_spec(h->threads) == 3 && a1 != 0 && !no_replace && (flags & MAP_FIXED) == 0 && !mb_block_range_is_free(h->block, r)) r.start = 0;
 			mb_sword res = mb_block_mmap(h->block, r, prot, h->layout.mmap_arena, no_replace);
 			/* A request bigger than the whole arena is not a tight fit, it is a
 			 * mistake - a corrupted size, or a reservation nobody sized against

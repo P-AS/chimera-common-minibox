@@ -251,6 +251,15 @@ ECL_EXPORT int V3HintHonored(void) {
 	if (syscall(SYS_munmap, h3, 4096) != 0) return 0;
 	uint8_t *h4 = (uint8_t *)syscall(SYS_mmap, h3, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (h4 != h3) return 0;                        /* freed: honoured */
+	/* MAP_FIXED is not a hint: it maps at the address, discarding overlap */
+	uint8_t *f1 = (uint8_t *)syscall(SYS_mmap, 0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (f1 == MAP_FAILED) return 0;
+	f1[0] = 0x11;
+	uint8_t *f2 = (uint8_t *)syscall(SYS_mmap, f1, 4096, PROT_READ | PROT_WRITE,
+	                                 MAP_PRIVATE | MAP_ANONYMOUS | 0x10 /*FIXED*/, -1, 0);
+	if (f2 != f1) return 0;
+	f2[0] = 0x22;
+	if (f1[0] != 0x22) return 0;
 	(void)h1;
 	return 1;
 }

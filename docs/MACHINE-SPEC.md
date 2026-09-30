@@ -408,9 +408,11 @@ instruction stream.
 - **Already-expired wait**: parking is skipped; the call costs one tick and
   returns ETIMEDOUT. (A zero-timeout spin therefore advances the clock
   instead of livelocking it: time passes while you spin, 1 us per call.)
-- **mmap**: a bare hint (addr != 0, no MAP_FIXED_NOREPLACE) is honoured when
-  those pages are Free, and the call is placed best-fit otherwise. (v2 keeps
-  ignoring every bare hint.) MAP_FIXED_NOREPLACE keeps today's rule.
+- **mmap**: a bare hint (addr != 0, neither MAP_FIXED nor
+  MAP_FIXED_NOREPLACE) is honoured when those pages are Free, and the call is
+  placed best-fit otherwise. (v2 maps every bare hint fixed at the address.)
+  MAP_FIXED maps at the address, discarding overlap, in both versions;
+  MAP_FIXED_NOREPLACE keeps today's EEXIST rule in both.
 - **mremap**: without MREMAP_MAYMOVE (1) the in-place rule is v2's (EEXIST
   when blocked). With MAYMOVE the mapping relocates to a best-fit free range
   (contents copied, old range freed) and returns the new address.
