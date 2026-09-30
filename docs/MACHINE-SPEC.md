@@ -364,3 +364,62 @@ machine runs on:
 - **wbx_clone(2000)** with `thread_area == 0`: returns EINVAL (a NULL area is
   a foreign clone convention, not the musl pthread struct whose words 12,13
   are stack_end/size; refused instead of faulting the host on pthread[12]).
+
+## Virtual time (spec v3, opt-in)
+
+A guest declares v3 by exporting a `uint32_t __wbx_machine_spec` holding 3,
+read at load the way `__wbxsysinfo` is. No symbol (or a 2) means v2, and every
+v2 behaviour above is unchanged, bit for bit - including the thread-state
+format. A value the host does not implement refuses the load with a clear
+message. There is deliberately no other clock input: no environment variable
+reaches the machine, and no frontend-driven advance exists. A v3 guest that
+wants frame-paced time calls `clock_nanosleep(frame_ns)` once per frame; the
+policy stays inside the core, and the advance is part of the guest's own
+instruction stream.
+
+- **Clock**: starts at the v2 constant (tv_sec=1495889068, tv_nsec=0,
+  whatever the clock id). Every `clock_gettime` advances it by the tick,
+  1000 ns, then yields (below). The tick is a constant written here, not a
+  knob: two runs of the same movie advance identically.
+- **Thread switches**: a clock read yields after ticking, and a futex wake
+  yields after waking. Reason: a thread spinning on the clock (or a waker
+  that never sleeps) must hand the others a chance to run; without the yield
+  a spinner starves every waiter it was waiting for. With one runnable thread
+  the yield is a no-op returning the same value.
+- **nanosleep(35)**: advances the clock by exactly the requested relative
+  duration, then yields once. Negative or out-of-range requests are EINVAL,
+  an unreadable pointer EFAULT, as on Linux (same for clock_nanosleep).
+- **clock_nanosleep(230)**: relative requests behave as nanosleep; with
+  TIMER_ABSTIME the clock advances to the absolute target when it is ahead of
+  now, else advances nothing. Absolute means the clock's own scale (the
+  readings it returns, starting at the constant above). The `rem` out-param
+  is zeroed.
+- **Futex timeouts**: WAIT takes a relative timeout, WAIT_BITSET an absolute
+  one (same scale), as a µs-precise struct timespec in guest memory; NULL
+  waits forever, as in v2. Negative or out-of-range fields are EINVAL, an
+  unreadable pointer EFAULT, as on Linux. A waiter whose deadline arrives
+  returns ETIMEDOUT (Linux errno 110).
+- **Expiry order**: earliest deadline first; ties broken by park order (FIFO).
+  Expiry is eager: after every clock advance, all waiters whose deadline has
+  passed are woken with ETIMEDOUT before the next thread runs.
+- **Nothing runnable**: when every thread is parked and at least one has a
+  deadline, the clock fast-forwards to the earliest deadline and expiry runs
+  as above. When every waiter has no timeout, the machine stops, as in v2.
+- **Already-expired wait**: parking is skipped; the call costs one tick and
+  returns ETIMEDOUT. (A zero-timeout spin therefore advances the clock
+  instead of livelocking it: time passes while you spin, 1 us per call.)
+- **mmap**: a bare hint (addr != 0, no MAP_FIXED_NOREPLACE) is honoured when
+  those pages are Free, and the call is placed best-fit otherwise. (v2 keeps
+  ignoring every bare hint.) MAP_FIXED_NOREPLACE keeps today's rule.
+- **mremap**: without MREMAP_MAYMOVE (1) the in-place rule is v2's (EEXIST
+  when blocked). With MAYMOVE the mapping relocates to a best-fit free range
+  (contents copied, old range freed) and returns the new address.
+  MAYMOVE|FIXED is EINVAL (no fixed-target moves).
+- **O_TRUNC**: on open of a writable regular mount with write access,
+  truncates it to zero length first. (Streams cannot be truncated; O_TRUNC on
+  one is ignored. O_TRUNC without write access is EACCES.)
+- **Thread-state format v3**: magic `"GuestThreadSe3"`, then the clock (u64
+  ns past the v2 constant), then exactly the v2 body, then per-thread
+  deadlines (u64 ns absolute, 0 for none) in tid order. v3 guests only ever
+  write and read this format. v2 guests keep the v1/v2 format byte for byte:
+  no clock, no deadlines, magic `"GuestThreadSet"`.

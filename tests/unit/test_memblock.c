@@ -111,8 +111,41 @@ static void test_madvise_keeps_allocated(void) {
 	mb_block_free(b);
 }
 
-static void test_mremap_inplace(void) {
+static void test_mremap_maymove(void) {
 	mb_block *b = fresh(0x10000);
+	mb_range arena = { b->addr.start, 0x10000 };
+	mb_range two = { b->addr.start, 0x2000 };
+	CHECK_EQ(mb_block_mmap_fixed(b, two, MB_PROT_RW, true), 0);
+	gp(b, 0)[0] = 0xAB; gp(b, 0x1000)[0] = 0xCD;
+	/* block the in-place grow */
+	mb_range blocker = { b->addr.start + 0x2000, 0x1000 };
+	CHECK_EQ(mb_block_mmap_fixed(b, blocker, MB_PROT_RW, true), 0);
+	/* without maymove: EEXIST, as in v2 */
+	CHECK_EQ(mb_block_mremap_maymove(b, two, 0x4000, arena, false), -EEXIST);
+	/* with maymove: relocates, contents follow, old range is free */
+	mb_sword moved = mb_block_mremap_maymove(b, two, 0x4000, arena, true);
+	CHECK(moved > 0 && moved != (mb_sword)b->addr.start);
+	CHECK_EQ(gp(b, (uintptr_t)(moved - (mb_sword)b->addr.start))[0], 0xAB);
+	CHECK_EQ(gp(b, (uintptr_t)(moved - (mb_sword)b->addr.start) + 0x1000)[0], 0xCD);
+	CHECK(freed(b, 0) && freed(b, 1));
+	CHECK(mb_block_maps_consistent(b));
+	mb_block_free(b);
+}
+
+static void test_range_is_free(void) {
+	mb_block *b = fresh(0x10000);
+	mb_range two = { b->addr.start, 0x2000 };
+	CHECK(mb_block_range_is_free(b, two));
+	CHECK_EQ(mb_block_mmap_fixed(b, two, MB_PROT_RW, true), 0);
+	CHECK(!mb_block_range_is_free(b, two));
+	mb_range half = { b->addr.start + 0x1000, 0x2000 };
+	CHECK(!mb_block_range_is_free(b, half));   /* overlaps */
+	mb_range oor = { b->addr.start + 0x10000, 0x1000 };
+	CHECK(!mb_block_range_is_free(b, oor));    /* outside */
+	mb_block_free(b);
+}
+
+static void test_mremap_inplace(void) {	mb_block *b = fresh(0x10000);
 	mb_range two = { b->addr.start, 0x2000 };
 	CHECK_EQ(mb_block_mmap_fixed(b, two, MB_PROT_RW, true), 0);
 	/* grow in place: following pages are free -> ok */
@@ -264,6 +297,8 @@ static void run_all(void) {
 	RUN(test_munmap_zeroes);
 	RUN(test_madvise_keeps_allocated);
 	RUN(test_mremap_inplace);
+	RUN(test_mremap_maymove);
+	RUN(test_range_is_free);
 	RUN(test_invisible);
 	RUN(test_double_seal);
 	RUN(test_copy_from_external);

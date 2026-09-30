@@ -247,6 +247,8 @@ int  mb_block_mprotect(mb_block *b, mb_range addr, mb_prot prot);
 int  mb_block_munmap(mb_block *b, mb_range addr);
 int  mb_block_madvise_dontneed(mb_block *b, mb_range addr);
 mb_sword mb_block_mremap(mb_block *b, mb_range addr, uintptr_t new_size, mb_range arena);
+mb_sword mb_block_mremap_maymove(mb_block *b, mb_range addr, uintptr_t new_size, mb_range arena, bool maymove);
+bool mb_block_range_is_free(mb_block *b, mb_range addr);
 int  mb_block_mark_invisible(mb_block *b, mb_range addr);
 int  mb_block_copy_from_external(mb_block *b, const uint8_t *src, uintptr_t start, uintptr_t len);
 int  mb_block_seal(mb_block *b);
