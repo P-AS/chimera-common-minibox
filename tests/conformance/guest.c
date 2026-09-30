@@ -204,6 +204,22 @@ __asm__(
  * machine back when a state is loaded (run_guest, "a guest that dies"). */
 ECL_EXPORT uint32_t Alive(void) { return 0xA11FE; }
 
+/* Memory the machine has not touched before, written: a megabyte through
+ * musl's mmap path. On a host out of memory that is where the commit is
+ * refused (run_guest: out_of_memory_is_said). */
+ECL_EXPORT uint32_t TouchFresh(void) {
+	const size_t size = 1u << 20;
+	/* volatile, a write per page: a memset of memory freed right after is a
+	 * dead store the compiler removes, and then nothing is touched at all */
+	volatile uint8_t *fresh = (volatile uint8_t *)malloc(size);
+	if (!fresh) return 0;
+	for (size_t i = 0; i < size; i += 4096) fresh[i] = 0x5A;
+	uint32_t ok = 0xF4E5;
+	for (size_t i = 0; i < size; i += 4096) if (fresh[i] != 0x5A) ok = 0;
+	free((void *)fresh);
+	return ok;
+}
+
 ECL_EXPORT void ExitNow(void) { exit(7); }   /* exit_group, after musl's atexit work */
 
 

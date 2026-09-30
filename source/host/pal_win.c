@@ -85,11 +85,28 @@ int mb_pal_protect(mb_range addr, mb_prot prot) {
 	return VirtualProtect((void *)addr.start, addr.size, prot_to_native(prot), &old) ? 0 : -1;
 }
 
+/* Tests only: this many commits are refused as an exhausted system would
+ * refuse them (ERROR_COMMITMENT_LIMIT), without having to exhaust one. */
+int mb_pal_commit_refusals = 0;
+
 /* Reserved section pages become real (zero-filled) here; each view of a
  * SEC_RESERVE section is committed on its own, so memblock calls this for the
  * guest view and the mirror separately. */
+/* Tests only, from outside the library: MB_REFUSE_COMMITS=1 refuses every
+ * commit while it is set (run_guest sets and clears it around one call). */
+static bool refuse_by_environment(void) {
+	char v[4];
+	const DWORD n = GetEnvironmentVariableA("MB_REFUSE_COMMITS", v, sizeof v);
+	return n > 0 && n < sizeof v && v[0] == '1';
+}
+
 int mb_pal_commit(mb_range addr, mb_prot prot) {
-	if (VirtualAlloc((void *)addr.start, addr.size, MEM_COMMIT, prot_to_native(prot)) != NULL) return 0;
+	if (mb_pal_commit_refusals > 0 || refuse_by_environment()) {
+		if (mb_pal_commit_refusals > 0) mb_pal_commit_refusals--;
+		SetLastError(ERROR_COMMITMENT_LIMIT);
+	} else if (VirtualAlloc((void *)addr.start, addr.size, MEM_COMMIT, prot_to_native(prot)) != NULL) {
+		return 0;
+	}
 	fprintf(stderr, "miniBox: VirtualAlloc(MEM_COMMIT %p, %llu) failed, error %lu\n",
 	        (void *)addr.start, (unsigned long long)addr.size, (unsigned long)GetLastError());
 	fflush(stderr);

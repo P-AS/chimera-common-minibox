@@ -256,6 +256,13 @@ uint8_t mb_block_page_info(mb_block *b, size_t index);
 const uint8_t *mb_block_hash(const mb_block *b);  /* 32 bytes; valid once sealed */
 
 /* Savestate (structure per docs/docs/MACHINE-SPEC.md section 6). Return 0 on success. */
+/* A guest fault on a lazy block's page whose commit the OS refused: commit it
+ * now (memblock.c). *oom is set when the OS refuses again. */
+bool mb_block_commit_on_fault(mb_block *b, uintptr_t addr, bool write, bool *oom);
+#ifdef _WIN32
+extern int mb_pal_commit_refusals;   /* tests: commits to refuse (pal_win.c) */
+#endif
+
 int mb_block_save_state(mb_block *b, mb_write_cb w, uintptr_t ud);
 int mb_block_load_state(mb_block *b, mb_read_cb r, uintptr_t ud);
 
