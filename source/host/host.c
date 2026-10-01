@@ -63,6 +63,7 @@ enum {
 	NR_readlink=89, NR_readlinkat=267, NR_pipe=22, NR_pipe2=293,
 };
 
+
 #define MAP_ANONYMOUS 0x20
 #define MAP_STACK 0x20000
 #define MAP_FIXED_NOREPLACE 0x100000
@@ -746,7 +747,12 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 	 * it its own %fs; every C/C++ guest on the waterbox musl uses %gs and is
 	 * left exactly as it was. */
 #ifdef MB_HAVE_FSBASE
-	h->context.fs_swap = mb_elf_has_tls(h->elf) && mb_fsbase_ok() && !getenv("MB_NO_FS_SWAP");
+	/* Eager, not lazy: the global probe result gates the entry park and the
+	 * fault repair for EVERY guest, and C's && would otherwise never run it
+	 * for a guest with no PT_TLS - leaving the gates at their zero value
+	 * while the instructions would have worked. */
+	{ const bool fs_ok = mb_fsbase_ok();
+	  h->context.fs_swap = mb_elf_has_tls(h->elf) && fs_ok && !getenv("MB_NO_FS_SWAP"); }
 	/* Said once, unprompted, because it decides whether a guest carrying its own
 	 * thread locals can work at all - and when it is wrong the failure is a
 	 * crash with nothing to connect it to. A guest with no TLS says nothing. */
@@ -849,8 +855,7 @@ void mb_host_activate(mb_host *h) {
 	/* guest code will run on THIS thread; make signal delivery on a faulting
 	 * tracked stack page possible (see tripguard.c) */
 	mb_tripguard_ensure_altstack();
-#endif
-	/* A guest that exports GuestFaultHandler wants to hear about faults on
+#endif	/* A guest that exports GuestFaultHandler wants to hear about faults on
 	 * pages it protected itself (see tripguard.c) - on BOTH platforms: the
 	 * Windows handler is the vectored one, and a guest whose handler is not
 	 * registered there dies on its first watched write. The RAW address: it

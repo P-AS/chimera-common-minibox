@@ -493,6 +493,11 @@ extern bool mb_fs_swap;
  * the OUTER call still needs. Nothing reads it without first establishing, from
  * the faulting rip, that guest code is what we are returning to. */
 extern mb_context *mb_guest_ctx;
+/* Whether the FSGSBASE instructions exist at all (the mb_fsbase_ok probe).
+ * Every rdfsbase/wrfsbase in the host is behind this at runtime: on a host
+ * without them (old kernels, some VMs) any one of them is SIGILL. Separate
+ * from per-context fs_swap, which is whether THIS guest wants its own base. */
+extern bool mb_fs_swap;
 
 /* The stand-in thread pointer the guest starts on, until musl installs its
  * own. The one %fs mismatch that is not a symptom: musl swaps thread_area in

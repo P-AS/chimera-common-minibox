@@ -17,3 +17,18 @@ test('conformance-guest', run_guest,
   suite: 'system',
   timeout: 120,
 )
+
+# Dropped-%fs repair: guest toolchain only (Linux), like the guest itself.
+test('conformance-fs-repair', run_guest,
+  args: ['--fs-repair-child', guest_wbx],
+  suite: 'system',
+  timeout: 120,
+)
+
+# Probe forced off: the FSGSBASE instructions must be unreachable, so the
+# whole standard flow has to pass without them.
+test('conformance-probe-off', run_guest,
+  args: ['--probe-off', guest_wbx],
+  suite: 'system',
+  timeout: 180,
+)
