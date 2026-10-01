@@ -261,8 +261,10 @@ static int guest_abort_is_reported(const char *self, const char *guest) {
 	const bool survived = status == 0;
 	const bool named = strstr(text, "the core aborted") != NULL;
 	const bool words = strstr(text, "conformance guest: these are my last words") != NULL;
-	printf("run_guest: abort child survived=%d, log names the abort=%d, log has the guest's words=%d\n", survived, named, words);
-	return survived && named && words;
+	/* and where it was: the abort's frames, in the form addr2line takes */
+	const bool stack = strstr(text, "guest stack (addr2line -f -C -e core.wbx): +") != NULL;
+	printf("run_guest: abort child survived=%d, log names the abort=%d, log has the guest's words=%d, and its stack=%d\n", survived, named, words, stack);
+	return survived && named && words && stack;
 #endif
 }
 
@@ -363,6 +365,13 @@ static void guest_deaths_are_survived(const char *path) {
 		{ "ExitNow", "exited (status 7)" },
 		{ "UnknownSyscall", "system call 4242" },
 		{ "Deadlock", "deadlock" },
+#ifndef _WIN32
+		/* Linux-only: faulting with rsp in a guard page needs the fault
+		 * handler on an alternate signal stack to report anything at all.
+		 * VEH has no altstack - the nested fault takes the process with no
+		 * report - so this cannot pass on Windows by construction. */
+		{ "GuardFault", "illegal instruction" },
+#endif
 	};
 	char why[512];
 	for (size_t i = 0; i < sizeof deaths / sizeof deaths[0]; i++) {

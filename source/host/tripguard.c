@@ -10,6 +10,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -377,17 +379,58 @@ static void say_code_and_regs(const unsigned char *ip, uintptr_t rsp, uintptr_t 
  * (__dynamic_cast, memcpy, an allocator) says nothing at all.
  *
  * Only what is safe to read: the scan stays inside the one layout region rsp
- * is on, and on Windows asks the OS about each page first - a nested fault in
- * here would lose the report it is part of. */
+ * is on, and asks the OS about each page first (VirtualQuery on Windows,
+ * /proc/self/maps on Linux) - a nested fault in here would lose the report
+ * it is part of. */
 #ifdef _WIN32
-static bool page_readable(uintptr_t p) {
+bool mb_page_readable(uintptr_t p) {
 	MEMORY_BASIC_INFORMATION mbi;
 	if (VirtualQuery((void *)p, &mbi, sizeof mbi) != sizeof mbi) return false;
 	if (mbi.State != MEM_COMMIT) return false;
 	return (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
 }
+#elif defined(__linux__)
+/* Raw open/read only: no stdio, no allocation - this runs inside the fault
+ * handler (and stdio already bit us once, with RPCS3). A page counts when
+ * some mapping covers it with read permission. */
+bool mb_page_readable(uintptr_t p) {
+	int fd = open("/proc/self/maps", O_RDONLY);
+	if (fd < 0) return false;
+	char buf[4096];
+	size_t have = 0;
+	bool found = false, readable = false;
+	for (;;) {
+		ssize_t n = read(fd, buf + have, sizeof buf - have);
+		if (n <= 0) break;
+		have += (size_t)n;
+		size_t line = 0;
+		for (size_t i = 0; i < have; i++) {
+			if (buf[i] != '\n') continue;
+			/* start-end perms ... : parse only what we need */
+			uintptr_t lo = 0, hi = 0;
+			size_t j = line;
+			while (j < i && buf[j] != '-') { lo = lo * 16 + (uintptr_t)(buf[j] <= '9' ? buf[j] - '0' : (buf[j] & 0xdf) - 'A' + 10); j++; }
+			if (j < i && buf[j] == '-') {
+				j++;
+				while (j < i && buf[j] != ' ') { hi = hi * 16 + (uintptr_t)(buf[j] <= '9' ? buf[j] - '0' : (buf[j] & 0xdf) - 'A' + 10); j++; }
+				if (j + 1 < i && p >= lo && p < hi) {
+					found = true;
+					readable = buf[j + 1] == 'r';
+					break;
+				}
+			}
+			line = i + 1;
+		}
+		if (found) break;
+		/* keep an unterminated tail (a split mapping line) for next read */
+		if (line > 0) { memmove(buf, buf + line, have - line); have -= line; }
+		else if (have == sizeof buf) break;   /* absurdly long line: give up */
+	}
+	close(fd);
+	return found && readable;
+}
 #else
-static bool page_readable(uintptr_t p) { (void)p; return true; }
+bool mb_page_readable(uintptr_t p) { (void)p; return true; }
 #endif
 
 static void say_guest_stack(uintptr_t rsp) {
@@ -411,7 +454,7 @@ static void say_guest_stack(uintptr_t rsp) {
 	for (uintptr_t p = rsp; p + sizeof(uintptr_t) <= stop && shown < 24; p += sizeof(uintptr_t)) {
 		/* the first word of each page, and the first of all, decides whether
 		 * the page may be read at all; a page that may not ends the walk */
-		if ((p == rsp || (p & MB_PAGEMASK) == 0) && !page_readable(p)) break;
+		if ((p == rsp || (p & MB_PAGEMASK) == 0) && !mb_page_readable(p)) break;
 		const uintptr_t v = *(const uintptr_t *)p;
 		if (!mb_range_contains(L->elf, v)) continue;
 		mb_diag(" +%llu:%llx", (unsigned long long)(p - rsp), (unsigned long long)v);
@@ -420,12 +463,13 @@ static void say_guest_stack(uintptr_t rsp) {
 	mb_diag(shown ? "\n" : " (nothing on it)\n");
 }
 
+/* The same walk, for a death that is not a fault (host.c record_death). */
+void mb_tripguard_say_guest_stack(uintptr_t rsp) { say_guest_stack(rsp); }
+
 #ifndef _WIN32
 /* ---- Linux: SIGSEGV via sigaction, chaining to the previous handler ---- */
 #include <signal.h>
 #include <ucontext.h>
-#include <unistd.h>
-#include <fcntl.h>
 #include <sys/mman.h>
 static struct sigaction g_old_sa;
 

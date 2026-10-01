@@ -267,6 +267,20 @@ __asm__(
 	"\tpop %rbx\n"
 	"\tret\n");
 
+/* Faults with rsp pointing into a guard page: a heap page is protected to
+ * PROT_NONE, rsp is pointed into it, and ud2 faults. The death report must
+ * complete without a nested fault - both stack readers check page
+ * readability first (run_guest checks the report; the process surviving
+ * with the machine refused is the check). Page protections are per-page
+ * state, so the runner's load_state after the death puts the page back. */
+static uint8_t guard_area[8192] __attribute__((aligned(4096)));
+ECL_EXPORT void GuardFault(void) {
+	uintptr_t base = ((uintptr_t)guard_area + 0xFFF) & ~(uintptr_t)0xFFF;
+	if (mprotect((void *)base, 4096, PROT_NONE) != 0) return;
+	__asm__ volatile ("mov %0, %%rsp\n\tud2" :: "r" (base + 2048) : "memory");
+	__builtin_unreachable();
+}
+
 /* ---- ways a guest dies ----
  * Each export below ends the machine a different way. The host must hand
  * control back to the caller, say why, refuse every later call, and bring the
