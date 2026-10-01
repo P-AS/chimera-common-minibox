@@ -19,6 +19,7 @@
 #include <sys/syscall.h>
 #include <signal.h>
 #include <sys/resource.h>
+#include <sys/mman.h>
 
 /* Savestated state (plain globals -> .bss / savestated memory). */
 static uint64_t g_acc;
@@ -176,6 +177,17 @@ ECL_EXPORT int Init(void) {
 		if (syscall(SYS_syncfs, 2) != 0) return 0;
 		if (syscall(SYS_fsync, 999) != -1) return 0;
 	}
+	/* Error numbers are LINUX numbers, whatever the host's libc spells: a
+	 * Windows host handed its own MSVCRT values through, ENOSYS as 40 (which
+	 * this guest's musl reads as ELOOP) and EOPNOTSUPP as 130. Two the host
+	 * gives on purpose: set_thread_area is musl's business, and a file-backed
+	 * mmap is not supported. */
+	{
+		errno = 0;
+		if (syscall(SYS_set_thread_area, 0) != -1 || errno != ENOSYS) return 0;
+		errno = 0;
+		if (syscall(SYS_mmap, 0, 4096, PROT_READ, MAP_PRIVATE, 3, 0) != -1 || errno != EOPNOTSUPP) return 0;
+	}
 
 	g_acc = seed;
 	g_step = 0;
@@ -250,6 +262,22 @@ __asm__(
  * control back to the caller, say why, refuse every later call, and bring the
  * machine back when a state is loaded (run_guest, "a guest that dies"). */
 ECL_EXPORT uint32_t Alive(void) { return 0xA11FE; }
+
+/* Memory the machine has not touched before, written: a megabyte through
+ * musl's mmap path. On a host out of memory that is where the commit is
+ * refused (run_guest: out_of_memory_is_said). */
+ECL_EXPORT uint32_t TouchFresh(void) {
+	const size_t size = 1u << 20;
+	/* volatile, a write per page: a memset of memory freed right after is a
+	 * dead store the compiler removes, and then nothing is touched at all */
+	volatile uint8_t *fresh = (volatile uint8_t *)malloc(size);
+	if (!fresh) return 0;
+	for (size_t i = 0; i < size; i += 4096) fresh[i] = 0x5A;
+	uint32_t ok = 0xF4E5;
+	for (size_t i = 0; i < size; i += 4096) if (fresh[i] != 0x5A) ok = 0;
+	free((void *)fresh);
+	return ok;
+}
 
 ECL_EXPORT void ExitNow(void) { exit(7); }   /* exit_group, after musl's atexit work */
 

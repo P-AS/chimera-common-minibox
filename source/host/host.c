@@ -71,7 +71,7 @@ enum {
 #define FUTEX_CLOCK_REALTIME 256
 #define FUTEX_UNLOCK_PI 7
 
-static uintptr_t serr(int e) { return (uintptr_t)(intptr_t)(-e); }  /* -errno as usize */
+static uintptr_t serr(int e) { return (uintptr_t)(intptr_t)(-mb_linux_errno(e)); }  /* -errno as usize, in Linux numbers */
 static uintptr_t sok(mb_sword v) { return (uintptr_t)v; }
 
 static mb_prot arg_to_prot(uintptr_t a, bool *bad) {

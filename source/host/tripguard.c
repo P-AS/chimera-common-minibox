@@ -919,9 +919,27 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 	return r;
 }
 
+/* A page the OS refused to commit (memblock.c, ensure_committed): committed
+ * now, before dirty tracking - which would otherwise give an uncommitted page
+ * its protection and fault on it for ever. *oom when refused again. */
+static bool commit_on_fault(uintptr_t addr, bool write, bool *oom) {
+	mb_block *b = owner_of(addr);
+	if (!b || mb_block_track_held_here(b)) return false;
+	const int phase = fault_phase();
+	fault_phase_set(MB_PHASE_TRACK);
+	const bool served = mb_block_commit_on_fault(b, addr, write, oom);
+	fault_phase_set(phase);
+	return served;
+}
+
 static LONG veh_access_violation(EXCEPTION_POINTERS *ep, bool write, uintptr_t fault) {
-	if (write && trip(fault)) return EXCEPTION_CONTINUE_EXECUTION;
-	if (ask_guest(fault, write)) return EXCEPTION_CONTINUE_EXECUTION;
+	bool oom = false;
+	if (commit_on_fault(fault, write, &oom)) return EXCEPTION_CONTINUE_EXECUTION;
+	/* refused again: nothing else can serve a page with no memory behind it -
+	 * dirty tracking would protect it and trap on the refusal - so it is
+	 * reported, as the host being out of memory */
+	if (!oom && write && trip(fault)) return EXCEPTION_CONTINUE_EXECUTION;
+	if (!oom && ask_guest(fault, write)) return EXCEPTION_CONTINUE_EXECUTION;
 
 	/* Not miniBox's to handle. Say what was asked for and whether any block owns
 	 * the address - the difference between "the guest touched something it
@@ -944,6 +962,9 @@ static LONG veh_access_violation(EXCEPTION_POINTERS *ep, bool write, uintptr_t f
 		const char *access = ep->ExceptionRecord->ExceptionInformation[0] == 0 ? "read"
 		        : ep->ExceptionRecord->ExceptionInformation[0] == 1 ? "write" : "execute";
 		mb_diag_banner(guest_code ? "unhandled fault" : "a fault in host code");
+		if (oom)
+			mb_diag("[veh] out of memory: Windows would not commit the page at %p (error %lu); the machine cannot go on\n",
+			        (void *)fault, (unsigned long)GetLastError());
 		if (guest_code)
 			mb_diag("[veh] unhandled fault: addr=%p access=%s rip=%p, %s",
 			        (void *)fault, access, (void *)ep->ContextRecord->Rip,
@@ -984,8 +1005,13 @@ static LONG veh_access_violation(EXCEPTION_POINTERS *ep, bool write, uintptr_t f
 		if (guest_code) say_guest_stack((uintptr_t)c->Rsp);
 		const uintptr_t rip = (uintptr_t)c->Rip;
 		if (guest_can_die_here(rip)) {
-			if (mb_host_guest_death_in_handler(mb_guest_ctx, "the core crashed: it %s address %p (at %p)",
-			        write ? "wrote to" : "read or ran", (void *)fault, (void *)rip)) {
+			const bool died = oom
+				? mb_host_guest_death_in_handler(mb_guest_ctx, "the computer is out of memory: Windows would not give the core "
+				      "the memory it needs (at %p). Close other programs, or give the greenzone less memory, and go back to a safe frame",
+				      (void *)fault)
+				: mb_host_guest_death_in_handler(mb_guest_ctx, "the core crashed: it %s address %p (at %p)",
+				      write ? "wrote to" : "read or ran", (void *)fault, (void *)rip);
+			if (died) {
 				ep->ContextRecord->Rsp = (DWORD64)mb_guest_ctx->esc_rsp;
 				ep->ContextRecord->Rip = (DWORD64)(uintptr_t)&mb_guarded_escape;
 				report_end(phase_before);

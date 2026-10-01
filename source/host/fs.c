@@ -23,6 +23,7 @@
 #include <windows.h>
 #endif
 #include <errno.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -356,6 +357,52 @@ size_t mb_fs_sysout_tail(const mb_fs *fs, char *out, size_t cap) {
 	return take;
 }
 
+/* The core log: a copy of everything any guest writes to stdout and stderr,
+ * into a file the frontend chose, while it asks for one (wbx_set_output_file).
+ * The host's own stderr is nowhere in a GUI process on Windows, so without
+ * this a core's log reaches nobody. Process-wide, not per host: a frontend
+ * runs one machine at a time and must not lose the log across a reboot.
+ * Flushed per write, because the log is wanted most when the process dies.
+ * Host-side only: the guest sees the same write either way. */
+static FILE *g_output_copy;
+static atomic_flag g_output_lock = ATOMIC_FLAG_INIT;
+
+static void output_lock(void) { while (atomic_flag_test_and_set_explicit(&g_output_lock, memory_order_acquire)) { } }
+static void output_unlock(void) { atomic_flag_clear_explicit(&g_output_lock, memory_order_release); }
+
+static void output_copy(const uint8_t *buf, size_t n) {
+	output_lock();
+	if (g_output_copy) {
+		fwrite(buf, 1, n, g_output_copy);   /* host errors swallowed, as for stderr */
+		fflush(g_output_copy);
+	}
+	output_unlock();
+}
+
+int mb_set_output_file(const char *path) {
+	FILE *f = NULL;
+	if (path && *path) {
+#if defined(_WIN32)
+		int n = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+		if (n <= 0) return -ENOENT;
+		wchar_t *wide = malloc((size_t)n * sizeof(wchar_t));
+		if (!wide) return -ENOMEM;
+		MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, n);
+		f = _wfopen(wide, L"ab");
+		free(wide);
+#else
+		f = fopen(path, "ab");
+#endif
+		if (!f) return -(errno ? errno : EIO);
+	}
+	output_lock();
+	FILE *old = g_output_copy;
+	g_output_copy = f;
+	output_unlock();
+	if (old) fclose(old);
+	return 0;
+}
+
 mb_sword mb_fs_write(mb_fs *fs, int fd, const uint8_t *buf, size_t n) {
 	open_handle *h = handle_by_fd(fs, fd);
 	if (!h) return -ENOENT;
@@ -363,6 +410,7 @@ mb_sword mb_fs_write(mb_fs *fs, int fd, const uint8_t *buf, size_t n) {
 	if (f->kind == F_SYSOUT) {
 		fwrite(buf, 1, n, f->sysout);   /* host errors swallowed */
 		sysout_remember(fs, buf, n);
+		output_copy(buf, n);
 		return (mb_sword)n;
 	}
 	if (f->kind == F_EMPTY || !f->writable) return -EBADF;
