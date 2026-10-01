@@ -18,6 +18,37 @@
  * is not a subtle bug: brk returned a truncated break, the guest computed its
  * next break from it, and the process died inside the first file read. */
 typedef intptr_t mb_sword;
+
+/* The guest is Linux, so every error number it sees is a LINUX number - but
+ * the host spells errors in its own libc's numbers, and MSVCRT's are not
+ * Linux's past ERANGE: ENOSYS is 40 there and 38 here, so a Windows host told
+ * a guest ELOOP when it meant "not implemented", EOPNOTSUPP 130 read as
+ * EOWNERDEAD, ETIMEDOUT 138 as nothing at all. Every error a guest can see
+ * goes through this (serr in host.c and threading.c). Keyed by NAME, so on a
+ * Linux host it is the identity and on Windows it translates; the aliases
+ * (ENOTSUP/EOPNOTSUPP, EWOULDBLOCK/EAGAIN) are separate numbers on Windows
+ * and the same one on Linux, which a table can hold and a switch cannot. A
+ * host number not listed passes through unchanged. */
+#include <errno.h>
+static inline int mb_linux_errno(int host) {
+	static const struct { int host, linux_; } map[] = {
+		{ EPERM, 1 }, { ENOENT, 2 }, { ESRCH, 3 }, { EINTR, 4 }, { EIO, 5 },
+		{ ENXIO, 6 }, { E2BIG, 7 }, { ENOEXEC, 8 }, { EBADF, 9 }, { ECHILD, 10 },
+		{ EAGAIN, 11 }, { ENOMEM, 12 }, { EACCES, 13 }, { EFAULT, 14 },
+		{ EBUSY, 16 }, { EEXIST, 17 }, { EXDEV, 18 }, { ENODEV, 19 },
+		{ ENOTDIR, 20 }, { EISDIR, 21 }, { EINVAL, 22 }, { ENFILE, 23 },
+		{ EMFILE, 24 }, { ENOTTY, 25 }, { EFBIG, 27 }, { ENOSPC, 28 },
+		{ ESPIPE, 29 }, { EROFS, 30 }, { EMLINK, 31 }, { EPIPE, 32 },
+		{ EDOM, 33 }, { ERANGE, 34 }, { EDEADLK, 35 }, { ENAMETOOLONG, 36 },
+		{ ENOLCK, 37 }, { ENOSYS, 38 }, { ENOTEMPTY, 39 }, { ELOOP, 40 },
+		{ EWOULDBLOCK, 11 }, { EILSEQ, 84 }, { EOVERFLOW, 75 },
+		{ ENOTSUP, 95 }, { EOPNOTSUPP, 95 }, { ECANCELED, 125 },
+		{ ETIMEDOUT, 110 },
+	};
+	for (size_t i = 0; i < sizeof map / sizeof map[0]; i++)
+		if (map[i].host == host) return map[i].linux_;
+	return host;
+}
 /* If this ever fails, every syscall return is silently losing its top half. */
 typedef char mb_sword_is_64_bit[sizeof(mb_sword) == 8 ? 1 : -1];
 

@@ -17,6 +17,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <sys/mman.h>
 
 /* Savestated state (plain globals -> .bss / savestated memory). */
 static uint64_t g_acc;
@@ -128,6 +129,17 @@ ECL_EXPORT int Init(void) {
 		if (syscall(SYS_fdatasync, 2) != 0) return 0;
 		if (syscall(SYS_syncfs, 2) != 0) return 0;
 		if (syscall(SYS_fsync, 999) != -1) return 0;
+	}
+	/* Error numbers are LINUX numbers, whatever the host's libc spells: a
+	 * Windows host handed its own MSVCRT values through, ENOSYS as 40 (which
+	 * this guest's musl reads as ELOOP) and EOPNOTSUPP as 130. Two the host
+	 * gives on purpose: set_thread_area is musl's business, and a file-backed
+	 * mmap is not supported. */
+	{
+		errno = 0;
+		if (syscall(SYS_set_thread_area, 0) != -1 || errno != ENOSYS) return 0;
+		errno = 0;
+		if (syscall(SYS_mmap, 0, 4096, PROT_READ, MAP_PRIVATE, 3, 0) != -1 || errno != EOPNOTSUPP) return 0;
 	}
 
 	g_acc = seed;

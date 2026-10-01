@@ -16,7 +16,7 @@ static int mb_tdbg(void) { static int v = -1; if (v < 0) { const char *e = geten
 #define FUTEX_WAITERS 0x80000000u
 
 static uintptr_t sok(mb_sword v) { return (uintptr_t)v; }
-static uintptr_t serr(int e) { return (uintptr_t)(intptr_t)(-e); }
+static uintptr_t serr(int e) { return (uintptr_t)(intptr_t)(-mb_linux_errno(e)); }   /* the guest's number, not the host's */
 
 typedef enum { T_RUNNABLE, T_WAITING } tstate;
 typedef struct {
