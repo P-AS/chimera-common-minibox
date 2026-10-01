@@ -17,6 +17,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <signal.h>
+#include <sys/resource.h>
 #include <sys/mman.h>
 
 /* Savestated state (plain globals -> .bss / savestated memory). */
@@ -75,6 +77,61 @@ static int readlinks_are_refused(void) {
 	if (errno != ENOENT) return 0;
 	errno = 0;
 	if (readlink("seed", buf, sizeof buf) >= 0) return 0;   /* mounted, not a link */
+	if (errno != EINVAL) return 0;
+	return 1;
+}
+
+/* ---- calls that used to stop the machine (spec v2.2) ----
+ * Each export below exercises one and returns 1 when the machine is still
+ * alive afterwards with the specified answer. Before v2.2 every one of these
+ * stopped the machine (unknown-syscall death, or a host fault for the NULL
+ * clone area), so no working movie can depend on the old way. */
+
+/* install accepted, never delivered */
+ECL_EXPORT int SigactionAccepted(void) {
+	struct sigaction sa;
+	memset(&sa, 0, sizeof sa);
+	sa.sa_handler = SIG_IGN;
+	if (sigaction(SIGUSR1, &sa, NULL) != 0) return 0;
+	/* the old action reads as the default, not as what was on the stack */
+	struct sigaction old;
+	memset(&old, 0xA5, sizeof old);
+	if (sigaction(SIGUSR1, &sa, &old) != 0) return 0;
+	if (old.sa_handler != SIG_DFL || old.sa_flags != 0) return 0;
+	/* and a pointer the guest does not own is EFAULT, not a host fault */
+	errno = 0;
+	if (syscall(SYS_rt_sigaction, SIGUSR1, 0, (void *)16, 8) != -1 || errno != EFAULT) return 0;
+	return 1;
+}
+
+/* no pipes in-guest: ENOSYS the caller must cope with */
+ECL_EXPORT int PipeRefused(void) {
+	int fds[2];
+	errno = 0;
+	if (pipe(fds) != -1) return 0;
+	if (errno != ENOSYS) return 0;
+	return 1;
+}
+
+/* zeros: no resource usage is observable in-guest */
+ECL_EXPORT int GetrusageZeroed(void) {
+	struct rusage ru;
+	memset(&ru, 0xA5, sizeof ru);
+	if (getrusage(RUSAGE_SELF, &ru) != 0) return 0;
+	/* the kernel struct is 144 bytes; musl pads struct rusage with
+	 * __reserved tail the kernel never touches, so only the first 144
+	 * bytes are specified. */
+	const unsigned char *p = (const unsigned char *)&ru;
+	for (size_t i = 0; i < 144; i++) if (p[i] != 0) return 0;
+	errno = 0;
+	if (syscall(SYS_getrusage, RUSAGE_SELF, (void *)16) != -1 || errno != EFAULT) return 0;
+	return 1;
+}
+
+/* a NULL thread area is a foreign clone convention: EINVAL, not a fault */
+ECL_EXPORT int NullCloneRefused(void) {
+	errno = 0;
+	if (syscall(2000, 0, 0, 0, 0, 0) != -1) return 0;   /* NR_wbx_clone */
 	if (errno != EINVAL) return 0;
 	return 1;
 }

@@ -348,3 +348,22 @@ guest changed the protection and the access is retried; zero, or no export, is
 an unhandled fault as before. Faults on tracked clean pages (dirty-page
 tracking) and on free pages are never the guest's. The handler runs whatever
 the guest puts in it, so the host's alternate signal stack is 1 MiB.
+
+## Answered instead of fatal (spec v2.2, additive)
+
+These calls used to stop the machine (section 7's "everything else" rule),
+which no working movie can depend on. Since v2.2 they get an answer and the
+machine runs on:
+
+- **rt_sigaction(13)**: returns 0; install accepted, never delivered (there
+  is no signal delivery in-guest). A non-null `oldact` is written as the
+  default action (all 32 bytes zero: SIG_DFL, no flags, empty mask); an
+  `act` or `oldact` the guest does not own is EFAULT.
+- **pipe(22)/pipe2(293)**: return ENOSYS (no pipes in-guest; a caller that
+  needs one must cope with ENOSYS, as musl's posix_spawn does).
+- **getrusage(98)**: zero-fills 144 bytes at the rusage pointer and returns
+  0 (no resource usage is observable in-guest); a pointer the guest does not
+  own is EFAULT.
+- **wbx_clone(2000)** with `thread_area == 0`: returns EINVAL (a NULL area is
+  a foreign clone convention, not the musl pthread struct whose words 12,13
+  are stack_end/size; refused instead of faulting the host on pthread[12]).

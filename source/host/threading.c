@@ -151,6 +151,11 @@ static void park_other(mb_threads *t, uintptr_t addr, uint32_t tid) {
 mb_sword mb_threads_spawn(mb_threads *t, mb_block *b, uintptr_t thread_area,
                       uintptr_t guest_rsp, uintptr_t guest_rip, uintptr_t child_tid, uint32_t *parent_tid) {
 	uint32_t tid = t->next_tid;
+	/* thread_area carries the musl pthread struct (words 12,13 are
+	 * stack_end/size). A NULL area is a foreign convention (musl's own
+	 * __clone, which speaks raw clone, not wbx_clone): refuse with EINVAL
+	 * instead of faulting the host on pthread[12]. */
+	if (thread_area == 0) return -EINVAL;
 	/* the musl pthread struct: words 12,13 are stack_end and stack_size */
 	const uintptr_t *pthread = (const uintptr_t *)thread_area;
 	uintptr_t stack_end = pthread[12], stack_size = pthread[13];

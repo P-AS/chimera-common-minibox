@@ -42,15 +42,16 @@ struct mb_host {
 /* ---- syscall numbers (x86-64) ---- */
 enum {
 	NR_read=0, NR_write=1, NR_open=2, NR_close=3, NR_dup=32, NR_stat=4, NR_fstat=5, NR_lseek=8,
-	NR_mmap=9, NR_mprotect=10, NR_munmap=11, NR_brk=12, NR_rt_sigprocmask=14,
+	NR_mmap=9, NR_mprotect=10, NR_munmap=11, NR_brk=12, NR_rt_sigaction=13, NR_rt_sigprocmask=14,
 	NR_ioctl=16, NR_readv=19, NR_writev=20, NR_sched_yield=24, NR_mremap=25, NR_madvise=28,
 	NR_nanosleep=35, NR_getpid=39, NR_exit=60, NR_truncate=76, NR_ftruncate=77,
 	NR_getppid=110, NR_gettid=186, NR_futex=202, NR_sched_setaffinity=203, NR_sched_getaffinity=204, NR_pread64=17, NR_sysinfo=99, NR_prctl=157, NR_openat=257, NR_newfstatat=262, NR_set_thread_area=205, NR_clock_nanosleep=230,
 	NR_clock_gettime=228, NR_set_tid_address=218, NR_getrandom=318, NR_fcntl=72,
 	NR_fsync=74, NR_fdatasync=75, NR_sync=162, NR_syncfs=306,
 	NR_getuid=102, NR_getgid=104, NR_geteuid=107, NR_getegid=108, NR_wbx_clone=2000,
+	NR_getrusage=98,
 	NR_tkill=200, NR_exit_group=231, NR_tgkill=234,
-	NR_readlink=89, NR_readlinkat=267
+	NR_readlink=89, NR_readlinkat=267, NR_pipe=22, NR_pipe2=293,
 };
 
 #define MAP_ANONYMOUS 0x20
@@ -386,6 +387,11 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 		                 mb_sword r = mb_fs_stat_name(h->fs, p, (void *)a2); return r < 0 ? serr((int)-r) : sok(0); }
 		case NR_fstat: { mb_sword r = mb_fs_stat_fd(h->fs, (int)a1, (void *)a2); return r < 0 ? serr((int)-r) : sok(0); }
 		case NR_ioctl: return sok(0);
+		/* No pipes in-guest (musl's posix_spawn, backing system(),
+		 * needs pipe2 and fails here; without an in-guest provider
+		 * this stays unreachable).
+		 * A caller that needs one must cope with ENOSYS. */
+		case NR_pipe: case NR_pipe2: return serr(ENOSYS);
 		case NR_read:  { mb_sword r = mb_fs_read(h->fs, (int)a1, (uint8_t *)a2, a3); return r < 0 ? serr((int)-r) : sok(r); }
 		case NR_write: {
 			const uint64_t before = mb_fs_sysout_total(h->fs);
@@ -420,6 +426,15 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			si[4] = 1024ull << 20;        /* totalram */
 			si[5] = 512ull << 20;         /* freeram */
 			((uint32_t *)a1)[100 / 4] = 1; /* mem_unit at offset 100 */
+			return sok(0);
+		}
+		case NR_getrusage: {
+			/* zeros: no resource usage is observable in-guest.
+			 * (a1 is who=RUSAGE_SELF/CHILDREN, a2 is struct rusage*.)
+			 * A pointer the guest does not own is EFAULT, as on Linux -
+			 * not a host fault. */
+			if (!guest_owns(h, a2, 144)) return serr(EFAULT);
+			memset((void *)a2, 0, 144);
 			return sok(0);
 		}
 		case NR_prctl:
@@ -531,6 +546,21 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 		case NR_fsync: case NR_fdatasync: case NR_syncfs:
 			/* the same, for one descriptor: it is flushed if it is open at all */
 			{ mb_sword r = mb_fs_sync_fd(h->fs, (int)a1); return r < 0 ? serr((int)-r) : sok(0); }
+		case NR_rt_sigaction: {
+			/* No signal delivery in-guest: an install is accepted and never
+			 * fires. (a1 sig, a2 act, a3 oldact, a4 sigsetsize.) The old
+			 * action is reported as the default - SIG_DFL, no flags, empty
+			 * mask - because that is what nothing installed means, and a
+			 * guest that saves and restores the old action must not read
+			 * whatever was on its stack. The kernel's struct is 32 bytes:
+			 * handler, flags, restorer, mask. */
+			if (a2 != 0 && !guest_owns(h, a2, 32)) return serr(EFAULT);
+			if (a3 != 0) {
+				if (!guest_owns(h, a3, 32)) return serr(EFAULT);
+				memset((void *)a3, 0, 32);
+			}
+			return sok(0);
+		}
 		case NR_rt_sigprocmask: return sok(0);
 		case NR_tkill: case NR_tgkill: {
 			/* A signal to one of its own threads. The one a guest sends is to itself:
