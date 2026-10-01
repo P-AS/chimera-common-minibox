@@ -261,6 +261,12 @@ static void test_free_releases_the_mirror(void) {
  * commits it then - the write lands, and is tracked, as any other. It used to
  * mark them committed anyway, so the touch faulted as "the core crashed" and
  * nothing ever tried again. */
+/* Wine says so in ntdll; Windows has no such export. */
+static bool under_wine(void) {
+	HMODULE nt = GetModuleHandleA("ntdll.dll");
+	return nt != NULL && GetProcAddress(nt, "wine_get_version") != NULL;
+}
+
 /* only a block over 4 GiB is lazy (pal_win.c): reserved, not committed */
 #define LAZY_SIZE (((uintptr_t)4 << 30) + 0x20000)
 
@@ -322,8 +328,17 @@ static void run_all(void) {
 	RUN(test_page_info_encoding);
 	RUN(test_write_with_sp_in_a_declared_stack);
 #ifdef _WIN32
-	RUN(test_refused_commit_is_retried_on_fault);
-	RUN(test_refused_again_is_out_of_memory);
+	/* Real Windows only. Wine reimplements Win32 and will not commit pages
+	 * inside a reserved section's view: the retry these two make at fault
+	 * time gets VirtualAlloc(MEM_COMMIT) error 1455 on the CI runner, so they
+	 * failed there from the day they were written while passing on Windows.
+	 * The windows-latest job runs them; under wine they are said, not run. */
+	if (under_wine()) {
+		fprintf(stderr, "- SKIP under wine: test_refused_commit_is_retried_on_fault, test_refused_again_is_out_of_memory (wine cannot commit in a reserved view; the native Windows job runs them)\n");
+	} else {
+		RUN(test_refused_commit_is_retried_on_fault);
+		RUN(test_refused_again_is_out_of_memory);
+	}
 #endif
 }
 TEST_MAIN()
