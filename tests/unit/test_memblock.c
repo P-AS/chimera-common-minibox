@@ -255,6 +255,64 @@ static void test_free_releases_the_mirror(void) {
 	}
 }
 
+#ifdef _WIN32
+/* chimera#166: a commit the system refuses (out of memory) leaves the pages
+ * uncommitted instead of claiming them, and the guest's first touch of one
+ * commits it then - the write lands, and is tracked, as any other. It used to
+ * mark them committed anyway, so the touch faulted as "the core crashed" and
+ * nothing ever tried again. */
+/* Wine says so in ntdll; Windows has no such export. */
+static bool under_wine(void) {
+	HMODULE nt = GetModuleHandleA("ntdll.dll");
+	return nt != NULL && GetProcAddress(nt, "wine_get_version") != NULL;
+}
+
+/* only a block over 4 GiB is lazy (pal_win.c): reserved, not committed */
+#define LAZY_SIZE (((uintptr_t)4 << 30) + 0x20000)
+
+static void test_refused_commit_is_retried_on_fault(void) {
+	mb_block *b = fresh(LAZY_SIZE);
+	CHECK(b->handle.lazy);
+	mb_range r = { b->addr.start, 0x4000 };
+	mb_pal_commit_refusals = 1;                 /* the mmap's commit is refused */
+	CHECK_EQ(mb_block_mmap_fixed(b, r, MB_PROT_RW, true), 0);
+	CHECK_EQ(mb_pal_commit_refusals, 0);
+	CHECK(b->pages[0].uncommitted);             /* not claimed */
+	gp(b, 0x10)[0] = 7;                         /* faults, is committed, lands */
+	CHECK_EQ(gp(b, 0x10)[0], 7);
+	CHECK(!b->pages[0].uncommitted);
+	CHECK(dirty(b, 0));
+	CHECK(!dirty(b, 1));
+	gp(b, 0x2010)[0] = 9;                       /* another refused page, the same way */
+	CHECK_EQ(gp(b, 0x2010)[0], 9);
+	CHECK(dirty(b, 2));
+	CHECK(mb_block_maps_consistent(b));
+	mb_block_free(b);
+}
+
+/* Refused again on the fault: the host is out of memory, which the fault
+ * handler reports as that; with memory back, the same page is served. */
+static void test_refused_again_is_out_of_memory(void) {
+	mb_block *b = fresh(LAZY_SIZE);
+	mb_range r = { b->addr.start, 0x4000 };
+	mb_pal_commit_refusals = 1;
+	CHECK_EQ(mb_block_mmap_fixed(b, r, MB_PROT_RW, true), 0);
+	mb_pal_commit_refusals = 1;
+	bool oom = false;
+	CHECK(!mb_block_commit_on_fault(b, b->addr.start + 0x10, true, &oom));
+	CHECK(oom);
+	CHECK(b->pages[0].uncommitted);
+	oom = false;
+	CHECK(mb_block_commit_on_fault(b, b->addr.start + 0x10, true, &oom));
+	CHECK(!oom);
+	CHECK(!b->pages[0].uncommitted);
+	/* a page the guest may not write is not this handler's to serve */
+	CHECK(!mb_block_commit_on_fault(b, b->addr.start + 0x8000, true, &oom));
+	CHECK(!oom);
+	mb_block_free(b);
+}
+#endif
+
 static void run_all(void) {
 	test_free_releases_the_mirror();
 	RUN(test_dirty_offset);
@@ -269,5 +327,18 @@ static void run_all(void) {
 	RUN(test_copy_from_external);
 	RUN(test_page_info_encoding);
 	RUN(test_write_with_sp_in_a_declared_stack);
+#ifdef _WIN32
+	/* Real Windows only. Wine reimplements Win32 and will not commit pages
+	 * inside a reserved section's view: the retry these two make at fault
+	 * time gets VirtualAlloc(MEM_COMMIT) error 1455 on the CI runner, so they
+	 * failed there from the day they were written while passing on Windows.
+	 * The windows-latest job runs them; under wine they are said, not run. */
+	if (under_wine()) {
+		fprintf(stderr, "- SKIP under wine: test_refused_commit_is_retried_on_fault, test_refused_again_is_out_of_memory (wine cannot commit in a reserved view; the native Windows job runs them)\n");
+	} else {
+		RUN(test_refused_commit_is_retried_on_fault);
+		RUN(test_refused_again_is_out_of_memory);
+	}
+#endif
 }
 TEST_MAIN()
