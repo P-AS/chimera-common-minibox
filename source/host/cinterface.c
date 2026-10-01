@@ -222,6 +222,16 @@ void wbx_get_epoch_page_count(mb_host *obj, mb_return *ret) { ok(ret, mb_host_ep
 
 void wbx_set_always_evict_blocks(bool val) { g_always_evict = val; (void)g_always_evict; }
 
+/* The core log: everything any guest writes to stdout/stderr is also appended
+ * to this file (a UTF-8 path) until it is called again with NULL or "". It
+ * is the host's copy of what the guest said and changes nothing the guest
+ * sees. */
+void wbx_set_output_file(const char *path, mb_return *ret) {
+	const int e = mb_set_output_file(path);
+	if (e != 0) { char m[96]; snprintf(m, sizeof m, "cannot open the core log file (errno %d)", -e); err(ret, m); return; }
+	ok(ret, 0);
+}
+
 void wbx_get_page_len(mb_host *obj, mb_return *ret) { ok(ret, mb_host_page_len(obj)); }
 
 /* The sealed machine's identity, 32 bytes, copied into the caller's buffer.

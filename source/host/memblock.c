@@ -505,23 +505,36 @@ mb_block *mb_block_new(mb_range addr) {
 /* Lazy blocks: back every still-unbacked page of the run in both views
  * before anything touches it (the guest through its protection, the host
  * through the mirror). Committed pages stay committed for the block's life;
- * the guest view gets no access here, refresh_range sets its protection. */
-static void ensure_committed(mb_block *b, size_t pstart, size_t pcount) {
-	if (!b->handle.lazy) return;
+ * the guest view gets no access here, refresh_range sets its protection.
+ *
+ * The OS can refuse: Windows answers ERROR_COMMITMENT_LIMIT when the system
+ * is out of memory. Pages it refused stay uncommitted - they used to be
+ * marked committed anyway, so the guest's next touch of them faulted as "the
+ * core crashed" and nothing ever tried again, and going back to a safe frame
+ * crashed the same way (chimera#166). A refused page is committed again on
+ * the guest's next fault on it (mb_block_commit_on_fault), and one still
+ * refused there is reported as the host being out of memory.
+ *
+ * 0, or -ENOMEM with the pages from the refused run on left uncommitted. */
+static int ensure_committed(mb_block *b, size_t pstart, size_t pcount) {
+	if (!b->handle.lazy) return 0;
 	size_t i = pstart;
 	while (i < pstart + pcount) {
 		if (!b->pages[i].uncommitted) { i++; continue; }
 		size_t j = i + 1;
 		while (j < pstart + pcount && b->pages[j].uncommitted) j++;
 		mb_range m = { mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)), (j - i) << MB_PAGESHIFT };
-		mb_pal_commit(m, MB_PROT_RW);
+		if (mb_pal_commit(m, MB_PROT_RW) != 0) return -ENOMEM;
 		if (b->swapped_in) {
+			/* a mirror committed without its guest view stays uncommitted: the
+			 * next attempt commits the mirror again, which the OS allows */
 			mb_range g = { b->addr.start + (i << MB_PAGESHIFT), (j - i) << MB_PAGESHIFT };
-			mb_pal_commit(g, MB_PROT_NONE);
+			if (mb_pal_commit(g, MB_PROT_NONE) != 0) return -ENOMEM;
 		}
 		for (size_t k = i; k < j; k++) b->pages[k].uncommitted = false;
 		i = j;
 	}
+	return 0;
 }
 
 static void refresh_all(mb_block *b);
@@ -606,11 +619,54 @@ static void refresh_range(mb_block *b, size_t pstart, size_t pcount) {
 		size_t j = i + 1;
 		while (j < pstart + pcount && mb_page_native_prot(&b->pages[j]) == prot) j++;
 		mb_range r = { b->addr.start + (i << MB_PAGESHIFT), (j - i) << MB_PAGESHIFT };
-		if (prot != MB_PROT_NONE) ensure_committed(b, i, j - i);
+		if (prot != MB_PROT_NONE && ensure_committed(b, i, j - i) != 0) {
+			/* Refused: the run keeps no access (uncommitted memory has none),
+			 * and the guest's first touch of a page of it commits that page
+			 * then (mb_block_commit_on_fault). */
+			for (size_t k = i; k < j; k++) {
+				if (!b->pages[k].uncommitted) {
+					mb_range one = { b->addr.start + (k << MB_PAGESHIFT), MB_PAGESIZE };
+					mb_pal_protect(one, prot);
+					note_prot(b, k, prot);
+				} else {
+					note_prot(b, k, MB_PROT_NONE);
+				}
+			}
+			i = j;
+			continue;
+		}
 		mb_pal_protect(r, prot);
 		for (size_t k = i; k < j; k++) note_prot(b, k, prot);
 		i = j;
 	}
+}
+
+/* A guest fault on a page of a lazy block that its commit was refused for:
+ * commit it now and give it its protection, so the access that faulted runs
+ * again (chimera#166). False when the page is not such a page - committed, or
+ * one the guest may not touch this way, which are the other handlers' - and
+ * false with *oom set when the OS refuses again: the host is out of memory,
+ * and the fault is reported as that rather than as the core crashing. */
+bool mb_block_commit_on_fault(mb_block *b, uintptr_t addr, bool write, bool *oom) {
+	if (!b->handle.lazy || !b->swapped_in || !mb_range_contains(b->addr, addr)) return false;
+	const size_t pi = (addr - b->addr.start) >> MB_PAGESHIFT;
+	if (!b->pages[pi].uncommitted) return false;   /* a look before the lock */
+	mb_block_track_lock(b);
+	bool served = false;
+	mb_page *p = &b->pages[pi];
+	const uint8_t st = p->status;
+	const bool allowed = st != MB_ST_FREE && st != MB_ST_NONE
+		&& (!write || st == MB_ST_RW || st == MB_ST_RWX || st == MB_ST_RWSTACK);
+	if (p->uncommitted && allowed) {
+		if (ensure_committed(b, pi, 1) == 0) {
+			refresh_range(b, pi, 1);
+			served = true;
+		} else if (oom) {
+			*oom = true;
+		}
+	}
+	mb_block_track_unlock(b);
+	return served;
 }
 
 static void refresh_all(mb_block *b) { refresh_range(b, 0, b->npages); }
@@ -1079,7 +1135,7 @@ static int copy_from_external_impl(mb_block *b, const uint8_t *src, uintptr_t st
 	mb_range e = mb_range_align_expand(r);
 	size_t pcount, ps = validate(b, e, &pcount);
 	if (ps == (size_t)-1) return -EINVAL;
-	ensure_committed(b, ps, pcount);
+	if (ensure_committed(b, ps, pcount) != 0) return -ENOMEM;
 	/* a write through the mirror: no fault tells a pending plan, so tell it */
 	for (size_t i = ps; i < ps + pcount; i++) { mb_block_plan_capture(b, i); set_dirty(b, i, true); page_cool(b, i); }
 	memcpy((void *)mirror_addr(b, start), src, len);
@@ -1268,7 +1324,7 @@ int mb_block_save_state(mb_block *b, mb_write_cb w, uintptr_t ud) {
 	for (size_t i = 0; i < b->npages; i++) {
 		if (!b->pages[i].invisible && b->pages[i].dirty) {
 			uintptr_t maddr = mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT));
-			ensure_committed(b, i, 1);
+			if (ensure_committed(b, i, 1) != 0) return -ENOMEM;
 			if (wr(w, ud, (const void *)maddr, MB_PAGESIZE)) return -EIO;
 		}
 	}
@@ -1366,7 +1422,8 @@ static size_t state_plan_impl(mb_block *b, uint8_t *dest) {
 		mb_page *p = &b->pages[i];
 		p->plan_slot = (uint32_t)b->plan_count;
 		b->plan_list[b->plan_count++] = i;
-		ensure_committed(b, i, 1);
+		/* a dirty page was written, so it is committed: this cannot be refused */
+		(void)ensure_committed(b, i, 1);
 		if (!plan_can_hold(p)) {
 			/* A page that cannot be held has to be copied now, while nothing
 			 * is running: there are a few hundred of them (two guest stacks)
@@ -1572,7 +1629,7 @@ int mb_block_load_state(mb_block *b, mb_read_cb r, uintptr_t ud) {
 		if (!p->invisible) {
 			bool old_d = p->dirty, new_d = dirtii[i] != 0;
 			uintptr_t maddr = mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT));
-			if (old_d || new_d) ensure_committed(b, i, 1);
+			if ((old_d || new_d) && ensure_committed(b, i, 1) != 0) { rc = -ENOMEM; goto done; }
 			if (!old_d && new_d) {
 				mb_page_maybe_snapshot(p, maddr);
 				if (rd(r, ud, (void *)maddr, MB_PAGESIZE)) { set_dirty(b, i, true); rc = -EIO; goto done; }
@@ -1780,7 +1837,7 @@ int mb_block_delta_save(mb_block *b, bool forward, mb_write_cb w, uintptr_t ud) 
 			uint64_t idx = i;
 			if (!b->pages[i].dirty) idx |= DELTA_IDX_CLEAN;   /* given back: baseline again, and clean */
 			if (wr(w, ud, &idx, sizeof(idx))) return -EIO;
-			ensure_committed(b, i, 1);   /* the live page, as the frame left it */
+			if (ensure_committed(b, i, 1) != 0) return -ENOMEM;   /* the live page, as the frame left it */
 			if (wr(w, ud, (const void *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)), MB_PAGESIZE)) return -EIO;
 		}
 	}
@@ -2086,7 +2143,7 @@ int mb_block_delta_apply(mb_block *b, mb_read_cb r, uintptr_t ud) {
 		const mb_prot before = mb_page_native_prot(p);
 		const bool was_uncommitted = p->uncommitted;   /* backed below: mapped with no access until refreshed */
 		const uintptr_t maddr = mirror_addr(b, b->addr.start + (idx << MB_PAGESHIFT));
-		ensure_committed(b, (size_t)idx, 1);
+		if (ensure_committed(b, (size_t)idx, 1) != 0) { rc = -ENOMEM; goto done; }
 		/* The baseline copy BEFORE the page is overwritten, as the fault handler
 		 * and load_state take it. Taken after, a page this process had never
 		 * written - one from a history file, applied to a machine that had not
