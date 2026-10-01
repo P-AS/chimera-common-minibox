@@ -13,6 +13,11 @@
 #ifndef _WIN32
 #include <pthread.h>
 #include <unistd.h>
+#include <sys/uio.h>
+/* the spin sampler's host, and the lock that lets mb_host_destroy wait for it
+ * (see sample_fn) */
+static pthread_mutex_t sample_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct mb_host *sample_h;
 #endif
 
 struct mb_host {
@@ -58,11 +63,6 @@ enum {
 	NR_readlink=89, NR_readlinkat=267, NR_pipe=22, NR_pipe2=293,
 };
 
-/* Guest-visible errno values are LINUX numbers (the guest is musl/Linux):
- * the host libc's need not match - MSVCRT's ENOSYS is 40, Linux's 38 - so
- * every serr() a guest can observe must carry the Linux value. EINVAL
- * happens to be 22 on both; ENOSYS is not. */
-enum { LINUX_ENOSYS = 38 };
 
 #define MAP_ANONYMOUS 0x20
 #define MAP_STACK 0x20000
@@ -85,7 +85,7 @@ enum { LINUX_ENOSYS = 38 };
 #define FUTEX_CLOCK_REALTIME 256
 #define FUTEX_UNLOCK_PI 7
 
-static uintptr_t serr(int e) { return (uintptr_t)(intptr_t)(-e); }  /* -errno as usize */
+static uintptr_t serr(int e) { return (uintptr_t)(intptr_t)(-mb_linux_errno(e)); }  /* -errno as usize, in Linux numbers */
 static uintptr_t sok(mb_sword v) { return (uintptr_t)v; }
 
 static mb_prot arg_to_prot(uintptr_t a, bool *bad) {
@@ -188,7 +188,7 @@ static void guest_last_words(mb_host *h, char *out, size_t cap) {
 
 /* Says it, keeps it, marks it. True when a guarded call is in progress to go
  * back to. */
-static bool record_death(mb_context *c, const char *fmt, va_list ap) {
+static bool record_death(mb_context *c, bool say_stack, const char *fmt, va_list ap) {
 	mb_host *h = c != NULL ? (mb_host *)c->host_ptr : NULL;
 	char what[256];
 	vsnprintf(what, sizeof what, fmt, ap);
@@ -203,23 +203,15 @@ static bool record_death(mb_context *c, const char *fmt, va_list ap) {
 	}
 	if (c == NULL) return false;
 	c->dead = 1;
-	/* Death-site backtrace (host VA == guest VA). Pages are checked first:
-	 * a dying thread's rsp may point at a guard page, and a nested fault
-	 * in here would lose the report it is part of. */
-	{
-		uintptr_t rsp = c->guest_rsp;
-		uint32_t atid = h && h->threads ? mb_threads_active_tid(h->threads) : 0;
-		mb_diag("  active tid=%u rsp=%lx stack:", atid, (unsigned long)rsp);
-		char sb[2048]; size_t so = 0;
-		for (int i = 0; i < 96 && so + 20 < sizeof sb; i++) {
-			uintptr_t a = rsp + (uintptr_t)i * sizeof(uintptr_t);
-			/* pageStarts, not iteration counts: rsp is not page-aligned */
-			if ((i == 0 || (a & MB_PAGEMASK) == 0) && !mb_page_readable(a)) break;
-			so += (size_t)snprintf(sb + so, sizeof sb - so, " %lx",
-			                       (unsigned long)*(const uintptr_t *)a);
-		}
-		sb[so] = '\0';
-		mb_diag("%s\n", sb);
+	/* Where the guest was, for a death that is not a fault - an abort, an
+	 * exit, a deadlock, all of which arrive through a syscall, so the saved
+	 * guest rsp is the one the call left. A fault's report already carries its
+	 * own walk, from the faulting rsp (tripguard.c). The same filtered form:
+	 * only words inside the ELF, ready for addr2line, because this is the file
+	 * people attach to an issue. */
+	if (say_stack) {
+		mb_diag(" active tid=%u", h && h->threads ? mb_threads_active_tid(h->threads) : 0);
+		mb_tripguard_say_guest_stack(c->guest_rsp);
 	}
 	const bool escapable = c->esc_rsp != 0;
 	mb_diag(escapable
@@ -231,7 +223,7 @@ static bool record_death(mb_context *c, const char *fmt, va_list ap) {
 void mb_host_guest_death(mb_context *c, const char *fmt, ...) {
 	va_list ap;
 	va_start(ap, fmt);
-	const bool escapable = record_death(c, fmt, ap);
+	const bool escapable = record_death(c, true, fmt, ap);
 	va_end(ap);
 	if (escapable) mb_guarded_escape_now(c);
 	__builtin_trap();
@@ -240,7 +232,7 @@ void mb_host_guest_death(mb_context *c, const char *fmt, ...) {
 bool mb_host_guest_death_in_handler(mb_context *c, const char *fmt, ...) {
 	va_list ap;
 	va_start(ap, fmt);
-	const bool escapable = record_death(c, fmt, ap);
+	const bool escapable = record_death(c, false, fmt, ap);
 	va_end(ap);
 	return escapable;
 }
@@ -435,7 +427,7 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 		 * needs pipe2 and fails here; without an in-guest provider
 		 * this stays unreachable).
 		 * A caller that needs one must cope with ENOSYS. */
-		case NR_pipe: case NR_pipe2: return serr(LINUX_ENOSYS);
+		case NR_pipe: case NR_pipe2: return serr(ENOSYS);
 		case NR_read:  { mb_sword r = mb_fs_read(h->fs, (int)a1, (uint8_t *)a2, a3); return r < 0 ? serr((int)-r) : sok(r); }
 		case NR_write: {
 			const uint64_t before = mb_fs_sysout_total(h->fs);
@@ -485,7 +477,10 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 		}
 		case NR_getrusage: {
 			/* zeros: no resource usage is observable in-guest.
-			 * (a1 is who=RUSAGE_SELF/CHILDREN, a2 is struct rusage*.) */
+			 * (a1 is who=RUSAGE_SELF/CHILDREN, a2 is struct rusage*.)
+			 * A pointer the guest does not own is EFAULT, as on Linux -
+			 * not a host fault. */
+			if (!guest_owns(h, a2, 144)) return serr(EFAULT);
 			memset((void *)a2, 0, 144);
 			return sok(0);
 		}
@@ -607,8 +602,21 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 		case NR_fsync: case NR_fdatasync: case NR_syncfs:
 			/* the same, for one descriptor: it is flushed if it is open at all */
 			{ mb_sword r = mb_fs_sync_fd(h->fs, (int)a1); return r < 0 ? serr((int)-r) : sok(0); }
-		case NR_rt_sigaction: return sok(0);   /* no signal delivery in-guest;
-		                                           install accepted, never fires */
+		case NR_rt_sigaction: {
+			/* No signal delivery in-guest: an install is accepted and never
+			 * fires. (a1 sig, a2 act, a3 oldact, a4 sigsetsize.) The old
+			 * action is reported as the default - SIG_DFL, no flags, empty
+			 * mask - because that is what nothing installed means, and a
+			 * guest that saves and restores the old action must not read
+			 * whatever was on its stack. The kernel's struct is 32 bytes:
+			 * handler, flags, restorer, mask. */
+			if (a2 != 0 && !guest_owns(h, a2, 32)) return serr(EFAULT);
+			if (a3 != 0) {
+				if (!guest_owns(h, a3, 32)) return serr(EFAULT);
+				memset((void *)a3, 0, 32);
+			}
+			return sok(0);
+		}
 		case NR_rt_sigprocmask: return sok(0);
 		case NR_tkill: case NR_tgkill: {
 			/* A signal to one of its own threads. The one a guest sends is to itself:
@@ -891,6 +899,12 @@ void mb_host_destroy(mb_host *h) {
 	 * machine opened in the same process took its first fault against this one's
 	 * freed context and wrote whatever was left there into the host's %fs. */
 	if (mb_guest_ctx == &h->context) mb_guest_ctx = NULL;
+#ifndef _WIN32
+	/* and the spin sampler: it must be done with this host before it is freed */
+	pthread_mutex_lock(&sample_lock);
+	if (sample_h == h) sample_h = NULL;
+	pthread_mutex_unlock(&sample_lock);
+#endif
 	/* The same rule for the same reason, one field over: the fault handler
 	 * names the region an address landed in by reading this host's layout, and
 	 * a freed host is not a layout. chimera#127 died of exactly this - the
@@ -906,11 +920,17 @@ void mb_host_destroy(mb_host *h) {
 uintptr_t mb_host_proc_addr_raw(mb_host *h, const char *name);
 
 /* Spin sampler (MB_SAMPLE_SECS=N). A helper thread prints the active green
- * thread + guest rsp + stack top every N seconds. Racy reads are fine for
- * diagnosis (may tear). Locates non-syscall spins. POSIX-only, env-gated,
- * and unobservable by the guest. */
+ * thread + guest rsp + stack top every N seconds. Locates non-syscall spins.
+ * POSIX-only, env-gated, and unobservable by the guest.
+ *
+ * It must never be able to take the process down, because it runs beside the
+ * frontend rather than inside the guest: a fault on this thread is nobody's
+ * to handle. So the stack is read with process_vm_readv on our own pid - a
+ * page that is gone (or goes while we read) is an error return, not a
+ * SIGSEGV - and the host it reads is held under sample_lock, which
+ * mb_host_destroy takes before the host is freed. Each activate points it at
+ * the live host, so a reboot does not leave it reading the first one. */
 #ifndef _WIN32
-static struct mb_host *sample_h;
 static pthread_t sample_thr;
 static int sample_started;
 static void *sample_fn(void *arg) {
@@ -920,14 +940,21 @@ static void *sample_fn(void *arg) {
 	if (secs <= 0) return NULL;
 	for (;;) {
 		sleep((unsigned)secs);
+		pthread_mutex_lock(&sample_lock);
 		struct mb_host *h = sample_h;
-		if (!h || !h->active) continue;
-		uint64_t *sp = (uint64_t *)h->context.guest_rsp;
-		fprintf(stderr, "[S] active=%u rsp=%lx stack:",
-		        mb_threads_active_tid(h->threads),
-		        (unsigned long)h->context.guest_rsp);
-		for (int i = 0; i < 12; i++) fprintf(stderr, " %lx", (unsigned long)sp[i]);
-		fprintf(stderr, "\n");
+		if (h && h->active) {
+			const uintptr_t rsp = h->context.guest_rsp;   /* racy by design: a snapshot */
+			uint64_t words[12];
+			struct iovec local = { words, sizeof words }, remote = { (void *)rsp, sizeof words };
+			const ssize_t got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+			fprintf(stderr, "[S] active=%u rsp=%lx stack:", mb_threads_active_tid(h->threads), (unsigned long)rsp);
+			if (got == (ssize_t)sizeof words)
+				for (int i = 0; i < 12; i++) fprintf(stderr, " %lx", (unsigned long)words[i]);
+			else
+				fprintf(stderr, " (not readable)");
+			fprintf(stderr, "\n");
+		}
+		pthread_mutex_unlock(&sample_lock);
 	}
 	return NULL;
 }
@@ -946,10 +973,15 @@ void mb_host_activate(mb_host *h) {
 	 * find no entry context to save. The guest ABI is spelled in the type. */
 	mb_tripguard_set_guest_fault_handler((mb_guest_fault_fn)mb_host_proc_addr_raw(h, "GuestFaultHandler"));
 #ifndef _WIN32
-	if (!sample_started && getenv("MB_SAMPLE_SECS")) {
-		sample_started = 1; sample_h = h;
-		pthread_create(&sample_thr, NULL, sample_fn, NULL);
-		pthread_detach(sample_thr);
+	if (getenv("MB_SAMPLE_SECS")) {
+		pthread_mutex_lock(&sample_lock);
+		sample_h = h;   /* the live host, every time: a reboot makes a new one */
+		pthread_mutex_unlock(&sample_lock);
+		if (!sample_started) {
+			sample_started = 1;
+			pthread_create(&sample_thr, NULL, sample_fn, NULL);
+			pthread_detach(sample_thr);
+		}
 	}
 #endif
 	if (h->active) return;

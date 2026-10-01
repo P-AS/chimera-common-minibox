@@ -18,6 +18,37 @@
  * is not a subtle bug: brk returned a truncated break, the guest computed its
  * next break from it, and the process died inside the first file read. */
 typedef intptr_t mb_sword;
+
+/* The guest is Linux, so every error number it sees is a LINUX number - but
+ * the host spells errors in its own libc's numbers, and MSVCRT's are not
+ * Linux's past ERANGE: ENOSYS is 40 there and 38 here, so a Windows host told
+ * a guest ELOOP when it meant "not implemented", EOPNOTSUPP 130 read as
+ * EOWNERDEAD, ETIMEDOUT 138 as nothing at all. Every error a guest can see
+ * goes through this (serr in host.c and threading.c). Keyed by NAME, so on a
+ * Linux host it is the identity and on Windows it translates; the aliases
+ * (ENOTSUP/EOPNOTSUPP, EWOULDBLOCK/EAGAIN) are separate numbers on Windows
+ * and the same one on Linux, which a table can hold and a switch cannot. A
+ * host number not listed passes through unchanged. */
+#include <errno.h>
+static inline int mb_linux_errno(int host) {
+	static const struct { int host, linux_; } map[] = {
+		{ EPERM, 1 }, { ENOENT, 2 }, { ESRCH, 3 }, { EINTR, 4 }, { EIO, 5 },
+		{ ENXIO, 6 }, { E2BIG, 7 }, { ENOEXEC, 8 }, { EBADF, 9 }, { ECHILD, 10 },
+		{ EAGAIN, 11 }, { ENOMEM, 12 }, { EACCES, 13 }, { EFAULT, 14 },
+		{ EBUSY, 16 }, { EEXIST, 17 }, { EXDEV, 18 }, { ENODEV, 19 },
+		{ ENOTDIR, 20 }, { EISDIR, 21 }, { EINVAL, 22 }, { ENFILE, 23 },
+		{ EMFILE, 24 }, { ENOTTY, 25 }, { EFBIG, 27 }, { ENOSPC, 28 },
+		{ ESPIPE, 29 }, { EROFS, 30 }, { EMLINK, 31 }, { EPIPE, 32 },
+		{ EDOM, 33 }, { ERANGE, 34 }, { EDEADLK, 35 }, { ENAMETOOLONG, 36 },
+		{ ENOLCK, 37 }, { ENOSYS, 38 }, { ENOTEMPTY, 39 }, { ELOOP, 40 },
+		{ EWOULDBLOCK, 11 }, { EILSEQ, 84 }, { EOVERFLOW, 75 },
+		{ ENOTSUP, 95 }, { EOPNOTSUPP, 95 }, { ECANCELED, 125 },
+		{ ETIMEDOUT, 110 },
+	};
+	for (size_t i = 0; i < sizeof map / sizeof map[0]; i++)
+		if (map[i].host == host) return map[i].linux_;
+	return host;
+}
 /* If this ever fails, every syscall return is silently losing its top half. */
 typedef char mb_sword_is_64_bit[sizeof(mb_sword) == 8 ? 1 : -1];
 
@@ -258,6 +289,13 @@ uint8_t mb_block_page_info(mb_block *b, size_t index);
 const uint8_t *mb_block_hash(const mb_block *b);  /* 32 bytes; valid once sealed */
 
 /* Savestate (structure per docs/docs/MACHINE-SPEC.md section 6). Return 0 on success. */
+/* A guest fault on a lazy block's page whose commit the OS refused: commit it
+ * now (memblock.c). *oom is set when the OS refuses again. */
+bool mb_block_commit_on_fault(mb_block *b, uintptr_t addr, bool write, bool *oom);
+#ifdef _WIN32
+extern int mb_pal_commit_refusals;   /* tests: commits to refuse (pal_win.c) */
+#endif
+
 int mb_block_save_state(mb_block *b, mb_write_cb w, uintptr_t ud);
 int mb_block_load_state(mb_block *b, mb_read_cb r, uintptr_t ud);
 
@@ -330,6 +368,9 @@ void mb_tripguard_unregister(mb_block *b);
  * only, no stdio or allocation: this runs inside the fault handler (see
  * tripguard.c). */
 bool mb_page_readable(uintptr_t p);
+/* The guest stack at rsp, as a fault report prints it: words inside the ELF,
+ * ready for addr2line. For a death that is not a fault (host.c). */
+void mb_tripguard_say_guest_stack(uintptr_t rsp);
 /* The live machine's layout, so an unhandled fault can name the region it
  * landed in rather than a page number somebody has to work out by hand. */
 void mb_tripguard_set_layout(const mb_layout *l);
@@ -515,6 +556,9 @@ mb_sword mb_fs_truncate_name(mb_fs *fs, const char *name, mb_sword size);
 mb_sword mb_fs_truncate_fd(mb_fs *fs, int fd, mb_sword size);
 mb_sword mb_fs_sync_fd(mb_fs *fs, int fd);
 size_t   mb_fs_sysout_tail(const mb_fs *fs, char *out, size_t cap);
+/* The core log: copy every guest stdout/stderr write into this file (UTF-8
+ * path, appended), or stop with NULL. 0 or -errno. */
+int      mb_set_output_file(const char *path);
 /* bytes ever written to stdout/stderr, and the newest of those written since a
  * count of them (at most cap, and at most what the ring still holds) */
 uint64_t mb_fs_sysout_total(const mb_fs *fs);

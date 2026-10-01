@@ -248,7 +248,7 @@ static int host_fault_is_reported_as_passed_on(const char *self, const char *gue
 	const char *dir = getenv("TMPDIR");
 	if (dir == NULL || dir[0] == '\0') dir = "/tmp";
 	char log[512], cmd[2048];
-	snprintf(log, sizeof log, "%s/run_guest_hostfault_%ld.log", dir, (long)time(NULL));
+	snprintf(log, sizeof log, "%s/run_guest_hostfault_%ld_%ld.log", dir, (long)getpid(), (long)time(NULL));
 	remove(log);
 	setenv("MINIBOX_LOG", log, 1);
 	snprintf(cmd, sizeof cmd, "'%s' --host-fault-child '%s' >/dev/null 2>&1", self, guest);
@@ -301,7 +301,7 @@ static int handler_does_not_recurse(const char *self, const char *guest) {
 	const char *dir = getenv("TEMP");
 	if (dir == NULL || dir[0] == '\0') dir = ".";
 	char log[512], cmd[2048];
-	snprintf(log, sizeof log, "%s\\run_guest_recursion_%ld.log", dir, (long)time(NULL));
+	snprintf(log, sizeof log, "%s\\run_guest_recursion_%ld_%ld.log", dir, (long)getpid(), (long)time(NULL));
 	remove(log);
 	_putenv_s("MINIBOX_LOG", log);
 	snprintf(cmd, sizeof cmd, "\"\"%s\" --handler-recursion-child \"%s\" >NUL 2>&1\"", self, guest);
@@ -405,6 +405,11 @@ static int fs_repair_child(const char *guest) {
 	CHECK(f0 != 0);
 	uint64_t v2 = ClobberAndProbe();
 	CHECK(Alive() == 0xA11FE);   /* survived: without the repair this is refused (0) */
+	/* and what the retried access read is what this guest saw before the
+	 * drop - the host's base, because it does not own %fs. Its thread
+	 * pointer here would leave the host's C reading glibc's thread locals
+	 * out of the guest's block for the rest of the call. */
+	CHECK(v2 == v1);
 	uint64_t v3 = FsProbe();
 	CHECK(v3 == v1);             /* the host base, intact across the episode */
 	CHECK(host_fs_base() == f0); /* ...in the register too */
@@ -432,7 +437,7 @@ static int guest_abort_is_reported(const char *self, const char *guest) {
 	const char *dir = getenv("TMPDIR");
 	if (dir == NULL || dir[0] == '\0') dir = "/tmp";
 	char log[512], cmd[2048];
-	snprintf(log, sizeof log, "%s/run_guest_abort_%ld.log", dir, (long)time(NULL));
+	snprintf(log, sizeof log, "%s/run_guest_abort_%ld_%ld.log", dir, (long)getpid(), (long)time(NULL));
 	remove(log);
 	setenv("MINIBOX_LOG", log, 1);
 	snprintf(cmd, sizeof cmd, "'%s' --abort-child '%s' >/dev/null 2>&1", self, guest);
@@ -447,8 +452,10 @@ static int guest_abort_is_reported(const char *self, const char *guest) {
 	const bool survived = status == 0;
 	const bool named = strstr(text, "the core aborted") != NULL;
 	const bool words = strstr(text, "conformance guest: these are my last words") != NULL;
-	printf("run_guest: abort child survived=%d, log names the abort=%d, log has the guest's words=%d\n", survived, named, words);
-	return survived && named && words;
+	/* and where it was: the abort's frames, in the form addr2line takes */
+	const bool stack = strstr(text, "guest stack (addr2line -f -C -e core.wbx): +") != NULL;
+	printf("run_guest: abort child survived=%d, log names the abort=%d, log has the guest's words=%d, and its stack=%d\n", survived, named, words, stack);
+	return survived && named && words && stack;
 #endif
 }
 
@@ -456,6 +463,67 @@ static int guest_abort_is_reported(const char *self, const char *guest) {
  * back. The call returns; the machine says why; every later call is refused and
  * runs nothing; and a state load brings back exactly the machine that was saved,
  * which the step after it proves. One host, killed and revived again and again. */
+#ifdef _WIN32
+/* chimera#166: out of memory is said as that. Windows refusing to commit the
+ * machine's memory (the system at its commit limit) used to leave the pages
+ * marked committed; the guest's next write to them faulted, was reported as
+ * "the core crashed", and going back to a safe frame crashed again. Now the
+ * refused pages are committed on the guest's fault, a refusal there is the
+ * machine's death as "out of memory", and once memory is back a load revives
+ * it and the same memory works. Only a machine over 4 GiB is committed lazily
+ * (pal_win.c), so this one is. */
+static void out_of_memory_is_said(const char *path) {
+	typedef uint32_t (MB_GUEST_ABI *touch_fn)(void);
+	mb_return r;
+	FILE *f = fopen(path, "rb");
+	if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(1); }
+	mb_memory_layout_template layout = {
+		.sbrk_size = 16u<<20, .sealed_size = 16u<<20, .invis_size = 16u<<20,
+		.plain_size = 16u<<20, .mmap_size = ((uintptr_t)4 << 30) + (32u<<20),
+	};
+	freader fr = { f };
+	wbx_create_host(&layout, "guest.wbx", file_read, (uintptr_t)&fr, &r);
+	fclose(f);
+	CHECK(!r.error_message[0]);
+	mb_host *h = (mb_host *)r.data;
+	uint32_t seed = 0xBEEF;
+	memreader mr = { (const uint8_t *)&seed, sizeof(seed), 0 };
+	wbx_mount_file(h, "seed", mem_reader, (uintptr_t)&mr, false, &r);
+	wbx_activate_host(h, &r);
+	((setcb_fn)proc(h, "SetLogCallback"))(0);
+	CHECK(((init_fn)proc(h, "Init"))() == 1);
+	seal_and_activate(h);
+	touch_fn TouchFresh = (touch_fn)proc(h, "TouchFresh");
+
+	membuf state = {0};
+	wbx_deactivate_host(h, &r);
+	wbx_save_state(h, mem_write, (uintptr_t)&state, &r);
+	CHECK(!r.error_message[0]);
+	wbx_activate_host(h, &r);
+
+	STAGE("a guest whose memory Windows will not commit");
+	SetEnvironmentVariableA("MB_REFUSE_COMMITS", "1");
+	TouchFresh();
+	SetEnvironmentVariableA("MB_REFUSE_COMMITS", NULL);
+	char why[512];
+	wbx_get_death(h, why, sizeof why, &r);
+	printf("run_guest: out of memory -> dead=%llu: %s\n", (unsigned long long)r.data, why);
+	CHECK(r.data == 1);
+	CHECK(strstr(why, "out of memory") != NULL);
+	CHECK(strstr(why, "crashed") == NULL);
+
+	STAGE("memory back: the machine revives, and the same memory works");
+	state.pos = 0;
+	wbx_deactivate_host(h, &r);
+	wbx_load_state(h, mem_read, (uintptr_t)&state, &r);
+	CHECK(!r.error_message[0]);
+	wbx_activate_host(h, &r);
+	CHECK(TouchFresh() == 0xF4E5);
+	wbx_destroy_host(h, &r);
+	free(state.buf);
+}
+#endif
+
 static void guest_deaths_are_survived(const char *path) {
 	typedef void (MB_GUEST_ABI *void_fn)(void);
 	typedef uint32_t (MB_GUEST_ABI *alive_fn)(void);
@@ -714,6 +782,9 @@ int main(int argc, char **argv) {
 
 	/* ---- a guest that dies does not take the host with it ---- */
 	guest_deaths_are_survived(path);
+#ifdef _WIN32
+	out_of_memory_is_said(path);
+#endif
 
 	/* ---- a destroyed machine is not what the fault handler reads (chimera#127) ----
 	 * The handler names the region an address landed in by reading the live

@@ -236,7 +236,12 @@ static bool insn_has_fs_prefix(uintptr_t rip) {
  * scan, which needs no thread pointer. An unreadable rip is not a repair
  * either way, it is a wild jump, and looking at it must not fault. */
 __attribute__((no_stack_protector))
-static bool rip_bytes_readable(uintptr_t rip) { return mb_page_readable(rip); }
+static bool rip_bytes_readable(uintptr_t rip) {
+	/* insn_has_fs_prefix reads up to 5 bytes: both pages, when they differ */
+	const uintptr_t last = rip + 4;
+	return mb_page_readable(rip)
+	    && ((last & ~(uintptr_t)MB_PAGEMASK) == (rip & ~(uintptr_t)MB_PAGEMASK) || mb_page_readable(last));
+}
 
 /* Leaving a fault handler back into guest code: install the guest's thread
  * pointer, whatever the register happens to hold now. The install comes
@@ -487,6 +492,9 @@ static void say_guest_stack(uintptr_t rsp) {
 	mb_diag(shown ? "\n" : " (nothing on it)\n");
 }
 
+/* The same walk, for a death that is not a fault (host.c record_death). */
+void mb_tripguard_say_guest_stack(uintptr_t rsp) { say_guest_stack(rsp); }
+
 #ifndef _WIN32
 /* ---- Linux: SIGSEGV via sigaction, chaining to the previous handler ---- */
 #include <signal.h>
@@ -542,10 +550,33 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
 	 * instruction says what it was. A fault that arrives back with %fs
 	 * already correct is the guest's own and goes below as it always did -
 	 * which is what bounds the retry to one pass. */
-	if (guest_rip && fs_at_fault != mb_guest_ctx->thread_area
+	/* What %fs IS for this guest decides what the repair puts back: its own
+	 * thread pointer when it owns %fs (fs_swap), and otherwise the host's
+	 * base, parked at entry. Not the thread pointer for every guest: on
+	 * Linux the host's C runs on %fs - glibc's thread locals, errno, malloc's
+	 * cache - and a guest that does not own %fs is not swapped back at the
+	 * syscall dispatcher or at an extcall, so a thread pointer installed for
+	 * it would have host code reading its thread locals out of the guest's
+	 * block until the guarded call returned. The bound is the same value: a
+	 * fault that arrives with %fs already what it should be is the guest's
+	 * own. (Windows is different: host code never uses FS there, and a guest
+	 * that reads %fs without owning it needs its thread pointer - see veh_fs.) */
+	const uintptr_t fs_want = !guest_rip ? 0
+	                        : mb_guest_ctx->fs_swap ? mb_guest_ctx->thread_area : mb_guest_ctx->host_fs;
+	if (guest_rip && fs_at_fault != fs_want
 	    && fs_at_fault != mb_early_tp && owner_of(fault) == NULL
 	    && rip_bytes_readable(rip) && insn_has_fs_prefix(rip)) {
-		mb_restore_guest_fs(fs_at_fault);
+		if (mb_guest_ctx->fs_swap) {
+			mb_restore_guest_fs(fs_at_fault);
+		} else {
+			/* the host's base is already back in the register (above) */
+			static bool said = false;
+			if (!said) {
+				said = true;
+				fprintf(stderr, "miniBox: a guest that does not own %%fs found it lost; the host's base is back\n");
+				fflush(stderr);
+			}
+		}
 		return;
 	}
 	handler_inner(sig, info, ucontext);
@@ -1026,9 +1057,27 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 	return r;
 }
 
+/* A page the OS refused to commit (memblock.c, ensure_committed): committed
+ * now, before dirty tracking - which would otherwise give an uncommitted page
+ * its protection and fault on it for ever. *oom when refused again. */
+static bool commit_on_fault(uintptr_t addr, bool write, bool *oom) {
+	mb_block *b = owner_of(addr);
+	if (!b || mb_block_track_held_here(b)) return false;
+	const int phase = fault_phase();
+	fault_phase_set(MB_PHASE_TRACK);
+	const bool served = mb_block_commit_on_fault(b, addr, write, oom);
+	fault_phase_set(phase);
+	return served;
+}
+
 static LONG veh_access_violation(EXCEPTION_POINTERS *ep, bool write, uintptr_t fault) {
-	if (write && trip(fault)) return EXCEPTION_CONTINUE_EXECUTION;
-	if (ask_guest(fault, write)) return EXCEPTION_CONTINUE_EXECUTION;
+	bool oom = false;
+	if (commit_on_fault(fault, write, &oom)) return EXCEPTION_CONTINUE_EXECUTION;
+	/* refused again: nothing else can serve a page with no memory behind it -
+	 * dirty tracking would protect it and trap on the refusal - so it is
+	 * reported, as the host being out of memory */
+	if (!oom && write && trip(fault)) return EXCEPTION_CONTINUE_EXECUTION;
+	if (!oom && ask_guest(fault, write)) return EXCEPTION_CONTINUE_EXECUTION;
 
 	/* Not miniBox's to handle. Say what was asked for and whether any block owns
 	 * the address - the difference between "the guest touched something it
@@ -1051,6 +1100,9 @@ static LONG veh_access_violation(EXCEPTION_POINTERS *ep, bool write, uintptr_t f
 		const char *access = ep->ExceptionRecord->ExceptionInformation[0] == 0 ? "read"
 		        : ep->ExceptionRecord->ExceptionInformation[0] == 1 ? "write" : "execute";
 		mb_diag_banner(guest_code ? "unhandled fault" : "a fault in host code");
+		if (oom)
+			mb_diag("[veh] out of memory: Windows would not commit the page at %p (error %lu); the machine cannot go on\n",
+			        (void *)fault, (unsigned long)GetLastError());
 		if (guest_code)
 			mb_diag("[veh] unhandled fault: addr=%p access=%s rip=%p, %s",
 			        (void *)fault, access, (void *)ep->ContextRecord->Rip,
@@ -1091,8 +1143,13 @@ static LONG veh_access_violation(EXCEPTION_POINTERS *ep, bool write, uintptr_t f
 		if (guest_code) say_guest_stack((uintptr_t)c->Rsp);
 		const uintptr_t rip = (uintptr_t)c->Rip;
 		if (guest_can_die_here(rip)) {
-			if (mb_host_guest_death_in_handler(mb_guest_ctx, "the core crashed: it %s address %p (at %p)",
-			        write ? "wrote to" : "read or ran", (void *)fault, (void *)rip)) {
+			const bool died = oom
+				? mb_host_guest_death_in_handler(mb_guest_ctx, "the computer is out of memory: Windows would not give the core "
+				      "the memory it needs (at %p). Close other programs, or give the greenzone less memory, and go back to a safe frame",
+				      (void *)fault)
+				: mb_host_guest_death_in_handler(mb_guest_ctx, "the core crashed: it %s address %p (at %p)",
+				      write ? "wrote to" : "read or ran", (void *)fault, (void *)rip);
+			if (died) {
 				ep->ContextRecord->Rsp = (DWORD64)mb_guest_ctx->esc_rsp;
 				ep->ContextRecord->Rip = (DWORD64)(uintptr_t)&mb_guarded_escape;
 				report_end(phase_before);

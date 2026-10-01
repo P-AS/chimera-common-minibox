@@ -106,6 +106,9 @@ void wbx_compose_delta(mb_read_callback a, uintptr_t a_userdata,
 /* pages the open epoch has touched: what a delta would cost, before writing one */
 void wbx_get_epoch_page_count(mb_host *obj, mb_return *ret);
 void wbx_set_always_evict_blocks(bool val);
+/* The core log: copy everything any guest writes to stdout/stderr into this
+ * file (UTF-8 path, appended, flushed per write) until called with NULL. */
+void wbx_set_output_file(const char *path, mb_return *ret);
 void wbx_get_page_len(mb_host *obj, mb_return *ret);
 void wbx_get_page_data(mb_host *obj, uintptr_t index, mb_return *ret);
 /* Whether the guest has died - aborted, halted, faulted, exited, or asked for
