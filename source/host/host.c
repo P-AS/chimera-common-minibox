@@ -430,7 +430,10 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 		}
 		case NR_getrusage: {
 			/* zeros: no resource usage is observable in-guest.
-			 * (a1 is who=RUSAGE_SELF/CHILDREN, a2 is struct rusage*.) */
+			 * (a1 is who=RUSAGE_SELF/CHILDREN, a2 is struct rusage*.)
+			 * A pointer the guest does not own is EFAULT, as on Linux -
+			 * not a host fault. */
+			if (!guest_owns(h, a2, 144)) return serr(EFAULT);
 			memset((void *)a2, 0, 144);
 			return sok(0);
 		}
@@ -543,8 +546,21 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 		case NR_fsync: case NR_fdatasync: case NR_syncfs:
 			/* the same, for one descriptor: it is flushed if it is open at all */
 			{ mb_sword r = mb_fs_sync_fd(h->fs, (int)a1); return r < 0 ? serr((int)-r) : sok(0); }
-		case NR_rt_sigaction: return sok(0);   /* no signal delivery in-guest;
-		                                           install accepted, never fires */
+		case NR_rt_sigaction: {
+			/* No signal delivery in-guest: an install is accepted and never
+			 * fires. (a1 sig, a2 act, a3 oldact, a4 sigsetsize.) The old
+			 * action is reported as the default - SIG_DFL, no flags, empty
+			 * mask - because that is what nothing installed means, and a
+			 * guest that saves and restores the old action must not read
+			 * whatever was on its stack. The kernel's struct is 32 bytes:
+			 * handler, flags, restorer, mask. */
+			if (a2 != 0 && !guest_owns(h, a2, 32)) return serr(EFAULT);
+			if (a3 != 0) {
+				if (!guest_owns(h, a3, 32)) return serr(EFAULT);
+				memset((void *)a3, 0, 32);
+			}
+			return sok(0);
+		}
 		case NR_rt_sigprocmask: return sok(0);
 		case NR_tkill: case NR_tgkill: {
 			/* A signal to one of its own threads. The one a guest sends is to itself:

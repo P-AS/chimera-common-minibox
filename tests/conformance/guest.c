@@ -93,6 +93,14 @@ ECL_EXPORT int SigactionAccepted(void) {
 	memset(&sa, 0, sizeof sa);
 	sa.sa_handler = SIG_IGN;
 	if (sigaction(SIGUSR1, &sa, NULL) != 0) return 0;
+	/* the old action reads as the default, not as what was on the stack */
+	struct sigaction old;
+	memset(&old, 0xA5, sizeof old);
+	if (sigaction(SIGUSR1, &sa, &old) != 0) return 0;
+	if (old.sa_handler != SIG_DFL || old.sa_flags != 0) return 0;
+	/* and a pointer the guest does not own is EFAULT, not a host fault */
+	errno = 0;
+	if (syscall(SYS_rt_sigaction, SIGUSR1, 0, (void *)16, 8) != -1 || errno != EFAULT) return 0;
 	return 1;
 }
 
@@ -115,6 +123,8 @@ ECL_EXPORT int GetrusageZeroed(void) {
 	 * bytes are specified. */
 	const unsigned char *p = (const unsigned char *)&ru;
 	for (size_t i = 0; i < 144; i++) if (p[i] != 0) return 0;
+	errno = 0;
+	if (syscall(SYS_getrusage, RUSAGE_SELF, (void *)16) != -1 || errno != EFAULT) return 0;
 	return 1;
 }
 
