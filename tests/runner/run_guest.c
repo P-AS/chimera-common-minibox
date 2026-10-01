@@ -39,7 +39,15 @@ static intptr_t mem_reader(uintptr_t ud, uint8_t *data, uintptr_t size) {
 	memcpy(data, m->p + m->pos, take); m->pos += take; return (intptr_t)take;
 }
 typedef struct { uint8_t *buf; size_t len, cap, pos; } membuf;
-static int32_t mem_write(uintptr_t ud, const uint8_t *data, uintptr_t n) {
+
+/* does a savestate buffer contain a byte string (thread-set magic check) */
+static bool state_contains(membuf *m, const char *s) {
+	size_t n = strlen(s);
+	if (n == 0 || m->len < n) return false;
+	for (size_t i = 0; i + n <= m->len; i++)
+		if (memcmp(m->buf + i, s, n) == 0) return true;
+	return false;
+}static int32_t mem_write(uintptr_t ud, const uint8_t *data, uintptr_t n) {
 	membuf *m = (membuf *)ud;
 	if (m->len + n > m->cap) { m->cap = (m->len + n) * 2 + 64; m->buf = realloc(m->buf, m->cap); }
 	memcpy(m->buf + m->len, data, n); m->len += n; return 0;
@@ -52,6 +60,11 @@ static intptr_t mem_read(uintptr_t ud, uint8_t *data, uintptr_t n) {
 
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "  FAIL %s:%d %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
+/* Stage markers on stderr, which is unbuffered: when the host aborts or the
+ * process dies, buffered stdout is lost, and the last thing seen is whatever
+ * the GUEST printed (its writes go through the host's stderr). That reads as
+ * "it stopped right after guest init" no matter where it really stopped. */
+#define STAGE(...) do { fprintf(stderr, "[stage] " __VA_ARGS__); fputc('\n', stderr); fflush(stderr); } while (0)
 
 /* guest->host callback (slot 0): record the last logged accumulator value.
  *
@@ -100,6 +113,82 @@ static mb_host *make_host(const char *path, uint32_t seed) {
 	return h;
 }
 
+/* A v3 host: seed readonly plus a writable scratch file for the O_TRUNC case */
+static void seal_and_activate(mb_host *h);
+static mb_host *make_v3_host(const char *path) {
+	FILE *f = fopen(path, "rb");
+	if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(1); }
+	mb_memory_layout_template layout = {
+		.sbrk_size = 16u<<20, .sealed_size = 16u<<20, .invis_size = 16u<<20,
+		.plain_size = 16u<<20, .mmap_size = 32u<<20,
+	};
+	freader fr = { f };
+	mb_return r;
+	wbx_create_host(&layout, "guest-v3.wbx", file_read, (uintptr_t)&fr, &r);
+	fclose(f);
+	if (r.error_message[0]) { fprintf(stderr, "create_host: %s\n", r.error_message); exit(1); }
+	mb_host *h = (mb_host *)r.data;
+	uint32_t seed = 0xABCD;
+	memreader mr = { (const uint8_t *)&seed, sizeof(seed), 0 };
+	wbx_mount_file(h, "seed", mem_reader, (uintptr_t)&mr, false, &r);
+	CHECK(!r.error_message[0]);
+	static uint8_t scratch_init[1] = { 'X' };
+	memreader sr = { scratch_init, sizeof scratch_init, 0 };
+	wbx_mount_file(h, "scratch", mem_reader, (uintptr_t)&sr, true, &r);
+	CHECK(!r.error_message[0]);
+	return h;
+}
+
+/* Spec v3 end to end: a guest declaring __wbx_machine_spec = 3. Fresh host
+ * per export group is unnecessary; one host runs the clock/sleep/wait/memory
+ * checks in order (each is self-contained), then the save/load dance around
+ * a parked timed waiter, then the v3 magic check. */
+static int v3_flow(const char *guest) {
+	mb_return r;
+	typedef int (MB_GUEST_ABI *int_fn)(void);
+	typedef uint64_t (MB_GUEST_ABI *u64_fn)(void);
+	mb_host *h = make_v3_host(guest);
+	STAGE("v3 host created + guest mounted");
+	wbx_activate_host(h, &r);
+	CHECK(((init_fn)proc(h, "Init"))() == 1);
+	seal_and_activate(h);
+	STAGE("v3 clock + sleeps + single wait");
+	CHECK(((int_fn)proc(h, "V3ClockTicks"))() == 1);
+	CHECK(((int_fn)proc(h, "V3NanosleepExact"))() == 1);
+	CHECK(((int_fn)proc(h, "V3TimedWaitExpires"))() == 1);
+	CHECK(((int_fn)proc(h, "V3WaitBitset"))() == 1);
+	STAGE("v3 waiter order + ties");	CHECK(((int_fn)proc(h, "V3WaitOrder"))() == 1);
+	STAGE("v3 memory + files");
+	CHECK(((int_fn)proc(h, "V3MremapMoves"))() == 1);
+	CHECK(((int_fn)proc(h, "V3HintHonored"))() == 1);
+	CHECK(((int_fn)proc(h, "V3OTrunc"))() == 1);
+	STAGE("v3 save/load across a timed wait");
+	CHECK(((int_fn)proc(h, "SetupWaiter"))() == 1);
+	uint64_t deadline = ((u64_fn)proc(h, "GetDeadline"))();
+	membuf state = {0};
+	wbx_deactivate_host(h, &r);
+	wbx_save_state(h, mem_write, (uintptr_t)&state, &r);
+	CHECK(!r.error_message[0]);
+	/* v3 thread-state format: Se3 in (and the v2 body inside it) */
+	CHECK(state_contains(&state, "GuestThreadSe3"));
+	CHECK(state_contains(&state, "GuestThreadSet"));
+	wbx_activate_host(h, &r);
+	uint64_t o1 = ((u64_fn)proc(h, "ExpireStep"))();
+	CHECK(o1 != 0);
+	CHECK(o1 == deadline + 1000);   /* expired exactly at the deadline */
+	state.pos = 0;
+	wbx_deactivate_host(h, &r);
+	wbx_load_state(h, mem_read, (uintptr_t)&state, &r);
+	CHECK(!r.error_message[0]);
+	wbx_activate_host(h, &r);
+	uint64_t o2 = ((u64_fn)proc(h, "ExpireStep"))();
+	CHECK(o2 == o1);                /* the wake happens at the same virtual time */
+	free(state.buf);
+	wbx_deactivate_host(h, &r);
+	wbx_destroy_host(h, &r);
+	return fails != 0;
+}
+
 static void seal_and_activate(mb_host *h) {
 	mb_return r;
 	fprintf(stderr, "[stage] sealing\n"); fflush(stderr);
@@ -113,7 +202,6 @@ static void seal_and_activate(mb_host *h) {
  * process dies, buffered stdout is lost, and the last thing seen is whatever the
  * GUEST printed (its writes go through the host's stderr). That reads as "it
  * stopped right after guest init" no matter where it really stopped. */
-#define STAGE(...) do { fprintf(stderr, "[stage] " __VA_ARGS__); fputc('\n', stderr); fflush(stderr); } while (0)
 
 /* The child half of the abort check: make a host, let the guest abort. The call
  * comes back - the machine is dead, the process is not - and the child says so
@@ -519,6 +607,7 @@ int main(int argc, char **argv) {
 #else
 	if (argc > 2 && strcmp(argv[1], "--handler-recursion-child") == 0) return handler_recursion_child(argv[2]);
 #endif
+	if (argc > 2 && strcmp(argv[1], "--v3") == 0) return v3_flow(argv[2]);
 	if (argc > 2 && strcmp(argv[1], "--probe-off") == 0) {
 		/* Probe forced off before anything initializes: the FSGSBASE
 		 * instructions must be unreachable, so the whole standard flow
@@ -582,6 +671,15 @@ int main(int argc, char **argv) {
 		CHECK(((int_fn)proc(h, "GetrusageZeroed"))() == 1);
 		CHECK(((int_fn)proc(h, "NullCloneRefused"))() == 1);
 	}
+	/* spec v2 invariants a v3 host must preserve: this guest declares
+	 * nothing, so the clock is constant, timeouts never expire on their
+	 * own, and a blocked mremap is EEXIST. */
+	{
+		typedef int (MB_GUEST_ABI *int_fn)(void);
+		CHECK(((int_fn)proc(h, "V2ClockConstant"))() == 1);
+		CHECK(((int_fn)proc(h, "V2TimedWaitIgnored"))() == 1);
+		CHECK(((int_fn)proc(h, "V2MremapBlocked"))() == 1);
+	}
 	STAGE("Init returned");
 	seal_and_activate(h);
 
@@ -608,6 +706,9 @@ int main(int argc, char **argv) {
 	wbx_deactivate_host(h, &r);
 	wbx_save_state(h, mem_write, (uintptr_t)&state, &r);
 	CHECK(!r.error_message[0]);
+	/* v2 thread-state format, byte for byte: GuestThreadSet in, Se3 never */
+	CHECK(state_contains(&state, "GuestThreadSet"));
+	CHECK(!state_contains(&state, "GuestThreadSe3"));
 	wbx_activate_host(h, &r);
 
 	uint32_t s3 = Step(0x33333333);

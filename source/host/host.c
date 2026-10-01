@@ -66,7 +66,11 @@ enum {
 
 #define MAP_ANONYMOUS 0x20
 #define MAP_STACK 0x20000
+#define MAP_FIXED 0x10
 #define MAP_FIXED_NOREPLACE 0x100000
+#define MREMAP_MAYMOVE 1
+#define MREMAP_FIXED 2
+#define O_TRUNC 01000
 #define MADV_DONTNEED 4
 #define PROT_READ 1
 #define PROT_WRITE 2
@@ -364,6 +368,12 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			bool no_replace = (flags & MAP_FIXED_NOREPLACE) != 0;
 			/* the kernel rounds an unaligned length up to a page; so do we */
 			mb_range r = { a1, (a2 + 0xFFF) & ~(uintptr_t)0xFFF };
+			/* v3: a bare hint is honoured when those pages are Free, and the
+			 * call is placed best-fit otherwise (v2 keeps mapping it fixed).
+			 * MAP_FIXED is not a hint: it maps at the address, discarding
+			 * overlap, in both versions. MAP_FIXED_NOREPLACE keeps today's
+			 * rule in both. */
+			if (mb_threads_spec(h->threads) == 3 && a1 != 0 && !no_replace && (flags & MAP_FIXED) == 0 && !mb_block_range_is_free(h->block, r)) r.start = 0;
 			mb_sword res = mb_block_mmap(h->block, r, prot, h->layout.mmap_arena, no_replace);
 			/* A request bigger than the whole arena is not a tight fit, it is a
 			 * mistake - a corrupted size, or a reservation nobody sized against
@@ -376,7 +386,13 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 		}
 		case NR_mremap: {
 			mb_range r = { a1, a2 };
-			mb_sword res = mb_block_mremap(h->block, r, a3, h->layout.mmap_arena);
+			/* v3: moves only with MREMAP_MAYMOVE (without it, EEXIST as in
+			 * v2); MAYMOVE|FIXED is EINVAL. v2 never examines the flags. */
+			mb_sword res;
+			if (mb_threads_spec(h->threads) == 3) {
+				if ((a4 & MREMAP_FIXED) != 0) return serr(EINVAL);
+				res = mb_block_mremap_maymove(h->block, r, a3, h->layout.mmap_arena, (a4 & MREMAP_MAYMOVE) != 0);
+			} else res = mb_block_mremap(h->block, r, a3, h->layout.mmap_arena);
 			return res < 0 ? serr((int)-res) : sok(res);
 		}
 		case NR_mprotect: {
@@ -436,7 +452,18 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			return sok(total);
 		}
 		case NR_open:  { const char *p = guest_str(h, a1); if (!p) return serr(EFAULT);
-		                 mb_sword r = mb_fs_open(h->fs, p, (int)a2); return r < 0 ? serr((int)-r) : sok(r); }
+		                 int flags = (int)a2;
+		                 /* v3 O_TRUNC: needs write access (else EACCES); after a
+		                  * successful open the file is truncated, except streams
+		                  * (truncate refuses those with EBADF, which is ignored) */
+		                 if (mb_threads_spec(h->threads) == 3 && (flags & O_TRUNC) != 0 && (flags & 3) == 0) return serr(EACCES);
+		                 mb_sword r = mb_fs_open(h->fs, p, flags);
+		                 if (r < 0) return serr((int)-r);
+		                 if (mb_threads_spec(h->threads) == 3 && (flags & O_TRUNC) != 0) {
+		                     mb_sword t = mb_fs_truncate_fd(h->fs, (int)r, 0);
+		                     if (t < 0 && t != -EBADF) return serr((int)-t);
+		                 }
+		                 return sok(r); }
 		case NR_sysinfo: {
 			/* fixed, plausible, deterministic: 1GB total, half free, no swap.
 			 * (struct sysinfo is 112 bytes of longs; fill what matters.) */
@@ -522,6 +549,15 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 		case NR_ftruncate: { mb_sword r = mb_fs_truncate_fd(h->fs, (int)a1, (mb_sword)a2); return r < 0 ? serr((int)-r) : sok(0); }
 		case NR_clock_gettime: {
 			int64_t *ts = (int64_t *)a2;  /* {tv_sec, tv_nsec} */
+			/* v3: the clock starts at the v2 constant and every read ticks
+			 * 1 us, then yields (a spinner on the clock hands the others a
+			 * chance to run; single-threaded the yield is a no-op) */
+			if (mb_threads_spec(h->threads) == 3) {
+				mb_threads_advance(h->threads, MB_V3_TICK_NS);
+				uint64_t now = MB_V3_BASE_NS + mb_threads_clock_ns(h->threads);
+				ts[0] = (int64_t)(now / 1000000000ull); ts[1] = (int64_t)(now % 1000000000ull);
+				return mb_threads_yield_value(h->threads, &h->context, sok(0));
+			}
 			ts[0] = 1495889068; ts[1] = 0; return sok(0);
 		}
 		case NR_getrandom: {
@@ -609,8 +645,39 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 		 * privileged and no path is taken for one user and not another. */
 		case NR_getuid: case NR_geteuid: return sok(1000);
 		case NR_getgid: case NR_getegid: return sok(1000);
-		case NR_sched_yield: case NR_nanosleep: case NR_clock_nanosleep:
+		case NR_sched_yield: return mb_threads_yield(h->threads, &h->context);
+		case NR_nanosleep: {
+			/* v3: the clock advances by exactly the requested duration, then
+			 * one yield. (Negative or out-of-range requests are EINVAL, and a
+			 * bad pointer EFAULT, as on Linux.) */
+			if (mb_threads_spec(h->threads) != 3) return mb_threads_yield(h->threads, &h->context);
+			const int64_t *req = (const int64_t *)a1;
+			if (!guest_owns(h, a1, 16)) return serr(EFAULT);
+			if (req[0] < 0 || req[1] < 0 || req[1] >= 1000000000ll) return serr(EINVAL);
+			mb_threads_advance(h->threads, (uint64_t)req[0] * 1000000000ull + (uint64_t)req[1]);
 			return mb_threads_yield(h->threads, &h->context);
+		}
+		case NR_clock_nanosleep: {
+			/* v3: relative requests behave as nanosleep; TIMER_ABSTIME (flag
+			 * 1) advances to the absolute target when it is ahead of now, else
+			 * nothing. rem is zeroed (nothing interrupts a sleep here). */
+			if (mb_threads_spec(h->threads) != 3) return mb_threads_yield(h->threads, &h->context);
+			const int64_t *req = (const int64_t *)a3;
+			if (!guest_owns(h, a3, 16)) return serr(EFAULT);
+			if (req[0] < 0 || req[1] < 0 || req[1] >= 1000000000ll) return serr(EINVAL);
+			uint64_t target = (uint64_t)req[0] * 1000000000ull + (uint64_t)req[1];
+			if ((a2 & 1) != 0) {
+				/* absolute, on the clock's own scale: convert past the base */
+				uint64_t rel = (target > MB_V3_BASE_NS) ? target - MB_V3_BASE_NS : 0;
+				uint64_t now = mb_threads_clock_ns(h->threads);
+				if (rel > now) mb_threads_advance(h->threads, rel - now);
+			} else mb_threads_advance(h->threads, target);
+			if (a4) {
+				if (!guest_owns(h, a4, 16)) return serr(EFAULT);
+				*(int64_t *)a4 = 0; *((int64_t *)a4 + 1) = 0;
+			}
+			return mb_threads_yield(h->threads, &h->context);
+		}
 		case NR_wbx_clone: {
 			/* args: (tls/thread_area, child_rsp, child_rip, child_tid, parent_tid*) */
 			mb_sword r = mb_threads_spawn(h->threads, h->block, a1, a2, a3, a4, (uint32_t *)a5);
@@ -651,9 +718,30 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			/* CLOCK_REALTIME only picks which clock a timeout is against, and a
 			 * timeout is not honoured here at all (see the bitset ops below). */
 			int op = (int)a2 & ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
+			bool v3 = mb_threads_spec(h->threads) == 3;
+			/* v3 timed waits: WAIT's timeout is relative, WAIT_BITSET's
+			 * absolute (a guest timespec; NULL waits forever as in v2).
+			 * Invalid values are EINVAL, a bad pointer EFAULT, as on Linux. */
+			if (v3 && (op == FUTEX_WAIT || op == FUTEX_WAIT_BITSET) && a4 != 0) {
+				const int64_t *to = (const int64_t *)a4;
+				if (!guest_owns(h, a4, 16)) return serr(EFAULT);
+				if (to[0] < 0 || to[1] < 0 || to[1] >= 1000000000ll) return serr(EINVAL);
+				uint64_t t = (uint64_t)to[0] * 1000000000ull + (uint64_t)to[1];
+				uint64_t dl;
+				if (op == FUTEX_WAIT) dl = mb_threads_clock_ns(h->threads) + t;
+				else dl = (t > MB_V3_BASE_NS) ? t - MB_V3_BASE_NS : 0;   /* absolute, past the base; at-or-before the base is already due */
+				return mb_threads_futex_wait_timeout(h->threads, &h->context, a1, (uint32_t)a3, true, dl);
+			}
 			switch (op) {
 				case FUTEX_WAIT: return mb_threads_futex_wait(h->threads, &h->context, a1, (uint32_t)a3);
-				case FUTEX_WAKE: return sok(mb_threads_futex_wake(h->threads, a1, (uint32_t)a3));
+				/* v3: a wake yields after waking (the woken thread is runnable
+				 * and the waker hands the others a chance to run); the count
+				 * is this thread's return when it resumes */
+				case FUTEX_WAKE: {
+					mb_sword n = mb_threads_futex_wake(h->threads, a1, (uint32_t)a3);
+					if (v3) return mb_threads_yield_value(h->threads, &h->context, sok(n));
+					return sok(n);
+				}
 				/* The bitset pair is the plain pair with a mask and an ABSOLUTE
 				 * timeout. Rust's std reaches for these - its Mutex, Condvar and
 				 * thread::park all wait this way - so a guest built from it spun
@@ -669,7 +757,11 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 				 * already is. A waiter here is woken by another guest thread or
 				 * not at all; there is no clock in the box to expire against. */
 				case FUTEX_WAIT_BITSET: return mb_threads_futex_wait(h->threads, &h->context, a1, (uint32_t)a3);
-				case FUTEX_WAKE_BITSET: return sok(mb_threads_futex_wake(h->threads, a1, (uint32_t)a3));
+				case FUTEX_WAKE_BITSET: {
+					mb_sword n = mb_threads_futex_wake(h->threads, a1, (uint32_t)a3);
+					if (v3) return mb_threads_yield_value(h->threads, &h->context, sok(n));
+					return sok(n);
+				}
 				case FUTEX_REQUEUE: return sok(mb_threads_futex_requeue(h->threads, a1, a5, (uint32_t)a3, (uint32_t)a4));
 				case FUTEX_LOCK_PI: return mb_threads_futex_lock_pi(h->threads, &h->context, a1);
 				case FUTEX_UNLOCK_PI: return mb_threads_futex_unlock_pi(h->threads, &h->context, a1);
@@ -693,6 +785,16 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 static void run_proc_if_present(mb_host *h, const char *name) {
 	uintptr_t p = mb_elf_proc_addr(h->elf, name);
 	if (p) mb_call_guest_simple(p, &h->context);
+}
+
+/* mb_host_new's way out once the guest's ELF is loaded: everything it built,
+ * given back in one place, so a field added to mb_host later cannot be leaked
+ * by one refusal and freed by another. */
+static mb_host *host_new_unwind(mb_host *h) {
+	mb_block_deactivate(h->block); mb_block_free(h->block); mb_fs_free(h->fs);
+	mb_elf_free(h->elf); mb_thunks_free(h->thunks); mb_threads_free(h->threads);
+	free(h->image); free(h);
+	return NULL;
 }
 
 mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_name,
@@ -765,6 +867,23 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 		fflush(stderr);
 	}
 #endif
+
+	/* Machine-spec version, decided before the guest runs a single
+	 * instruction: a guest declares v3 by exporting a uint32_t
+	 * __wbx_machine_spec holding 3 (read the way __wbxsysinfo is; host VA ==
+	 * guest VA). No symbol, or a 2, is v2: every v2 behaviour bit for bit.
+	 * Anything else refuses the load - a movie recorded under version N
+	 * requires a host implementing version N. */
+	{ uintptr_t spec_addr = mb_elf_proc_addr(h->elf, "__wbx_machine_spec");
+	  int spec = 2;
+	  if (spec_addr) {
+		if (!guest_owns(h, spec_addr, 4)) { snprintf(errbuf, errlen, "guest's __wbx_machine_spec points outside its memory"); return host_new_unwind(h); }
+		uint32_t v; memcpy(&v, (const void *)spec_addr, 4);
+		if (v != 2 && v != 3) { snprintf(errbuf, errlen, "guest declares machine spec %u, this host implements 2 and 3", v); return host_new_unwind(h); }
+		spec = (int)v;
+	  }
+	  mb_threads_set_spec(h->threads, spec);
+	  if (spec == 3) { fprintf(stderr, "miniBox: guest declares machine spec v3 (virtual time)\n"); fflush(stderr); } }
 
 	mb_call_guest_simple(mb_elf_entry(h->elf), &h->context);  /* _start */
 	mb_block_deactivate(h->block); h->active = false;

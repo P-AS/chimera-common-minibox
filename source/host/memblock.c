@@ -924,6 +924,19 @@ int mb_block_mmap_fixed(mb_block *b, mb_range addr, mb_prot prot, bool no_replac
 	return r;
 }
 
+/* Whether a whole range is Free (and inside the block): the v3 mmap hint
+ * check. Unaligned or out-of-block hints are not free - the caller then
+ * places best-fit instead. */
+bool mb_block_range_is_free(mb_block *b, mb_range addr) {
+	mb_block_track_lock(b);
+	size_t pcount, ps = validate(b, addr, &pcount);
+	bool free = ps != (size_t)-1;
+	for (size_t i = ps; free && i < ps + pcount; i++)
+		if (b->pages[i].status != MB_ST_FREE) free = false;
+	mb_block_track_unlock(b);
+	return free;
+}
+
 
 /* A big request is served from the TOP of the arena, a small one from the
  * bottom. Best fit alone is not enough over a long run: a machine that
@@ -1110,6 +1123,58 @@ static mb_sword mremap_impl(mb_block *b, mb_range addr, uintptr_t new_size, mb_r
 mb_sword mb_block_mremap(mb_block *b, mb_range addr, uintptr_t new_size, mb_range arena) {
 	mb_block_track_lock(b);
 	const mb_sword r = mremap_impl(b, addr, new_size, arena);
+	mb_block_track_unlock(b);
+	return r;
+}
+
+/* v3 MAYMOVE grow: relocate to a best-fit free range when growing in place is
+ * blocked. Contents move with their per-page protection; the new pages are
+ * marked dirty (a write through the mirror notifies a pending plan, so this
+ * tells it, exactly as copy_from_external does); invisibility moves with the
+ * page. The old range is freed. Shrink never moves (handled above). */
+static mb_sword mremap_move_impl(mb_block *b, mb_range addr, uintptr_t new_size, mb_range arena) {
+	size_t pcount, ps = validate(b, addr, &pcount);
+	if (ps == (size_t)-1 || addr.size == 0 || new_size == 0) return -EINVAL;
+	if (new_size != mb_align_down(new_size)) return -EINVAL;   /* as the grow path's validate demands */
+	for (size_t i = ps; i < ps + pcount; i++)
+		if (b->pages[i].status == MB_ST_FREE) return -EINVAL;
+	size_t acount, as = validate(b, arena, &acount);
+	if (as == (size_t)-1) return -EINVAL;
+	size_t nps = find_free_pages(b, as, acount, new_size >> MB_PAGESHIFT);
+	if (nps == (size_t)-1) return -ENOMEM;
+	/* A commit Windows refuses (chimera#166) leaves the pages uncommitted on
+	 * purpose; the copy below is the HOST writing them, not a guest access the
+	 * fault path would commit on demand, so a refusal must stop the move here,
+	 * with nothing changed. */
+	if (ensure_committed(b, nps, new_size >> MB_PAGESHIFT) != 0) return -ENOMEM;
+	for (size_t k = 0; k < (new_size >> MB_PAGESHIFT); k++) {
+		size_t si = (k < pcount) ? ps + k : ps + pcount - 1;
+		uint8_t st = b->pages[si].status;
+		set_protections(b, nps + k, 1, st);
+		b->pages[nps + k].invisible = b->pages[si].invisible;
+		mb_block_plan_capture(b, nps + k); set_dirty(b, nps + k, true); page_cool(b, nps + k);
+		void *dst = (void *)mirror_addr(b, b->addr.start + ((nps + k) << MB_PAGESHIFT));
+		/* an uncommitted page reads back zero with nothing behind its mirror */
+		if (k < pcount && !b->pages[ps + k].uncommitted)
+			memcpy(dst, (const void *)mirror_addr(b, b->addr.start + ((ps + k) << MB_PAGESHIFT)), MB_PAGESIZE);
+		else
+			memset(dst, 0, MB_PAGESIZE);
+	}
+	munmap_impl(b, addr, false);
+	return (mb_sword)(b->addr.start + (nps << MB_PAGESHIFT));
+}
+
+mb_sword mb_block_mremap_maymove(mb_block *b, mb_range addr, uintptr_t new_size, mb_range arena, bool maymove) {
+	mb_block_track_lock(b);
+	mb_sword r;
+	if (!maymove || new_size <= addr.size) {
+		r = mremap_impl(b, addr, new_size, arena);
+	} else {
+		/* grow with a move allowed: in place when it fits (same answer as
+		 * v2), relocate when blocked */
+		r = mremap_impl(b, addr, new_size, arena);
+		if (r == -EEXIST) r = mremap_move_impl(b, addr, new_size, arena);
+	}
 	mb_block_track_unlock(b);
 	return r;
 }

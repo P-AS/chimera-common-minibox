@@ -16,6 +16,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
+#include <pthread.h>
 #include <sys/syscall.h>
 #include <signal.h>
 #include <sys/resource.h>
@@ -133,6 +135,53 @@ ECL_EXPORT int NullCloneRefused(void) {
 	errno = 0;
 	if (syscall(2000, 0, 0, 0, 0, 0) != -1) return 0;   /* NR_wbx_clone */
 	if (errno != EINVAL) return 0;
+	return 1;
+}
+
+/* ---- spec v2 invariants a v3 host must preserve ----
+ * This guest declares nothing, so every one of these must hold exactly as
+ * the v2 spec says, on any host. */
+
+/* the clock is the v2 constant, reads tick nothing */
+ECL_EXPORT int V2ClockConstant(void) {
+	struct timespec a, b;
+	if (syscall(SYS_clock_gettime, 0, &a) != 0) return 0;
+	if (syscall(SYS_clock_gettime, 0, &b) != 0) return 0;
+	if (a.tv_sec != 1495889068 || a.tv_nsec != 0) return 0;
+	if (b.tv_sec != a.tv_sec || b.tv_nsec != a.tv_nsec) return 0;
+	return 1;
+}
+
+/* a timed wait with no waker never expires on its own: parked until woken */
+static int v2_fut;
+static long v2_wret;
+static void *v2_waiter(void *arg) {
+	(void)arg;
+	struct timespec to = { 0, 100000000 };   /* 100 ms of a clock that never moves */
+	v2_wret = syscall(SYS_futex, &v2_fut, 0 /*WAIT*/, 0, &to, NULL, 0);
+	return 0;
+}
+ECL_EXPORT int V2TimedWaitIgnored(void) {
+	pthread_t th;
+	v2_wret = 0x5a5a5a5a;
+	if (pthread_create(&th, 0, v2_waiter, 0) != 0) return 0;
+	for (int i = 0; i < 5; i++) syscall(SYS_sched_yield);   /* no clock: nothing expires */
+	if (syscall(SYS_futex, &v2_fut, 1 /*WAKE*/, 1, NULL, NULL, 0) != 1) return 0;
+	pthread_join(th, 0);
+	if (v2_wret != 0) return 0;   /* woken, never ETIMEDOUT */
+	return 1;
+}
+
+/* mremap blocked from growing, without MAYMOVE, is EEXIST */
+ECL_EXPORT int V2MremapBlocked(void) {
+	uint8_t *p1 = (uint8_t *)syscall(SYS_mmap, 0, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (p1 == MAP_FAILED) return 0;
+	uint8_t *fill = (uint8_t *)syscall(SYS_mmap, p1 + 8192, 8192, PROT_READ | PROT_WRITE,
+	                                   MAP_PRIVATE | MAP_ANONYMOUS | 0x100000 /*NOREPLACE*/, -1, 0);
+	if (fill == MAP_FAILED && errno != EEXIST) return 0;
+	(void)fill;
+	errno = 0;
+	if (syscall(SYS_mremap, p1, 8192, 16384, 0) != -1 || errno != 17 /*EEXIST*/) return 0;
 	return 1;
 }
 
