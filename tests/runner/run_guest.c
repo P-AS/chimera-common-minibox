@@ -160,7 +160,7 @@ static int host_fault_is_reported_as_passed_on(const char *self, const char *gue
 	const char *dir = getenv("TMPDIR");
 	if (dir == NULL || dir[0] == '\0') dir = "/tmp";
 	char log[512], cmd[2048];
-	snprintf(log, sizeof log, "%s/run_guest_hostfault_%ld.log", dir, (long)time(NULL));
+	snprintf(log, sizeof log, "%s/run_guest_hostfault_%ld_%ld.log", dir, (long)getpid(), (long)time(NULL));
 	remove(log);
 	setenv("MINIBOX_LOG", log, 1);
 	snprintf(cmd, sizeof cmd, "'%s' --host-fault-child '%s' >/dev/null 2>&1", self, guest);
@@ -213,7 +213,7 @@ static int handler_does_not_recurse(const char *self, const char *guest) {
 	const char *dir = getenv("TEMP");
 	if (dir == NULL || dir[0] == '\0') dir = ".";
 	char log[512], cmd[2048];
-	snprintf(log, sizeof log, "%s\\run_guest_recursion_%ld.log", dir, (long)time(NULL));
+	snprintf(log, sizeof log, "%s\\run_guest_recursion_%ld_%ld.log", dir, (long)getpid(), (long)time(NULL));
 	remove(log);
 	_putenv_s("MINIBOX_LOG", log);
 	snprintf(cmd, sizeof cmd, "\"\"%s\" --handler-recursion-child \"%s\" >NUL 2>&1\"", self, guest);
@@ -317,6 +317,11 @@ static int fs_repair_child(const char *guest) {
 	CHECK(f0 != 0);
 	uint64_t v2 = ClobberAndProbe();
 	CHECK(Alive() == 0xA11FE);   /* survived: without the repair this is refused (0) */
+	/* and what the retried access read is what this guest saw before the
+	 * drop - the host's base, because it does not own %fs. Its thread
+	 * pointer here would leave the host's C reading glibc's thread locals
+	 * out of the guest's block for the rest of the call. */
+	CHECK(v2 == v1);
 	uint64_t v3 = FsProbe();
 	CHECK(v3 == v1);             /* the host base, intact across the episode */
 	CHECK(host_fs_base() == f0); /* ...in the register too */
@@ -344,7 +349,7 @@ static int guest_abort_is_reported(const char *self, const char *guest) {
 	const char *dir = getenv("TMPDIR");
 	if (dir == NULL || dir[0] == '\0') dir = "/tmp";
 	char log[512], cmd[2048];
-	snprintf(log, sizeof log, "%s/run_guest_abort_%ld.log", dir, (long)time(NULL));
+	snprintf(log, sizeof log, "%s/run_guest_abort_%ld_%ld.log", dir, (long)getpid(), (long)time(NULL));
 	remove(log);
 	setenv("MINIBOX_LOG", log, 1);
 	snprintf(cmd, sizeof cmd, "'%s' --abort-child '%s' >/dev/null 2>&1", self, guest);
