@@ -13,6 +13,11 @@
 #ifndef _WIN32
 #include <pthread.h>
 #include <unistd.h>
+#include <sys/uio.h>
+/* the spin sampler's host, and the lock that lets mb_host_destroy wait for it
+ * (see sample_fn) */
+static pthread_mutex_t sample_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct mb_host *sample_h;
 #endif
 
 struct mb_host {
@@ -178,7 +183,7 @@ static void guest_last_words(mb_host *h, char *out, size_t cap) {
 
 /* Says it, keeps it, marks it. True when a guarded call is in progress to go
  * back to. */
-static bool record_death(mb_context *c, const char *fmt, va_list ap) {
+static bool record_death(mb_context *c, bool say_stack, const char *fmt, va_list ap) {
 	mb_host *h = c != NULL ? (mb_host *)c->host_ptr : NULL;
 	char what[256];
 	vsnprintf(what, sizeof what, fmt, ap);
@@ -193,23 +198,15 @@ static bool record_death(mb_context *c, const char *fmt, va_list ap) {
 	}
 	if (c == NULL) return false;
 	c->dead = 1;
-	/* Death-site backtrace (host VA == guest VA). Pages are checked first:
-	 * a dying thread's rsp may point at a guard page, and a nested fault
-	 * in here would lose the report it is part of. */
-	{
-		uintptr_t rsp = c->guest_rsp;
-		uint32_t atid = h && h->threads ? mb_threads_active_tid(h->threads) : 0;
-		mb_diag("  active tid=%u rsp=%lx stack:", atid, (unsigned long)rsp);
-		char sb[2048]; size_t so = 0;
-		for (int i = 0; i < 96 && so + 20 < sizeof sb; i++) {
-			uintptr_t a = rsp + (uintptr_t)i * sizeof(uintptr_t);
-			/* pageStarts, not iteration counts: rsp is not page-aligned */
-			if ((i == 0 || (a & MB_PAGEMASK) == 0) && !mb_page_readable(a)) break;
-			so += (size_t)snprintf(sb + so, sizeof sb - so, " %lx",
-			                       (unsigned long)*(const uintptr_t *)a);
-		}
-		sb[so] = '\0';
-		mb_diag("%s\n", sb);
+	/* Where the guest was, for a death that is not a fault - an abort, an
+	 * exit, a deadlock, all of which arrive through a syscall, so the saved
+	 * guest rsp is the one the call left. A fault's report already carries its
+	 * own walk, from the faulting rsp (tripguard.c). The same filtered form:
+	 * only words inside the ELF, ready for addr2line, because this is the file
+	 * people attach to an issue. */
+	if (say_stack) {
+		mb_diag(" active tid=%u", h && h->threads ? mb_threads_active_tid(h->threads) : 0);
+		mb_tripguard_say_guest_stack(c->guest_rsp);
 	}
 	const bool escapable = c->esc_rsp != 0;
 	mb_diag(escapable
@@ -221,7 +218,7 @@ static bool record_death(mb_context *c, const char *fmt, va_list ap) {
 void mb_host_guest_death(mb_context *c, const char *fmt, ...) {
 	va_list ap;
 	va_start(ap, fmt);
-	const bool escapable = record_death(c, fmt, ap);
+	const bool escapable = record_death(c, true, fmt, ap);
 	va_end(ap);
 	if (escapable) mb_guarded_escape_now(c);
 	__builtin_trap();
@@ -230,7 +227,7 @@ void mb_host_guest_death(mb_context *c, const char *fmt, ...) {
 bool mb_host_guest_death_in_handler(mb_context *c, const char *fmt, ...) {
 	va_list ap;
 	va_start(ap, fmt);
-	const bool escapable = record_death(c, fmt, ap);
+	const bool escapable = record_death(c, false, fmt, ap);
 	va_end(ap);
 	return escapable;
 }
@@ -787,6 +784,12 @@ void mb_host_destroy(mb_host *h) {
 	 * machine opened in the same process took its first fault against this one's
 	 * freed context and wrote whatever was left there into the host's %fs. */
 	if (mb_guest_ctx == &h->context) mb_guest_ctx = NULL;
+#ifndef _WIN32
+	/* and the spin sampler: it must be done with this host before it is freed */
+	pthread_mutex_lock(&sample_lock);
+	if (sample_h == h) sample_h = NULL;
+	pthread_mutex_unlock(&sample_lock);
+#endif
 	/* The same rule for the same reason, one field over: the fault handler
 	 * names the region an address landed in by reading this host's layout, and
 	 * a freed host is not a layout. chimera#127 died of exactly this - the
@@ -802,11 +805,17 @@ void mb_host_destroy(mb_host *h) {
 uintptr_t mb_host_proc_addr_raw(mb_host *h, const char *name);
 
 /* Spin sampler (MB_SAMPLE_SECS=N). A helper thread prints the active green
- * thread + guest rsp + stack top every N seconds. Racy reads are fine for
- * diagnosis (may tear). Locates non-syscall spins. POSIX-only, env-gated,
- * and unobservable by the guest. */
+ * thread + guest rsp + stack top every N seconds. Locates non-syscall spins.
+ * POSIX-only, env-gated, and unobservable by the guest.
+ *
+ * It must never be able to take the process down, because it runs beside the
+ * frontend rather than inside the guest: a fault on this thread is nobody's
+ * to handle. So the stack is read with process_vm_readv on our own pid - a
+ * page that is gone (or goes while we read) is an error return, not a
+ * SIGSEGV - and the host it reads is held under sample_lock, which
+ * mb_host_destroy takes before the host is freed. Each activate points it at
+ * the live host, so a reboot does not leave it reading the first one. */
 #ifndef _WIN32
-static struct mb_host *sample_h;
 static pthread_t sample_thr;
 static int sample_started;
 static void *sample_fn(void *arg) {
@@ -816,14 +825,21 @@ static void *sample_fn(void *arg) {
 	if (secs <= 0) return NULL;
 	for (;;) {
 		sleep((unsigned)secs);
+		pthread_mutex_lock(&sample_lock);
 		struct mb_host *h = sample_h;
-		if (!h || !h->active) continue;
-		uint64_t *sp = (uint64_t *)h->context.guest_rsp;
-		fprintf(stderr, "[S] active=%u rsp=%lx stack:",
-		        mb_threads_active_tid(h->threads),
-		        (unsigned long)h->context.guest_rsp);
-		for (int i = 0; i < 12; i++) fprintf(stderr, " %lx", (unsigned long)sp[i]);
-		fprintf(stderr, "\n");
+		if (h && h->active) {
+			const uintptr_t rsp = h->context.guest_rsp;   /* racy by design: a snapshot */
+			uint64_t words[12];
+			struct iovec local = { words, sizeof words }, remote = { (void *)rsp, sizeof words };
+			const ssize_t got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+			fprintf(stderr, "[S] active=%u rsp=%lx stack:", mb_threads_active_tid(h->threads), (unsigned long)rsp);
+			if (got == (ssize_t)sizeof words)
+				for (int i = 0; i < 12; i++) fprintf(stderr, " %lx", (unsigned long)words[i]);
+			else
+				fprintf(stderr, " (not readable)");
+			fprintf(stderr, "\n");
+		}
+		pthread_mutex_unlock(&sample_lock);
 	}
 	return NULL;
 }
@@ -833,7 +849,8 @@ void mb_host_activate(mb_host *h) {
 	/* guest code will run on THIS thread; make signal delivery on a faulting
 	 * tracked stack page possible (see tripguard.c) */
 	mb_tripguard_ensure_altstack();
-#endif	/* A guest that exports GuestFaultHandler wants to hear about faults on
+#endif
+	/* A guest that exports GuestFaultHandler wants to hear about faults on
 	 * pages it protected itself (see tripguard.c) - on BOTH platforms: the
 	 * Windows handler is the vectored one, and a guest whose handler is not
 	 * registered there dies on its first watched write. The RAW address: it
@@ -842,10 +859,15 @@ void mb_host_activate(mb_host *h) {
 	 * find no entry context to save. The guest ABI is spelled in the type. */
 	mb_tripguard_set_guest_fault_handler((mb_guest_fault_fn)mb_host_proc_addr_raw(h, "GuestFaultHandler"));
 #ifndef _WIN32
-	if (!sample_started && getenv("MB_SAMPLE_SECS")) {
-		sample_started = 1; sample_h = h;
-		pthread_create(&sample_thr, NULL, sample_fn, NULL);
-		pthread_detach(sample_thr);
+	if (getenv("MB_SAMPLE_SECS")) {
+		pthread_mutex_lock(&sample_lock);
+		sample_h = h;   /* the live host, every time: a reboot makes a new one */
+		pthread_mutex_unlock(&sample_lock);
+		if (!sample_started) {
+			sample_started = 1;
+			pthread_create(&sample_thr, NULL, sample_fn, NULL);
+			pthread_detach(sample_thr);
+		}
 	}
 #endif
 	if (h->active) return;

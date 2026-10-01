@@ -463,6 +463,9 @@ static void say_guest_stack(uintptr_t rsp) {
 	mb_diag(shown ? "\n" : " (nothing on it)\n");
 }
 
+/* The same walk, for a death that is not a fault (host.c record_death). */
+void mb_tripguard_say_guest_stack(uintptr_t rsp) { say_guest_stack(rsp); }
+
 #ifndef _WIN32
 /* ---- Linux: SIGSEGV via sigaction, chaining to the previous handler ---- */
 #include <signal.h>
