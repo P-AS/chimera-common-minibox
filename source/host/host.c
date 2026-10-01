@@ -787,6 +787,16 @@ static void run_proc_if_present(mb_host *h, const char *name) {
 	if (p) mb_call_guest_simple(p, &h->context);
 }
 
+/* mb_host_new's way out once the guest's ELF is loaded: everything it built,
+ * given back in one place, so a field added to mb_host later cannot be leaked
+ * by one refusal and freed by another. */
+static mb_host *host_new_unwind(mb_host *h) {
+	mb_block_deactivate(h->block); mb_block_free(h->block); mb_fs_free(h->fs);
+	mb_elf_free(h->elf); mb_thunks_free(h->thunks); mb_threads_free(h->threads);
+	free(h->image); free(h);
+	return NULL;
+}
+
 mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_name,
                      const mb_memory_layout_template *tpl, char *errbuf, size_t errlen) {
 	mb_host *h = (mb_host *)calloc(1, sizeof(mb_host));
@@ -867,9 +877,9 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 	{ uintptr_t spec_addr = mb_elf_proc_addr(h->elf, "__wbx_machine_spec");
 	  int spec = 2;
 	  if (spec_addr) {
-		if (!guest_owns(h, spec_addr, 4)) { snprintf(errbuf, errlen, "guest's __wbx_machine_spec points outside its memory"); mb_block_deactivate(h->block); mb_block_free(h->block); mb_fs_free(h->fs); mb_elf_free(h->elf); mb_thunks_free(h->thunks); mb_threads_free(h->threads); free(h->image); free(h); return NULL; }
+		if (!guest_owns(h, spec_addr, 4)) { snprintf(errbuf, errlen, "guest's __wbx_machine_spec points outside its memory"); return host_new_unwind(h); }
 		uint32_t v; memcpy(&v, (const void *)spec_addr, 4);
-		if (v != 2 && v != 3) { snprintf(errbuf, errlen, "guest declares machine spec %u, this host implements 2 and 3", v); mb_block_deactivate(h->block); mb_block_free(h->block); mb_fs_free(h->fs); mb_elf_free(h->elf); mb_thunks_free(h->thunks); mb_threads_free(h->threads); free(h->image); free(h); return NULL; }
+		if (v != 2 && v != 3) { snprintf(errbuf, errlen, "guest declares machine spec %u, this host implements 2 and 3", v); return host_new_unwind(h); }
 		spec = (int)v;
 	  }
 	  mb_threads_set_spec(h->threads, spec);

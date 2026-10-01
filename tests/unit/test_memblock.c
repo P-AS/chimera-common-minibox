@@ -323,6 +323,31 @@ static void test_refused_commit_is_retried_on_fault(void) {
 	mb_block_free(b);
 }
 
+/* A v3 mremap that moves (MREMAP_MAYMOVE) commits the new range and then the
+ * HOST copies the old pages into it. Refused, that commit leaves the pages
+ * uncommitted on purpose, and a copy into them is a host fault, not a guest
+ * access the fault path would serve: the move must stop with ENOMEM, the old
+ * mapping as it was and the new range still free. */
+static void test_refused_commit_stops_a_move(void) {
+	mb_block *b = fresh(LAZY_SIZE);
+	CHECK(b->handle.lazy);
+	mb_range arena = { b->addr.start, 0x40000 };
+	mb_range two = { b->addr.start, 0x2000 };
+	CHECK_EQ(mb_block_mmap_fixed(b, two, MB_PROT_RW, true), 0);
+	gp(b, 0)[0] = 0xAB; gp(b, 0x1000)[0] = 0xCD;
+	mb_range blocker = { b->addr.start + 0x2000, 0x1000 };   /* no growing in place */
+	CHECK_EQ(mb_block_mmap_fixed(b, blocker, MB_PROT_RW, true), 0);
+	mb_pal_commit_refusals = 1;                 /* the move's commit is refused */
+	CHECK_EQ(mb_block_mremap_maymove(b, two, 0x4000, arena, true), -ENOMEM);
+	CHECK_EQ(mb_pal_commit_refusals, 0);
+	CHECK_EQ(gp(b, 0)[0], 0xAB);                /* the old mapping, untouched */
+	CHECK_EQ(gp(b, 0x1000)[0], 0xCD);
+	mb_range after = { b->addr.start + 0x3000, 0x4000 };
+	CHECK(mb_block_range_is_free(b, after));     /* nothing claimed for the move */
+	CHECK(mb_block_maps_consistent(b));
+	mb_block_free(b);
+}
+
 /* Refused again on the fault: the host is out of memory, which the fault
  * handler reports as that; with memory back, the same page is served. */
 static void test_refused_again_is_out_of_memory(void) {
@@ -373,6 +398,7 @@ static void run_all(void) {
 	} else {
 		RUN(test_refused_commit_is_retried_on_fault);
 		RUN(test_refused_again_is_out_of_memory);
+		RUN(test_refused_commit_stops_a_move);
 	}
 #endif
 }

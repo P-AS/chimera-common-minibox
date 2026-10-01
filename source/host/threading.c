@@ -270,7 +270,6 @@ uintptr_t mb_threads_futex_wait(mb_threads *t, mb_context *c, uintptr_t addr, ui
 }
 
 /* ---- v3 virtual time (spec section "Virtual time") ---- */
-enum { LINUX_ETIMEDOUT = 110 };   /* host libc's differs (MSVCRT: 138); the guest is Linux */
 
 uint64_t mb_threads_clock_ns(mb_threads *t) { return t->vclock_ns; }
 
@@ -286,7 +285,7 @@ static void expire_due(mb_threads *t) {
 		}
 		if (pick == (size_t)-1) return;
 		t->threads[pick].state = T_RUNNABLE;
-		t->threads[pick].rax = serr(LINUX_ETIMEDOUT);
+		t->threads[pick].rax = serr(ETIMEDOUT);
 		t->deadlines[pick] = 0; t->seqs[pick] = 0;
 	}
 }
@@ -301,7 +300,7 @@ uintptr_t mb_threads_futex_wait_timeout(mb_threads *t, mb_context *c, uintptr_t 
 	if (t->spec != 3 || !has_deadline) return park_me(t, c, sok(0), addr);
 	/* already expired: skip the park, cost one tick, ETIMEDOUT. A
 	 * zero-timeout spin advances the clock instead of livelocking it. */
-	if (deadline <= t->vclock_ns) { t->vclock_ns += MB_V3_TICK_NS; return serr(LINUX_ETIMEDOUT); }
+	if (deadline <= t->vclock_ns) { t->vclock_ns += MB_V3_TICK_NS; return serr(ETIMEDOUT); }
 	queue_push(get_or_make_queue(t, addr), t->active_tid);
 	gthread *self = find_thread(t, t->active_tid);
 	self->state = T_WAITING;

@@ -1142,7 +1142,11 @@ static mb_sword mremap_move_impl(mb_block *b, mb_range addr, uintptr_t new_size,
 	if (as == (size_t)-1) return -EINVAL;
 	size_t nps = find_free_pages(b, as, acount, new_size >> MB_PAGESHIFT);
 	if (nps == (size_t)-1) return -ENOMEM;
-	ensure_committed(b, nps, new_size >> MB_PAGESHIFT);
+	/* A commit Windows refuses (chimera#166) leaves the pages uncommitted on
+	 * purpose; the copy below is the HOST writing them, not a guest access the
+	 * fault path would commit on demand, so a refusal must stop the move here,
+	 * with nothing changed. */
+	if (ensure_committed(b, nps, new_size >> MB_PAGESHIFT) != 0) return -ENOMEM;
 	for (size_t k = 0; k < (new_size >> MB_PAGESHIFT); k++) {
 		size_t si = (k < pcount) ? ps + k : ps + pcount - 1;
 		uint8_t st = b->pages[si].status;
