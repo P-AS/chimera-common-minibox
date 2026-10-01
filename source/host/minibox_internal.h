@@ -511,6 +511,9 @@ mb_sword mb_fs_truncate_name(mb_fs *fs, const char *name, mb_sword size);
 mb_sword mb_fs_truncate_fd(mb_fs *fs, int fd, mb_sword size);
 mb_sword mb_fs_sync_fd(mb_fs *fs, int fd);
 size_t   mb_fs_sysout_tail(const mb_fs *fs, char *out, size_t cap);
+/* The core log: copy every guest stdout/stderr write into this file (UTF-8
+ * path, appended), or stop with NULL. 0 or -errno. */
+int      mb_set_output_file(const char *path);
 /* bytes ever written to stdout/stderr, and the newest of those written since a
  * count of them (at most cap, and at most what the ring still holds) */
 uint64_t mb_fs_sysout_total(const mb_fs *fs);

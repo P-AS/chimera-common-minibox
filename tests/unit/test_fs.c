@@ -186,6 +186,55 @@ static void test_sysout_tail(void) {
 	mb_fs_free(fs);
 }
 
+/* The core log: while a file is set, every stdout/stderr write is appended to
+ * it, in order and whole; before it is set and after it is cleared, nothing
+ * is; and a write to an ordinary file never is. The guest's own result is
+ * the same either way. */
+static void read_all(const char *path, char *out, size_t cap, size_t *len) {
+	FILE *f = fopen(path, "rb");
+	*len = f ? fread(out, 1, cap, f) : 0;
+	if (f) fclose(f);
+}
+
+static void test_output_copy(void) {
+	char path[512];
+	int tmpfd = host_tempfile(path, sizeof path, "mb-fs-corelog");
+	CHECK(tmpfd >= 0);
+	close(tmpfd);
+
+	mb_fs *fs = mb_fs_new();
+	CHECK_EQ(mb_fs_mount(fs, "save", NULL, 0, true), 0);
+	const int save = (int)mb_fs_open(fs, "save", O_RDWR);
+	CHECK(save >= 0);
+
+	CHECK_EQ(mb_fs_write(fs, 2, (const uint8_t *)"before ", 7), 7);   /* not asked for yet */
+	CHECK_EQ(mb_set_output_file(path), 0);
+	CHECK_EQ(mb_fs_write(fs, 2, (const uint8_t *)"core ", 5), 5);
+	CHECK_EQ(mb_fs_write(fs, save, (const uint8_t *)"SAVE", 4), 4);   /* a file, not output */
+	CHECK_EQ(mb_fs_write(fs, 1, (const uint8_t *)"log\n", 4), 4);
+	char got[256];
+	size_t len = 0;
+	read_all(path, got, sizeof got, &len);   /* flushed per write: readable while still set */
+	CHECK_EQ(len, 9);
+	CHECK(memcmp(got, "core log\n", 9) == 0);
+
+	CHECK_EQ(mb_set_output_file(NULL), 0);
+	CHECK_EQ(mb_fs_write(fs, 2, (const uint8_t *)"after", 5), 5);   /* stopped */
+	read_all(path, got, sizeof got, &len);
+	CHECK_EQ(len, 9);
+
+	CHECK_EQ(mb_set_output_file(path), 0);   /* set again: appended, not replaced */
+	CHECK_EQ(mb_fs_write(fs, 2, (const uint8_t *)"more", 4), 4);
+	CHECK_EQ(mb_set_output_file(""), 0);
+	read_all(path, got, sizeof got, &len);
+	CHECK_EQ(len, 13);
+	CHECK(memcmp(got, "core log\nmore", 13) == 0);
+
+	CHECK(mb_set_output_file("/nonexistent-dir-mb/x/corelog") != 0);   /* said, not ignored */
+	mb_fs_free(fs);
+	remove(path);
+}
+
 static void test_host_file(void) {
 	static const char text[] = "0123456789abcdefghij";
 	const size_t len = sizeof(text) - 1;
@@ -348,6 +397,7 @@ static void run_all(void) {
 	RUN(test_mount_errors);
 	RUN(test_sysout_tail);
 	RUN(test_stdout_write);
+	RUN(test_output_copy);
 	RUN(test_host_file);
 	RUN(test_dup);
 }
