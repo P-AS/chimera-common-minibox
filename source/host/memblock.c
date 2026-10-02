@@ -286,6 +286,11 @@ static void page_cool(mb_block *b, size_t i);
 /* Membership of the stack set, which only Windows uses (mb_page_native_prot):
  * a page that stops being a stack gives its shadow back. */
 static void note_status(mb_block *b, size_t i, uint8_t status) {
+	const uint8_t was = b->pages[i].status;
+	if (was != status) {
+		if (was == MB_ST_FREE) b->group_free[i >> MB_GROUP_SHIFT]--;
+		else if (status == MB_ST_FREE) b->group_free[i >> MB_GROUP_SHIFT]++;
+	}
 	/* an allocation that moves is a different page, whatever it held */
 	if (b->pages[i].hot && b->pages[i].status != status) page_cool(b, i);
 	b->pages[i].status = status;
@@ -478,12 +483,19 @@ mb_block *mb_block_new(mb_range addr) {
 	b->epoch_status = (uint8_t *)calloc(b->npages ? b->npages : 1, 1);
 	b->status_map = (uint8_t *)calloc(b->npages ? b->npages : 1, 1);
 	b->dirty_map = (uint8_t *)calloc(b->npages ? b->npages : 1, 1);
+	const size_t ngroups = (b->npages + MB_GROUP_PAGES - 1) >> MB_GROUP_SHIFT;
+	b->group_free = (uint32_t *)calloc(ngroups ? ngroups : 1, sizeof(uint32_t));
 	if (!b->pages || !b->epoch_bits || !b->stat_bits || !b->unheld_bits || !b->stack_bits || !b->hot_bits
-		|| !b->epoch_status || !b->status_map || !b->dirty_map) {
+		|| !b->epoch_status || !b->status_map || !b->dirty_map || !b->group_free) {
 		free(b->pages); free(b->epoch_bits); free(b->stat_bits);
 		free(b->unheld_bits); free(b->stack_bits); free(b->hot_bits); free(b->epoch_status);
-		free(b->status_map); free(b->dirty_map); free(b);
+		free(b->status_map); free(b->dirty_map); free(b->group_free); free(b);
 		return NULL;
+	}
+	/* every page starts Free (below) */
+	for (size_t g = 0; g < ngroups; g++) {
+		const size_t first = g << MB_GROUP_SHIFT;
+		b->group_free[g] = (uint32_t)(b->npages - first < MB_GROUP_PAGES ? b->npages - first : MB_GROUP_PAGES);
 	}
 	b->addr = addr;
 	for (size_t i = 0; i < b->npages; i++) {
@@ -605,6 +617,7 @@ void mb_block_free(mb_block *b) {
 	free(b->hot_bits);
 	free(b->status_map);
 	free(b->dirty_map);
+	free(b->group_free);
 	free(b->pages);
 	free(b);
 }
@@ -950,13 +963,36 @@ bool mb_block_range_is_free(mb_block *b, mb_range addr) {
  * of them either way. */
 #define MB_BIG_REQUEST_PAGES (4096) /* 16 MiB */
 
-/* best-fit free run inside an arena; returns start page index or SIZE_MAX */
+/* Whether group g (whole, and inside [lo, hi)) is all taken / all Free. */
+static bool group_taken(const mb_block *b, size_t first, size_t lo, size_t hi) {
+	return (first & MB_GROUP_MASK) == 0 && first >= lo && first + MB_GROUP_PAGES <= hi
+		&& b->group_free[first >> MB_GROUP_SHIFT] == 0;
+}
+static bool group_all_free(const mb_block *b, size_t first, size_t lo, size_t hi) {
+	return (first & MB_GROUP_MASK) == 0 && first >= lo && first + MB_GROUP_PAGES <= hi
+		&& b->group_free[first >> MB_GROUP_SHIFT] == MB_GROUP_PAGES;
+}
+
+/* best-fit free run inside an arena; returns start page index or SIZE_MAX.
+ * The answer is exactly the page-by-page walk's (where a guest's memory lands
+ * is part of the machine, so it must never move): group_free only lets the
+ * walk cross a whole group it already knows the answer for in one step. */
 static size_t find_free_pages(mb_block *b, size_t arena_start, size_t arena_count, size_t npages) {
 	size_t end = arena_start + arena_count;
 	if (npages >= MB_BIG_REQUEST_PAGES) {
 		/* the highest run that fits, so the low end stays free for the rest */
 		size_t i = end, run_end = end;
 		while (i > arena_start) {
+			if (i >= MB_GROUP_PAGES && group_taken(b, i - MB_GROUP_PAGES, arena_start, end)) {
+				i -= MB_GROUP_PAGES; /* every page of it taken: the run ends below it */
+				run_end = i;
+				continue;
+			}
+			if (i >= MB_GROUP_PAGES && run_end - (i - MB_GROUP_PAGES) < npages
+				&& group_all_free(b, i - MB_GROUP_PAGES, arena_start, end)) {
+				i -= MB_GROUP_PAGES; /* all Free, and the run still too short within it */
+				continue;
+			}
 			i--;
 			if (b->pages[i].status != MB_ST_FREE) { run_end = i; continue; }
 			if (run_end - i >= npages) return run_end - npages;
@@ -968,11 +1004,15 @@ static size_t find_free_pages(mb_block *b, size_t arena_start, size_t arena_coun
 	while (i < end) {
 		if (b->pages[i].status == MB_ST_FREE) {
 			size_t j = i;
-			while (j < end && b->pages[j].status == MB_ST_FREE) j++;
+			while (j < end && b->pages[j].status == MB_ST_FREE) {
+				if (group_all_free(b, j, arena_start, end)) j += MB_GROUP_PAGES;
+				else j++;
+			}
 			size_t len = j - i;
 			if (len >= npages && len < best_len) { best = i; best_len = len; }
 			i = j;
-		} else i++;
+		} else if (group_taken(b, i, arena_start, end)) i += MB_GROUP_PAGES;
+		else i++;
 	}
 	return best;
 }

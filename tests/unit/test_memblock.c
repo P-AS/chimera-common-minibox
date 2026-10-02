@@ -371,11 +371,106 @@ static void test_refused_again_is_out_of_memory(void) {
 }
 #endif
 
+/* Where a movable mmap lands, found the slow way: the page-by-page walk
+ * find_free_pages did before it kept group_free (the top-down highest fit for
+ * a big request, best fit from the bottom otherwise). The fast walk must give
+ * this answer every time - a guest's addresses are part of its machine. */
+static size_t reference_place(mb_block *b, size_t npages) {
+	const size_t end = b->npages;
+	if (npages >= 4096) {
+		size_t i = end, run_end = end;
+		while (i > 0) {
+			i--;
+			if (b->status_map[i] != MB_ST_FREE) { run_end = i; continue; }
+			if (run_end - i >= npages) return run_end - npages;
+		}
+		return (size_t)-1;
+	}
+	size_t best = (size_t)-1, best_len = (size_t)-1, i = 0;
+	while (i < end) {
+		if (b->status_map[i] == MB_ST_FREE) {
+			size_t j = i;
+			while (j < end && b->status_map[j] == MB_ST_FREE) j++;
+			if (j - i >= npages && j - i < best_len) { best = i; best_len = j - i; }
+			i = j;
+		} else i++;
+	}
+	return best;
+}
+
+static bool group_counts_right(mb_block *b) {
+	for (size_t g = 0; g * MB_GROUP_PAGES < b->npages; g++) {
+		uint32_t n = 0;
+		for (size_t i = g * MB_GROUP_PAGES; i < (g + 1) * MB_GROUP_PAGES && i < b->npages; i++)
+			n += b->status_map[i] == MB_ST_FREE;
+		if (n != b->group_free[g]) return false;
+	}
+	return true;
+}
+
+/* Thousands of movable mmaps and munmaps, big and small, over a block with
+ * whole groups taken, whole groups free and groups in pieces (and a size
+ * that is not a whole number of groups): every placement must be the
+ * reference walk's, and the per-group counts must match a recount. */
+static void test_mmap_placement_is_the_page_walks(void) {
+	const uintptr_t size = (uintptr_t)(19 * MB_GROUP_PAGES + 77) << MB_PAGESHIFT;
+	mb_block *b = fresh(size);
+	mb_range arena = { b->addr.start, size };
+	struct { uintptr_t at; size_t pages; } live[256];
+	int nlive = 0, placed = 0, refused = 0, mismatches = 0;
+	uint32_t seed = 12345;
+#define NEXT() (seed = seed * 1103515245u + 12345u, (seed >> 8))
+	for (int step = 0; step < 20000; step++) {
+		const uint32_t what = NEXT() % 6;
+		if (nlive > 0 && (nlive == 256 || what < 2)) {
+			const int k = (int)(NEXT() % (uint32_t)nlive);
+			mb_range r = { live[k].at, live[k].pages << MB_PAGESHIFT };
+			CHECK_EQ(mb_block_munmap(b, r), 0);
+			live[k] = live[--nlive];
+		} else if (what == 2) {
+			/* a single page pinned at a random free place: groups with one
+			 * page taken, or one page free, are where a wrong shortcut shows */
+			const size_t at = NEXT() % b->npages;
+			if (b->status_map[at] == MB_ST_FREE) {
+				mb_range r = { b->addr.start + (at << MB_PAGESHIFT), (uintptr_t)1 << MB_PAGESHIFT };
+				CHECK_EQ(mb_block_mmap_fixed(b, r, MB_PROT_RW, true), 0);
+				live[nlive].at = r.start;
+				live[nlive].pages = 1;
+				nlive++;
+			}
+		} else {
+			const uint32_t pick = NEXT() % 100;
+			const size_t npages = pick < 5 ? 4096 + NEXT() % 3000   /* big: from the top */
+				: pick < 15 ? MB_GROUP_PAGES * (1 + NEXT() % 3)     /* whole groups */
+				: 1 + NEXT() % 700;                                 /* small */
+			const size_t want = reference_place(b, npages);
+			mb_range r = { 0, npages << MB_PAGESHIFT };
+			const mb_sword got = mb_block_mmap(b, r, MB_PROT_RW, arena, false);
+			if (want == (size_t)-1) {
+				CHECK(got < 0);
+				refused++;
+			} else {
+				if (got != (mb_sword)(b->addr.start + (want << MB_PAGESHIFT))) mismatches++;
+				if (got >= 0) { live[nlive].at = (uintptr_t)got; live[nlive].pages = npages; nlive++; placed++; }
+			}
+		}
+		if (!group_counts_right(b)) { CHECK(group_counts_right(b)); break; }
+	}
+#undef NEXT
+	fprintf(stderr, "  %d placed, %d refused for want of room, %d mismatches\n", placed, refused, mismatches);
+	CHECK_EQ(mismatches, 0);
+	CHECK(placed > 500);
+	CHECK(refused > 50);  /* the full-arena path was walked too */
+	CHECK(mb_block_maps_consistent(b));
+	mb_block_free(b);
+}
+
 static void run_all(void) {
 	test_free_releases_the_mirror();
 	RUN(test_dirty_offset);
 	RUN(test_mmap_errors);
 	RUN(test_mmap_movable_bestfit);
+	RUN(test_mmap_placement_is_the_page_walks);
 	RUN(test_mprotect_free_enomem);
 	RUN(test_munmap_zeroes);
 	RUN(test_madvise_keeps_allocated);

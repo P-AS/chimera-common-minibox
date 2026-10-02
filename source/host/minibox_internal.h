@@ -180,6 +180,10 @@ typedef struct {
 
 /* status byte encoding (also what page_info reports, minus dirty/invis bits) */
 #define MB_ST_FREE      0x00
+/* find_free_pages' stride (see mb_block.group_free): 512 pages, 2 MiB */
+#define MB_GROUP_SHIFT  9
+#define MB_GROUP_PAGES  ((size_t)1 << MB_GROUP_SHIFT)
+#define MB_GROUP_MASK   (MB_GROUP_PAGES - 1)
 #define MB_ST_NONE      0x20  /* allocated, no access (guard) */
 #define MB_ST_R         0x01
 #define MB_ST_RW        0x03
@@ -228,6 +232,12 @@ typedef struct mb_block {
 	 * time over twenty. Written wherever status or dirty is, and nowhere else. */
 	uint8_t *status_map;    /* pages[i].status */
 	uint8_t *dirty_map;     /* pages[i].dirty, as 0 or 1 */
+	/* How many pages of each MB_GROUP_PAGES group are Free, kept by
+	 * note_status like status_map. Only for find_free_pages, which steps
+	 * over a group that is all taken or all free instead of page by page:
+	 * an arena with a 4 GiB reservation in it otherwise costs every small
+	 * mmap a walk over a million pages. */
+	uint32_t *group_free;
 
 	/* ---- the tracking lock (see mb_block_track_lock in memblock.c) ----
 	 *
