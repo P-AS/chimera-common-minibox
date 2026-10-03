@@ -142,6 +142,7 @@ static int  fault_depth(void) { return g_fault_depth; }
 static void fault_depth_set(int d) { g_fault_depth = d; }
 static int  fault_phase(void) { return g_fault_phase; }
 static void fault_phase_set(int p) { g_fault_phase = p; }
+static uintptr_t guest_fs_sampled(void) { return g_guest_fs_at_fault; }
 #else
 static DWORD g_fault_tls = TLS_OUT_OF_INDEXES;   /* allocated in initialize(): depth << 8 | phase */
 static uintptr_t fault_word(void) { return (uintptr_t)TlsGetValue(g_fault_tls); }
@@ -149,6 +150,8 @@ static int  fault_depth(void) { return (int)(fault_word() >> 8); }
 static void fault_depth_set(int d) { TlsSetValue(g_fault_tls, (LPVOID)(((uintptr_t)d << 8) | (fault_word() & 0xff))); }
 static int  fault_phase(void) { return (int)(fault_word() & 0xff); }
 static void fault_phase_set(int p) { TlsSetValue(g_fault_tls, (LPVOID)((fault_word() & ~(uintptr_t)0xff) | (uintptr_t)p)); }
+/* the Windows handler samples no base: ask_guest falls back to thread_area */
+static uintptr_t guest_fs_sampled(void) { return 0; }
 #endif
 
 static const char *phase_name(int phase) {
@@ -308,8 +311,8 @@ static bool ask_guest(uintptr_t addr, bool write) {
 	const uintptr_t host_fs = swap ? mb_rdfsbase() : 0;
 	/* the very base the guest faulted on, when the handler sampled a live one:
 	 * the faulting thread's own, whichever thread that is */
-	if (swap) mb_wrfsbase(g_guest_fs_at_fault && g_guest_fs_at_fault != mb_early_tp
-	                          ? g_guest_fs_at_fault : mb_guest_ctx->thread_area);
+	const uintptr_t sampled = guest_fs_sampled();
+	if (swap) mb_wrfsbase(sampled && sampled != mb_early_tp ? sampled : mb_guest_ctx->thread_area);
 #endif
 	const bool handled = g_guest_fault((uint64_t)addr, write ? 1 : 0) != 0;
 #ifdef MB_HAVE_FSBASE
