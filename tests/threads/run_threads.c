@@ -35,6 +35,7 @@ int main(int argc, char **argv) {
 	CHECK(((init_fn)proc(h, "Init"))() == 1);
 	run_fn RunThreads = (run_fn)proc(h, "RunThreads");
 	run1_fn RunCondvar = (run1_fn)proc(h, "RunCondvar");
+	run_fn RunTls = (run_fn)proc(h, "RunTls");
 	wbx_deactivate_host(h, &r); wbx_seal(h, &r);
 	if (r.error_message[0]) { fprintf(stderr, "seal: %s\n", r.error_message); return 1; }
 	wbx_activate_host(h, &r);
@@ -48,6 +49,11 @@ int main(int argc, char **argv) {
 	uint64_t cv = RunCondvar(21);
 	printf("RunCondvar(21) -> %llu (expect 43)\n", (unsigned long long)cv);
 	CHECK(cv == 43);
+	{
+		const uint64_t tls = RunTls();
+		printf("RunTls -> %#llx (expect 0: thread locals zeroed, initialised, apart from the stack)\n", (unsigned long long)tls);
+		CHECK(tls == 0);
+	}
 
 	/* determinism: identical results on repeat */
 	CHECK(RunThreads() == 4000);
