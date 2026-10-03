@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/mman.h>
 
 #define NTHREADS 4
 #define ITERS 1000
@@ -105,4 +106,39 @@ ECL_EXPORT uint64_t RunTls(void) {
 	if (pthread_create(&t, 0, tls_worker, 0) != 0) return 0xffff;
 	pthread_join(t, &on_new);
 	return on_main | (uint64_t)(uintptr_t)on_new << 8;
+}
+
+/* The guest's own fault handler (GuestFaultHandler), which an emulator's
+ * write tracking uses: called on the faulting thread, it must run as guest
+ * code does - its thread locals its own, its system calls accepted. Until it
+ * ran under the guest's %fs it read the host's thread locals and its
+ * mprotect arrived with a base the dispatcher refuses. */
+static _Thread_local volatile uint32_t t_faults;   /* changed by the handler, under the compiler's feet */
+static volatile uintptr_t g_watched;
+
+ECL_EXPORT int GuestFaultHandler(uint64_t addr, uint64_t is_write) {
+	(void)is_write;
+	if (!g_watched || addr < g_watched || addr >= g_watched + 4096) return 0;
+	t_faults++;
+	return mprotect((void *)g_watched, 4096, PROT_READ | PROT_WRITE) == 0;
+}
+
+/* 0 when right: the write lands, and the handler counted it in THIS thread's
+ * thread local */
+ECL_EXPORT uint64_t RunGuestFault(void) {
+	/* volatile: the write must happen while the page is watched, not be
+	 * moved past the store that stops watching it */
+	volatile uint8_t *page = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (page == MAP_FAILED) return 0xff;
+	page[0] = 1;
+	if (mprotect((void *)page, 4096, PROT_READ) != 0) return 0xfe;
+	const uint32_t before = t_faults;
+	g_watched = (uintptr_t)page;
+	page[1] = 0x5a;   /* faults; the handler opens the page and it is retried */
+	g_watched = 0;
+	uint64_t bad = 0;
+	if (page[1] != 0x5a) bad |= 1;
+	if (t_faults != before + 1) bad |= 2;
+	munmap((void *)page, 4096);
+	return bad;
 }

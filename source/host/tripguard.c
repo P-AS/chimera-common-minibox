@@ -135,6 +135,9 @@ enum { MB_PHASE_NONE = 0, MB_PHASE_TRACK, MB_PHASE_GUEST, MB_PHASE_REPORT };
 #ifndef _WIN32
 static __thread int g_fault_depth;
 static __thread int g_fault_phase;
+/* the guest's %fs when it faulted, sampled by the Linux handler on entry (0
+ * when the fault was not in guest code, or on Windows) */
+static __thread uintptr_t g_guest_fs_at_fault;
 static int  fault_depth(void) { return g_fault_depth; }
 static void fault_depth_set(int d) { g_fault_depth = d; }
 static int  fault_phase(void) { return g_fault_phase; }
@@ -295,7 +298,23 @@ static bool ask_guest(uintptr_t addr, bool write) {
 	/* guest code runs from here: a fault it takes on a held page is served */
 	const int phase = fault_phase();
 	fault_phase_set(MB_PHASE_GUEST);
+#ifdef MB_HAVE_FSBASE
+	/* ...and with the guest's own thread pointer, when it owns %fs. The
+	 * handler put the host's back on entry, and guest code under it reads
+	 * the HOST's thread locals and arrives at its system calls with a base
+	 * the dispatcher refuses ("something outside a fault took it"). Host C
+	 * runs again after it, so the host's comes back. */
+	const bool swap = mb_fs_swap && mb_guest_ctx && mb_guest_ctx->fs_swap;
+	const uintptr_t host_fs = swap ? mb_rdfsbase() : 0;
+	/* the very base the guest faulted on, when the handler sampled a live one:
+	 * the faulting thread's own, whichever thread that is */
+	if (swap) mb_wrfsbase(g_guest_fs_at_fault && g_guest_fs_at_fault != mb_early_tp
+	                          ? g_guest_fs_at_fault : mb_guest_ctx->thread_area);
+#endif
 	const bool handled = g_guest_fault((uint64_t)addr, write ? 1 : 0) != 0;
+#ifdef MB_HAVE_FSBASE
+	if (swap) mb_wrfsbase(host_fs);
+#endif
 	fault_phase_set(phase);
 	return handled;
 }
@@ -534,6 +553,7 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
 	                                       ->uc_mcontext.gregs[REG_RIP]);
 	const uintptr_t fs_at_fault = guest_rip ? mb_rdfsbase() : 0;
 	if (guest_rip && mb_guest_ctx->host_fs) mb_wrfsbase(mb_guest_ctx->host_fs);
+	g_guest_fs_at_fault = fs_at_fault;   /* under the host's base: a host thread local */
 	const uintptr_t fault = (uintptr_t)info->si_addr;
 	const uintptr_t rip = (uintptr_t)((ucontext_t *)ucontext)->uc_mcontext.gregs[REG_RIP];
 	/* A %fs access with the base already lost is the repair, not a fault to

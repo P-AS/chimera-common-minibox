@@ -36,6 +36,7 @@ int main(int argc, char **argv) {
 	run_fn RunThreads = (run_fn)proc(h, "RunThreads");
 	run1_fn RunCondvar = (run1_fn)proc(h, "RunCondvar");
 	run_fn RunTls = (run_fn)proc(h, "RunTls");
+	run_fn RunGuestFault = (run_fn)proc(h, "RunGuestFault");
 	wbx_deactivate_host(h, &r); wbx_seal(h, &r);
 	if (r.error_message[0]) { fprintf(stderr, "seal: %s\n", r.error_message); return 1; }
 	wbx_activate_host(h, &r);
@@ -53,6 +54,9 @@ int main(int argc, char **argv) {
 		const uint64_t tls = RunTls();
 		printf("RunTls -> %#llx (expect 0: thread locals zeroed, initialised, apart from the stack)\n", (unsigned long long)tls);
 		CHECK(tls == 0);
+		const uint64_t gf = RunGuestFault();
+		printf("RunGuestFault -> %#llx (expect 0: the guest's fault handler runs as guest code)\n", (unsigned long long)gf);
+		CHECK(gf == 0);
 	}
 
 	/* determinism: identical results on repeat */
