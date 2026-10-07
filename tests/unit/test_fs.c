@@ -88,6 +88,35 @@ static void test_rw_write_grow(void) {
 	mb_fs_free(fs);
 }
 
+/* pwrite: at an offset, the position left alone; past the end with the gap as
+ * zeros; and a descriptor that is not open is EBADF, never anything worse. */
+static void test_pwrite(void) {
+	mb_fs *fs = mb_fs_new();
+	mb_fs_mount(fs, "w", NULL, 0, true);
+	mb_fs_mount(fs, "r", (const uint8_t *)"fixed", 5, false);
+	mb_sword fd = mb_fs_open(fs, "w", O_RDWR);
+	CHECK_EQ(mb_fs_write(fs, fd, (const uint8_t *)"abcdefgh", 8), 8);
+	CHECK_EQ(mb_fs_pwrite(fs, fd, (const uint8_t *)"XY", 2, 2), 2);
+	CHECK_EQ(mb_fs_seek(fs, fd, 0, SEEK_CUR), 8);                    /* position untouched */
+	CHECK_EQ(mb_fs_pwrite(fs, fd, (const uint8_t *)"Z", 1, 12), 1);  /* past the end */
+	CHECK_EQ(mb_fs_pwrite(fs, fd, (const uint8_t *)"", 0, 40), 0);   /* nothing written, nothing grown... */
+	CHECK_EQ(mb_fs_seek(fs, fd, 0, SEEK_END), 13);                   /* ...the file ends where Z left it */
+	CHECK(mb_fs_pwrite(fs, fd, (const uint8_t *)"q", 1, -1) == -EINVAL);
+	CHECK(mb_fs_pwrite(fs, -1, (const uint8_t *)"q", 1, 0) == -EBADF);   /* the call that was fatal */
+	CHECK(mb_fs_pwrite(fs, 9999, (const uint8_t *)"q", 1, 0) == -EBADF);
+	mb_sword ro = mb_fs_open(fs, "r", O_RDONLY);
+	CHECK(mb_fs_pwrite(fs, (int)ro, (const uint8_t *)"q", 1, 0) == -EBADF);
+	CHECK(mb_fs_pwrite(fs, 1, (const uint8_t *)"q", 1, 0) == -ESPIPE);   /* stdout has no offsets */
+	CHECK_EQ(mb_fs_close(fs, ro), 0);
+	CHECK_EQ(mb_fs_close(fs, fd), 0);
+	uint8_t *out; size_t len;
+	CHECK_EQ(mb_fs_unmount(fs, "w", &out, &len), 0);
+	CHECK_EQ(len, 13);
+	CHECK(memcmp(out, "abXYefgh\0\0\0\0Z", 13) == 0);
+	free(out);
+	mb_fs_free(fs);
+}
+
 static void test_fd_semantics(void) {
 	mb_fs *fs = mb_fs_new();
 	mb_fs_mount(fs, "a", (const uint8_t *)"x", 1, false);
@@ -393,6 +422,7 @@ static void run_all(void) {
 	RUN(test_ro_read);
 	RUN(test_seek);
 	RUN(test_rw_write_grow);
+	RUN(test_pwrite);
 	RUN(test_fd_semantics);
 	RUN(test_mount_errors);
 	RUN(test_sysout_tail);

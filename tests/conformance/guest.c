@@ -130,6 +130,20 @@ ECL_EXPORT int GetrusageZeroed(void) {
 	return 1;
 }
 
+/* pwrite through a descriptor that is not open: EBADF, and the machine goes
+ * on. The call did not exist, so this was the end of the guest - which a
+ * Triforce game writing its IC card to a file it had failed to open found out
+ * (chimera issue #185). A buffer the guest does not own is EFAULT. */
+ECL_EXPORT int PwriteBadDescriptor(void) {
+	char sixteen[16];
+	memset(sixteen, 0x5A, sizeof sixteen);
+	errno = 0;
+	if (pwrite(-1, sixteen, sizeof sixteen, 0) != -1 || errno != EBADF) return 0;
+	errno = 0;
+	if (syscall(SYS_pwrite64, 1, (void *)16, 8, 0) != -1 || errno != EFAULT) return 0;
+	return 1;
+}
+
 /* a NULL thread area is a foreign clone convention: EINVAL, not a fault */
 ECL_EXPORT int NullCloneRefused(void) {
 	errno = 0;

@@ -422,6 +422,32 @@ mb_sword mb_fs_write(mb_fs *fs, int fd, const uint8_t *buf, size_t n) {
 	return (mb_sword)n;
 }
 
+/* pwrite(2): n bytes at `offset`, the handle's own position untouched. Past
+ * the end is allowed, as it is everywhere, and the gap reads as zeros. A
+ * descriptor that is not open is EBADF - which is the whole of what the call
+ * that brought this here needed (chimera issue #185: a Triforce game wrote
+ * its IC card through a file it had failed to open, fd -1). */
+mb_sword mb_fs_pwrite(mb_fs *fs, int fd, const uint8_t *buf, size_t n, mb_sword offset) {
+	open_handle *h = handle_by_fd(fs, fd);
+	if (!h) return -EBADF;
+	mounted_file *f = &fs->files[h->file];
+	if (f->kind == F_SYSOUT) return -ESPIPE;
+	if (f->kind != F_REGULAR || !f->writable) return -EBADF;
+	if (offset < 0) return -EINVAL;
+	if (n == 0) return 0;   /* nothing written is nothing grown, wherever it points */
+	const size_t at = (size_t)offset, end = at + n;
+	if (end < at) return -EFBIG;
+	if (end > f->cap) {
+		uint8_t *grown = realloc(f->data, end);
+		if (!grown) return -ENOSPC;
+		f->data = grown; f->cap = end;
+	}
+	if (at > f->len) memset(f->data + f->len, 0, at - f->len);
+	memcpy(f->data + at, buf, n);
+	if (end > f->len) f->len = end;
+	return (mb_sword)n;
+}
+
 mb_sword mb_fs_seek(mb_fs *fs, int fd, mb_sword offset, int whence) {
 	open_handle *h = handle_by_fd(fs, fd);
 	if (!h) return -EINVAL;

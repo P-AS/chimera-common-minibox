@@ -558,6 +558,7 @@ mb_sword mb_fs_close(mb_fs *fs, int fd);
 mb_sword mb_fs_dup(mb_fs *fs, int fd);
 mb_sword mb_fs_read(mb_fs *fs, int fd, uint8_t *buf, size_t n);
 mb_sword mb_fs_write(mb_fs *fs, int fd, const uint8_t *buf, size_t n);
+mb_sword mb_fs_pwrite(mb_fs *fs, int fd, const uint8_t *buf, size_t n, mb_sword offset);
 mb_sword mb_fs_seek(mb_fs *fs, int fd, mb_sword offset, int whence);
 mb_sword mb_fs_stat_name(mb_fs *fs, const char *name, void *kstat);
 bool     mb_fs_exists(mb_fs *fs, const char *name);

@@ -367,6 +367,12 @@ machine runs on:
 - **wbx_clone(2000)** with `thread_area == 0`: returns EINVAL (a NULL area is
   a foreign clone convention, not the musl pthread struct whose words 12,13
   are stack_end/size; refused instead of faulting the host on pthread[12]).
+- **pwrite64(18)** (2026-10-07, additive in the same way: it used to stop
+  the machine): writes `count` bytes at `offset` of a writable mounted file
+  and leaves the descriptor's position alone; an offset past the end is
+  allowed and the gap reads as zeros. A descriptor that is not open, or not
+  writable, is EBADF; stdout and stderr are ESPIPE; a buffer the guest does
+  not own is EFAULT. pread64(17) has been there since v2.
 
 ## Virtual time (spec v3, opt-in)
 

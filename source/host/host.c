@@ -54,7 +54,7 @@ enum {
 	NR_mmap=9, NR_mprotect=10, NR_munmap=11, NR_brk=12, NR_rt_sigaction=13, NR_rt_sigprocmask=14,
 	NR_ioctl=16, NR_readv=19, NR_writev=20, NR_sched_yield=24, NR_mremap=25, NR_madvise=28,
 	NR_nanosleep=35, NR_getpid=39, NR_exit=60, NR_truncate=76, NR_ftruncate=77,
-	NR_getppid=110, NR_gettid=186, NR_futex=202, NR_sched_setaffinity=203, NR_sched_getaffinity=204, NR_pread64=17, NR_sysinfo=99, NR_prctl=157, NR_openat=257, NR_newfstatat=262, NR_set_thread_area=205, NR_clock_nanosleep=230,
+	NR_getppid=110, NR_gettid=186, NR_futex=202, NR_sched_setaffinity=203, NR_sched_getaffinity=204, NR_pread64=17, NR_pwrite64=18, NR_sysinfo=99, NR_prctl=157, NR_openat=257, NR_newfstatat=262, NR_set_thread_area=205, NR_clock_nanosleep=230,
 	NR_clock_gettime=228, NR_set_tid_address=218, NR_getrandom=318, NR_fcntl=72,
 	NR_fsync=74, NR_fdatasync=75, NR_sync=162, NR_syncfs=306,
 	NR_getuid=102, NR_getgid=104, NR_geteuid=107, NR_getegid=108, NR_wbx_clone=2000,
@@ -497,6 +497,17 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			if (r < 0) return serr((int)-r);
 			mb_sword n = mb_fs_read(h->fs, (int)a1, (void *)a2, a3);
 			mb_fs_seek(h->fs, (int)a1, pos, 0);
+			return n < 0 ? serr((int)-n) : sok(n);
+		}
+		case NR_pwrite64: {
+			/* write at an offset, position untouched: pread64's twin. It was
+			 * not here, and a call that is not here ends the guest - so a
+			 * program that wrote through a descriptor it had failed to open,
+			 * which is EBADF and a logged error on any other system, died of
+			 * it (chimera issue #185). A buffer the guest does not own is
+			 * EFAULT, not a host fault. */
+			if (a3 != 0 && !guest_owns(h, a2, a3)) return serr(EFAULT);
+			mb_sword n = mb_fs_pwrite(h->fs, (int)a1, (const uint8_t *)a2, a3, (mb_sword)a4);
 			return n < 0 ? serr((int)-n) : sok(n);
 		}
 		case NR_openat: {
