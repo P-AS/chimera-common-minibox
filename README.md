@@ -19,8 +19,9 @@ Derived from the BizHawk project's waterbox
 (github.com/TASEmulators/BizHawk). miniBox combines several upstream projects,
 each under its own permissive license (BizHawk's waterbox - MIT; musl libc -
 MIT, Rich Felker et al.; libco - public domain, byuu; LLVM libc++ etc. -
-Apache-2.0 w/ LLVM exception, built not vendored). See LICENSE and
-docs/ATTRIBUTION.md for the full component-by-component breakdown.
+Apache-2.0 w/ LLVM exception, built not vendored). The terms are in LICENSE
+(the MIT License); NOTICE says whose work each part is, and
+docs/ATTRIBUTION.md has the full component-by-component breakdown.
 
 ## Layout
 
