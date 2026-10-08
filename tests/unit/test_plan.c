@@ -209,6 +209,57 @@ static void test_an_epoch_across_a_plan(void) {
 	mb_block_free(b);
 }
 
+/* A plan must not cost the NEXT epoch its holds.
+ *
+ * This is the order a history takes an anchor in: the state is planned as the
+ * frame ends, and the epoch for the next frame opens while somebody else is
+ * still copying it. The pages the plan held were mapped writable until then -
+ * written since the last epoch, so the next one owed each of them a hold -
+ * and holding them for the plan took them off the list that hold is made
+ * from. Nothing showed while a page stayed as the plan left it, read-only; the
+ * first thing that worked its protection out again after the copy found it
+ * dirty, not held, owed to nobody, and mapped it writable. What the guest wrote
+ * there was then in no delta.
+ *
+ * Two things work a protection out again, and both are here: the guest giving
+ * a range the protection it already has (RPCS3 does it all day to the pages of
+ * its video memory, and Dead or Alive 5 came back from a greenzone restore
+ * with four pages of it stale and a PPU thread jumping to address zero), and
+ * the plan being finished in the middle of the epoch. */
+static void test_a_plan_keeps_the_next_epochs_holds(void) {
+	for (int how = 0; how < 2; how++) {
+		mb_block *b = running(0x80000);
+		const size_t size = mb_block_state_size(b);
+		uint8_t *dest = (uint8_t *)calloc(1, size);
+		CHECK(dest != NULL);
+		CHECK(mb_block_state_plan(b, dest) != 0);       /* the anchor, as the frame ends */
+		mb_block_epoch_begin(b);                         /* the next frame's epoch */
+		if (how == 0) {
+			/* somebody copies the whole state, and the guest then says of a
+			 * range what is already true of it */
+			CHECK_EQ(mb_block_plan_fill(b, 0, mb_block_plan_count(b)), mb_block_plan_count(b));
+			mb_range r = { b->addr.start + 0x2000, 0x4000 };
+			CHECK_EQ(mb_block_mprotect(b, r, MB_PROT_RW), 0);
+		} else {
+			CHECK_EQ(mb_block_plan_finish(b), 0);
+		}
+		gp(b, 0x3000)[5] = 0x99;                         /* the frame writes */
+		if (how == 0) CHECK_EQ(mb_block_plan_finish(b), 0);
+
+		membuf delta = {0};
+		CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&delta), 0);
+		gp(b, 0x3000)[5] = 0;
+		delta.pos = 0;
+		CHECK_EQ(mb_block_delta_apply(b, membuf_read, (uintptr_t)&delta), 0);
+		CHECK_EQ(gp(b, 0x3000)[5], 0x99);                /* the delta knew */
+
+		free(dest);
+		membuf_free(&delta);
+		CHECK(mb_block_maps_consistent(b));
+		mb_block_free(b);
+	}
+}
+
 /* Memory given back while a state is being taken. munmap and MADV_DONTNEED zero
  * pages through the mirror, which never faults, so nothing told the plan: the
  * state kept the zeros instead of what malloc had there (chimera issue #68). */
@@ -341,6 +392,7 @@ static void run_all(void) {
 	RUN(test_filled_by_a_thread);
 	RUN(test_a_planned_state_loads);
 	RUN(test_an_epoch_across_a_plan);
+	RUN(test_a_plan_keeps_the_next_epochs_holds);
 	RUN(test_an_unmap_during_a_plan);
 	RUN(test_an_external_copy_during_a_plan);
 	RUN(test_a_load_during_a_plan);
