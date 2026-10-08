@@ -43,7 +43,7 @@ static inline int mb_linux_errno(int host) {
 		{ ENOLCK, 37 }, { ENOSYS, 38 }, { ENOTEMPTY, 39 }, { ELOOP, 40 },
 		{ EWOULDBLOCK, 11 }, { EILSEQ, 84 }, { EOVERFLOW, 75 },
 		{ ENOTSUP, 95 }, { EOPNOTSUPP, 95 }, { ECANCELED, 125 },
-		{ ETIMEDOUT, 110 },
+		{ ETIMEDOUT, 110 }, { EAFNOSUPPORT, 97 },
 	};
 	for (size_t i = 0; i < sizeof map / sizeof map[0]; i++)
 		if (map[i].host == host) return map[i].linux_;
