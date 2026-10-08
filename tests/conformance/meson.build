@@ -47,6 +47,9 @@ test('conformance-kit0', run_guest,
   timeout: 120,
 )
 
+# x86-64 only: the %fs a host may drop, and FSGSBASE that may be missing.
+# aarch64's thread pointer is always the user's and is never lost.
+if host_machine.cpu_family() != 'aarch64'
 # Dropped-%fs repair: guest toolchain only (Linux), like the guest itself.
 test('conformance-fs-repair', run_guest,
   args: ['--fs-repair-child', guest_wbx],
@@ -61,6 +64,7 @@ test('conformance-probe-off', run_guest,
   suite: 'system',
   timeout: 180,
 )
+endif
 
 # Guests that die while starting and while being sealed: the host refuses the
 # machine with the reason and lives on.
