@@ -373,6 +373,10 @@ machine runs on:
   allowed and the gap reads as zeros. A descriptor that is not open, or not
   writable, is EBADF; stdout and stderr are ESPIPE; a buffer the guest does
   not own is EFAULT. pread64(17) has been there since v2.
+- **socket(41)** (2026-10-08, additive in the same way): returns
+  EAFNOSUPPORT for every family. There is no network in-guest and none will
+  be offered; a caller that probes for one is told so and runs on. The
+  first refusal of a run is noted in the diagnostic log.
 
 ## Virtual time (spec v3, opt-in)
 

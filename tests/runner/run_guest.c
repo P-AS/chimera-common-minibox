@@ -671,6 +671,7 @@ int main(int argc, char **argv) {
 		CHECK(((int_fn)proc(h, "GetrusageZeroed"))() == 1);
 		CHECK(((int_fn)proc(h, "NullCloneRefused"))() == 1);
 		CHECK(((int_fn)proc(h, "PwriteBadDescriptor"))() == 1);
+		CHECK(((int_fn)proc(h, "SocketRefused"))() == 1);
 	}
 	/* spec v2 invariants a v3 host must preserve: this guest declares
 	 * nothing, so the clock is constant, timeouts never expire on their

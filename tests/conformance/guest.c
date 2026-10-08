@@ -144,6 +144,17 @@ ECL_EXPORT int PwriteBadDescriptor(void) {
 	return 1;
 }
 
+/* no network in-guest: a socket is refused, and the machine goes on. The call
+ * was not there, so asking was the end of the guest (chimera issue #184). */
+ECL_EXPORT int SocketRefused(void) {
+	errno = 0;
+	if (syscall(SYS_socket, 2 /* AF_INET */, 1 /* SOCK_STREAM */, 0) != -1) return 0;
+	if (errno != EAFNOSUPPORT) return 0;
+	errno = 0;
+	if (syscall(SYS_socket, 1 /* AF_UNIX */, 2 /* SOCK_DGRAM */, 0) != -1 || errno != EAFNOSUPPORT) return 0;
+	return 1;
+}
+
 /* a NULL thread area is a foreign clone convention: EINVAL, not a fault */
 ECL_EXPORT int NullCloneRefused(void) {
 	errno = 0;
