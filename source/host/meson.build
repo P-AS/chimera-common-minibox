@@ -25,9 +25,11 @@ minibox_host_sources = files(
 # for the CPU it runs on: x86-64 (the spec's) or aarch64.
 if host_machine.cpu_family() == 'aarch64'
   minibox_host_sources += files('interop_aarch64.S', 'guarded_aarch64.S')
-else
+elif host_machine.cpu_family() == 'x86_64'
   # (the win64<->sysv64 adapters are x86-64's: aarch64 has one ABI)
   minibox_host_sources += files('interop_bin.c', 'guarded.S', 'calling_convention_adapters.c')
+else
+  error('miniBox runs on x86-64 and aarch64 only, not ' + host_machine.cpu_family())
 endif
 
 # The PAL is platform-specific (each file self-guards with #ifdef, so listing

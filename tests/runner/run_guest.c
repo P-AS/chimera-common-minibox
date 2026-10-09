@@ -26,8 +26,10 @@ static uintptr_t host_fs_base(void) {
 #if defined(__aarch64__)
 	/* aarch64: TPIDR_EL0, where glibc keeps this thread's state */
 	__asm__ volatile ("mrs %0, tpidr_el0" : "=r" (v));
-#else
+#elif defined(__x86_64__)
 	syscall(SYS_arch_prctl, 0x1003 /* ARCH_GET_FS */, &v);
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
 #endif
 	return v;
 }
@@ -329,7 +331,7 @@ static int handler_does_not_recurse(const char *self, const char *guest) {
 }
 #endif
 
-#if !defined(_WIN32) && !defined(__aarch64__)   /* %fs repair: x86-64 only (aarch64 never loses TPIDR_EL0) */
+#if !defined(_WIN32) && defined(__x86_64__)   /* %fs repair: x86-64 only (aarch64 never loses TPIDR_EL0) */
 /* Can this machine run a real guest-side drop (guest WRFSBASE(0))? Some
  * kernels (WSL2) kill it despite the CPU flag - and the base is already 0
  * when the fault arrives, so nothing libc may run until %fs is put back.
@@ -556,7 +558,7 @@ static void guest_deaths_are_survived(const char *path) {
 		{ "Abort", "aborted" },
 		{ "Halt", "stopped itself" },
 		{ "Ud2", "illegal instruction" },
-#if !defined(__aarch64__)   /* aarch64 integer division by zero does not trap: it answers 0 */
+#if defined(__x86_64__)   /* aarch64 integer division by zero does not trap: it answers 0 */
 		{ "DivideByZero", "divided by zero" },
 #endif
 		{ "WildWrite", "crashed" },
@@ -610,7 +612,7 @@ int main(int argc, char **argv) {
 	if (argc > 2 && strcmp(argv[1], "--abort-child") == 0) return abort_child(argv[2]);
 #ifndef _WIN32
 	if (argc > 2 && strcmp(argv[1], "--host-fault-child") == 0) return host_fault_child(argv[2]);
-#if !defined(__aarch64__)
+#if defined(__x86_64__)
 	if (argc > 2 && strcmp(argv[1], "--fs-repair-child") == 0) return fs_repair_child(argv[2]);
 #endif
 #else

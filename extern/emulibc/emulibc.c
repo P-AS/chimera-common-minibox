@@ -85,8 +85,10 @@ ECL_EXPORT void ecl_seal()
 		if (mprotect((void*)__wbxsysinfo.sealed.start, (__sealed_current - __wbxsysinfo.sealed.start + 0xfff) & ~0xffful, PROT_READ) != 0)
 #if defined(__aarch64__)
 			__builtin_trap();
-#else
+#elif defined(__x86_64__)
 			__asm__("int3");
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
 #endif
 	}
 }
