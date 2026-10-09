@@ -352,6 +352,13 @@ itself fault on a tracked clean page - its own thread locals, held by an
 epoch - and that fault is served as any other; a fault it does not handle is
 the guest's death, as anywhere in guest code.
 
+The machine's page is 4 KiB on every host, and a host whose own page is larger
+(16 KiB on Apple silicon) protects the machine pages that share one host page
+together. A page the guest protects beside one it left open is then not
+protected, and the access the handler is waiting for never faults. Such a host
+cannot keep this section, so it refuses a guest that exports
+GuestFaultHandler at creation, saying why, rather than run it differently.
+
 ## Answered instead of fatal (spec v2.2, additive)
 
 These calls used to stop the machine (section 7's "everything else" rule),
