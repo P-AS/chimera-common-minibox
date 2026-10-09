@@ -475,6 +475,13 @@ thunk, so that its own system calls (unprotecting the page) work. Before
 ended the process (Chimera issue 280). Not observable to a guest that handles
 its faults: it is now called where it used to kill the host.
 
+The machine's page is 4 KiB on every host, and a host whose own page is larger
+(16 KiB on Apple silicon) protects the machine pages that share one host page
+together. A page the guest protects beside one it left open is then not
+protected, and the access the handler is waiting for never faults. Such a host
+cannot keep this section, so it refuses a guest that exports
+GuestFaultHandler at creation, saying why, rather than run it differently.
+
 A frontend that only READS guest memory - its memory tools, between frames,
 on a thread of its own - does not go through the guest's view at all
 (2026-10-18). Read there, a page the guest protected faults, the handler runs
