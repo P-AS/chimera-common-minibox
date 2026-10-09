@@ -187,7 +187,7 @@ bool mb_fsbase_ok(void) {
 	mb_fs_swap = true;
 	return true;
 }
-#else
+#elif defined(__x86_64__)
 #ifndef HWCAP2_FSGSBASE
 #define HWCAP2_FSGSBASE (1u << 1)
 #endif
@@ -200,6 +200,8 @@ bool mb_fsbase_ok(void) {
 	mb_fs_swap = cached != 0;
 	return cached != 0;
 }
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
 #endif
 #endif
 
@@ -356,13 +358,15 @@ uintptr_t mb_thunks_get(mb_thunks *t, uintptr_t guest_entry, mb_context *c) {
 	emit64(&p, guest_entry);                                  /* 32 */
 	emit64(&p, (uintptr_t)&mb_guest_ctx);                     /* 40 */
 	emit64(&p, (uintptr_t)&mb_guarded_call);                  /* 48 */
-#else
+#elif defined(__x86_64__)
 	emit8(&p, 0x49); emit8(&p, 0xba); emit64(&p, (uintptr_t)c);            /* mov r10, ctx */
 	emit8(&p, 0x49); emit8(&p, 0xbb); emit64(&p, guest_entry);              /* mov r11, entry */
 	emit8(&p, 0x4c); emit8(&p, 0x89); emit8(&p, 0xd0);                      /* mov rax, r10 */
 	emit8(&p, 0x48); emit8(&p, 0xa3); emit64(&p, (uintptr_t)&mb_guest_ctx); /* mov [abs], rax */
 	emit8(&p, 0x48); emit8(&p, 0xb8); emit64(&p, (uintptr_t)&mb_guarded_call); /* mov rax, guarded */
 	emit8(&p, 0xff); emit8(&p, 0xe0);                                       /* jmp rax */
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
 #endif
 	if ((size_t)(p - (uint8_t *)addr) > THUNK_SIZE) {
 		/* Silent overflow here writes over the NEXT thunk, which shows up much
@@ -448,7 +452,7 @@ uintptr_t mb_thunks_get_extcall(mb_thunks *t, uintptr_t cb, mb_context *c) {
 	emit64(&p, (uintptr_t)c);                                                  /* 40 */
 	emit64(&p, cb);                                                            /* 48 */
 	__builtin___clear_cache((char *)addr, (char *)p);
-#else
+#elif defined(__x86_64__)
 	const uint32_t guest_fcw = (uint32_t)offsetof(mb_context, guest_fcw);
 	const uint32_t guest_mxcsr = (uint32_t)offsetof(mb_context, guest_mxcsr);
 	const uint32_t host_fcw = (uint32_t)offsetof(mb_context, host_fcw);
@@ -478,6 +482,8 @@ uintptr_t mb_thunks_get_extcall(mb_thunks *t, uintptr_t cb, mb_context *c) {
 	emit8(&p, 0x4c); emit8(&p, 0x89); emit8(&p, 0xd8);                 /* mov rax, r11 */
 	emit8(&p, 0xc3);                                                   /* ret */
 	if ((size_t)(p - (uint8_t *)addr) > THUNK_SIZE) abort();           /* the size was checked above for THUNK_SIZE */
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
 #endif
 	t->ext_entries[t->ext_count] = cb;
 	t->ext_ptrs[t->ext_count] = addr;
