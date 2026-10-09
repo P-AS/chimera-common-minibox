@@ -25,6 +25,7 @@ by the same number and one host can answer them all. See README.md.
 
 Usage: gen-gl-bridge.py <glad gl.h> <master list> <output dir> [--only <subset>]
 """
+import os
 import re
 import sys
 
@@ -168,14 +169,21 @@ def main():
             continue
 
         if name in STRING_RETURNING:
-            # the guest supplies the buffer; see STRING_RETURNING above
+            # the guest supplies the buffer; see STRING_RETURNING above. The
+            # answer is then given a place of its own (gl-string-keep.inc): the
+            # buffer is one, and a caller holding two answers at once - vendor
+            # and version, say - would otherwise hold the second one twice.
+            key_index = "(unsigned)index" if any(arg == "index" for _, arg in args) else "CHIMERA_GL_STRING_NO_INDEX"
             guest.append(f"""static const GLubyte *GLAD_API_PTR w_{name}({signature})
 {{
 	static char buffer[4096];
+	const char *kept;
 	struct {struct} chimera_a;
 """ + "".join(f"\tchimera_a.{arg} = {arg};\n" for _, arg in args) + f"""	g_bridge(CHIMERA_GL_OP_{name}, (uint64_t)(uintptr_t)&chimera_a,
 		(uint64_t)(uintptr_t)buffer, sizeof buffer, 0, 0);
-	return buffer[0] ? (const GLubyte *)buffer : NULL;
+	if (!buffer[0]) return NULL;
+	kept = chimera_gl_string_keep((unsigned)name, {key_index}, buffer);
+	return (const GLubyte *)(kept ? kept : buffer);
 }}
 """)
             host.append(f"""		case CHIMERA_GL_OP_{name}:
@@ -252,6 +260,11 @@ void *chimera_gl_lookup(const char *name)
 	return nullptr;
 }""")
 
+    # pasted in rather than included: a core's build finds this generator by
+    # path, and not every core has this directory on its include path
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "gl-string-keep.inc")) as f:
+        string_keep = f.read()
+
     with open(f"{outdir}/gl-bridge-guest.cpp", "w") as f:
         f.write(banner + f"""
 /* The guest's side: {len(entries)} entry points, each one a struct and a call
@@ -267,7 +280,7 @@ void *chimera_gl_lookup(const char *name)
 
 static chimera_gl_bridge_fn g_bridge;
 
-""" + "\n".join(guest) + f"""
+""" + string_keep + "\n" + "\n".join(guest) + f"""
 /* Returns false when the host is older than this guest - it would not know
  * every opcode this guest can emit, and the core must draw some other way. */
 bool chimera_gl_install(chimera_gl_bridge_fn bridge)

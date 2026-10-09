@@ -44,3 +44,20 @@ guest can emit to be one the host knows.
 `--only` generates a guest half for the entry points that core actually names,
 with the master list's opcodes. Without it the whole list is generated, which is
 what the host wants: it answers everything, for every core.
+
+## The two calls that answer with a string
+
+`glGetString` and `glGetStringi` return a pointer into the driver's memory,
+which a guest cannot read. The host copies the answer into a buffer the guest
+supplies, and the generated wrapper then gives it a place of its own, one per
+(name, index): `gl-string-keep.inc`, pasted into every core's wrapper file.
+OpenGL promises those strings are static, and renderers hold several at once
+- vendor, renderer and version, to pick driver workarounds by. With one
+buffer for all of them, which is how the wrapper first was, a renderer read
+its version string as its vendor (Flycast logged exactly that on a GTX 1060;
+Dolphin stores the three pointers too). `tests/unit/test_gl_strings.c` holds
+the rule, and fails on the one-buffer version.
+
+A core gets this when its wrapper file is generated again - at its next build
+for the cores that generate it while building, and when somebody regenerates
+and commits it for the ones that keep it in their repository.
