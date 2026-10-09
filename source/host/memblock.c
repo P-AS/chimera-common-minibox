@@ -222,6 +222,8 @@ void mb_block_track_lock(mb_block *b) {
 		__builtin_ia32_pause();
 #elif defined(__aarch64__)
 		__asm__ volatile("yield");
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
 #endif
 	}
 	b->track_owner = self_id();
@@ -1724,6 +1726,8 @@ static bool plan_take(mb_block *b, size_t pi, bool wait) {
 		__builtin_ia32_pause();
 #elif defined(__aarch64__)
 		__asm__ volatile("yield");
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
 #endif
 	}
 }

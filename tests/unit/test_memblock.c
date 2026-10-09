@@ -252,7 +252,7 @@ static void test_write_with_sp_in_a_declared_stack(void) {
 		: "=&r"(got)
 		: "r"(sp)
 		: "x11", "x12", "memory", "cc");
-#else
+#elif defined(__x86_64__)
 	__asm__ __volatile__(
 		"mov %%rsp, %%r11\n\t"
 		"mov %1, %%rsp\n\t"
@@ -263,6 +263,8 @@ static void test_write_with_sp_in_a_declared_stack(void) {
 		: "=r"(got)
 		: "r"(sp)
 		: "r11", "rax", "memory", "cc");
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
 #endif
 
 	CHECK_EQ(got, 0x5aull);   /* the push and pop actually happened */

@@ -495,6 +495,8 @@ static inline void mb_wrfsbase(uintptr_t v) { __asm__ volatile("wrfsbase %0" :: 
 #define MB_HAVE_FSBASE 1
 static inline uintptr_t mb_rdfsbase(void) { uintptr_t v; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(v) :: "memory"); return v; }
 static inline void mb_wrfsbase(uintptr_t v) { __asm__ volatile("msr tpidr_el0, %0" :: "r"(v) : "memory"); }
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
 #endif
 #ifdef MB_HAVE_FSBASE
 bool mb_fsbase_ok(void);

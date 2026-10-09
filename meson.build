@@ -56,13 +56,15 @@ if build_guest_toolchain
     waterbox_musl_target = 'waterbox_aarch64'
     waterbox_guest_triplet = 'aarch64-linux-musl'
     waterbox_cpu_flags = ['-mbranch-protection=none', '-mno-outline-atomics', '-ffp-contract=off', '-fsigned-char']
-  else
+  elif host_machine.cpu_family() == 'x86_64'
     waterbox_musl_target = 'waterbox'
     waterbox_guest_triplet = 'x86_64-linux-musl'
     waterbox_cpu_flags = ['-mcmodel=large', '-mno-red-zone']
+  else
+    error('miniBox runs on x86-64 and aarch64 only, not ' + host_machine.cpu_family())
   endif
   waterbox_common_flags = ['-mstack-protector-guard=global', '-fno-stack-protector', '-fno-pic', '-fno-pie']
-  if host_machine.cpu_family() != 'aarch64'
+  if host_machine.cpu_family() == 'x86_64'
     waterbox_common_flags += ['-fcf-protection=none']
   endif
   musl_cflags = ' '.join(['-Werror', '-fvisibility=hidden'] + waterbox_cpu_flags + waterbox_common_flags)

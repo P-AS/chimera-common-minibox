@@ -272,8 +272,10 @@ ECL_EXPORT int Init(void) {
 		/* on aarch64 it is how musl sets its thread pointer (the host keeps
 		 * TPIDR_EL0); a null one is refused and the live one stays */
 		if (syscall(SYS_set_thread_area, 0) != -1 || errno != EINVAL) return 0;
-#else
+#elif defined(__x86_64__)
 		if (syscall(SYS_set_thread_area, 0) != -1 || errno != ENOSYS) return 0;
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
 #endif
 		errno = 0;
 		if (syscall(SYS_mmap, 0, 4096, PROT_READ, MAP_PRIVATE, 3, 0) != -1 || errno != EOPNOTSUPP) return 0;
@@ -357,7 +359,7 @@ __asm__(
 	WBX_OR_SCRATCH("x8")
 	"\tldp x29, x30, [sp], #16\n"
 	"\tret\n");
-#else
+#elif defined(__x86_64__)
 __asm__(
 	".text\n"
 	".globl EntryR10\n.type EntryR10,@function\n"
@@ -390,6 +392,8 @@ __asm__(
 	"\tmov %r10, %rax\n"
 	"\tpop %rbx\n"
 	"\tret\n");
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
 #endif
 
 /* Faults with rsp pointing into a guard page: a heap page is protected to
@@ -404,8 +408,10 @@ ECL_EXPORT void GuardFault(void) {
 	if (mprotect((void *)base, 4096, PROT_NONE) != 0) return;
 #if defined(__aarch64__)
 	__asm__ volatile ("mov sp, %0\n\tudf #0" :: "r" (base + 2048) : "memory");
-#else
+#elif defined(__x86_64__)
 	__asm__ volatile ("mov %0, %%rsp\n\tud2" :: "r" (base + 2048) : "memory");
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
 #endif
 	__builtin_unreachable();
 }
@@ -485,7 +491,7 @@ __asm__(
 	"\tblr x16\n"
 	"\tldp x29, x30, [sp], #16\n"
 	"\tret\n");
-#else
+#elif defined(__x86_64__)
 __asm__(
 	".text\n"
 	".globl Halt\n.type Halt,@function\n"
@@ -547,6 +553,8 @@ __asm__(
 	"\tcall *%r10\n"
 	"\tpop %rbx\n"
 	"\tret\n");
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
 #endif
 
 int main(void) { return 0; }

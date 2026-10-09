@@ -571,10 +571,12 @@ static bool uc_write(const ucontext_t *uc) {
 	}
 	return false;
 }
-#else
+#elif defined(__x86_64__)
 #define UC_PC(uc) ((uc)->uc_mcontext.gregs[REG_RIP])
 #define UC_SP(uc) ((uc)->uc_mcontext.gregs[REG_RSP])
 static bool uc_write(const ucontext_t *uc) { return (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0; }
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
 #endif
 
 static void say_uc_regs(const ucontext_t *uc) {
@@ -590,7 +592,7 @@ static void say_uc_regs(const ucontext_t *uc) {
 	mb_diag(" code:");
 	for (int i = 0; i < 16; i++) mb_diag(" %02x", ((const unsigned char *)ip)[i]);
 	mb_diag("\n");
-#else
+#elif defined(__x86_64__)
 	say_code_and_regs((const unsigned char *)uc->uc_mcontext.gregs[REG_RIP],
 	                  uc->uc_mcontext.gregs[REG_RSP], uc->uc_mcontext.gregs[REG_RBP],
 	                  uc->uc_mcontext.gregs[REG_RAX], uc->uc_mcontext.gregs[REG_RBX],
@@ -600,6 +602,8 @@ static void say_uc_regs(const ucontext_t *uc) {
 	                  uc->uc_mcontext.gregs[REG_R10], uc->uc_mcontext.gregs[REG_R11],
 	                  uc->uc_mcontext.gregs[REG_R12], uc->uc_mcontext.gregs[REG_R13],
 	                  uc->uc_mcontext.gregs[REG_R14], uc->uc_mcontext.gregs[REG_R15]);
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
 #endif
 }
 
@@ -832,8 +836,10 @@ static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 			 * which its allocator runs on finding the heap corrupt */
 #if defined(__aarch64__)
 			const bool halted = false;   /* aarch64's a_crash is udf #0xf4: SIGILL, handler_other */
-#else
+#elif defined(__x86_64__)
 			const bool halted = *(const unsigned char *)rip == 0xf4;
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
 #endif
 			const bool escapable = halted
 				? mb_host_guest_death_in_handler(mb_guest_ctx,
@@ -898,8 +904,10 @@ static void handler_other(int sig, siginfo_t *info, void *ucontext) {
 		/* musl's a_crash() on aarch64 (arch/waterbox_aarch64): udf #0xf4, the
 		 * halt its allocator runs on finding the heap corrupt */
 		const bool halted = sig == SIGILL && *(const uint32_t *)rip == 0x000000f4u;
-#else
+#elif defined(__x86_64__)
 		const bool halted = false;
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
 #endif
 		const bool escapable = halted
 			? mb_host_guest_death_in_handler(mb_guest_ctx,

@@ -671,8 +671,10 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			if (a1 == 0) return serr(EINVAL);   /* no thread pointer is null */
 			h->context.thread_area = a1;
 			return sok(0);
-#else
+#elif defined(__x86_64__)
 		case NR_set_thread_area: return serr(ENOSYS);   /* musl handles in userspace */
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
 #endif
 		case NR_set_tid_address: return sok(mb_threads_set_tid_address(h->threads, a1));
 		case NR_gettid: return sok(mb_threads_get_tid(h->threads));
@@ -724,8 +726,10 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			 * past it (TLS above TP), so the guest passes the struct as well. */
 #if defined(__aarch64__)
 			const uintptr_t pthread = a6;
-#else
+#elif defined(__x86_64__)
 			const uintptr_t pthread = a1;
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
 #endif
 			mb_sword r = mb_threads_spawn(h->threads, h->block, a1, a2, a3, a4, (uint32_t *)a5, pthread);
 			return r < 0 ? serr((int)-r) : sok(r);
@@ -859,8 +863,10 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 	{
 #if defined(__aarch64__)
 		const uint16_t want = 183; const char *cpu = "aarch64";   /* EM_AARCH64 */
-#else
+#elif defined(__x86_64__)
 		const uint16_t want = 62; const char *cpu = "x86-64";     /* EM_X86_64 */
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
 #endif
 		uint16_t machine = 0;
 		if (image_len >= 20) memcpy(&machine, image + 18, 2);
@@ -926,13 +932,15 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 	  /* every aarch64 guest: its musl reaches pthread_self through TPIDR_EL0
 	   * (arch/waterbox_aarch64), with or without thread locals of its own */
 	  h->context.fs_swap = fs_ok; }
-#else
+#elif defined(__x86_64__)
 	  h->context.fs_swap = mb_elf_has_tls(h->elf) && fs_ok && !getenv("MB_NO_FS_SWAP"); }
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
 #endif
 	/* Said once, unprompted, because it decides whether a guest carrying its own
 	 * thread locals can work at all - and when it is wrong the failure is a
 	 * crash with nothing to connect it to. A guest with no TLS says nothing. */
-#if !defined(__aarch64__)   /* (aarch64: always on, nothing to say) */
+#if defined(__x86_64__)   /* (aarch64: always on, nothing to say) */
 	if (mb_elf_has_tls(h->elf)) {
 		fprintf(stderr, "miniBox: guest declares TLS; %%fs swap %s%s\n",
 		        h->context.fs_swap ? "ON" : "OFF",
