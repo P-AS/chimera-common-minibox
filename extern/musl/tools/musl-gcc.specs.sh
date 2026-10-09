@@ -14,8 +14,10 @@ arch=$4
 case "$arch" in
 waterbox_aarch64) cc1_machine="-mbranch-protection=none -mno-outline-atomics -ffp-contract=off -fsigned-char"
 	libgcc_spec="-lgcc" ;;
-*) cc1_machine="-mno-red-zone"
+waterbox) cc1_machine="-mno-red-zone"
 	libgcc_spec="" ;;
+*) echo "musl-gcc.specs.sh: no machine for $arch: miniBox runs on x86-64 and aarch64 only" >&2
+	exit 1 ;;
 esac
 cat <<EOF
 %rename cpp_options old_cpp_options
