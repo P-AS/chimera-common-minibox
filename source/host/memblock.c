@@ -1678,6 +1678,21 @@ static size_t state_plan_impl(mb_block *b, uint8_t *dest) {
 			continue;
 		}
 		__atomic_store_n(&p->plan_hold, 1, __ATOMIC_RELEASE);
+		/* ...and it is HELD, in the sense every epoch means: dirty, and mapped
+		 * read-only from here until its next write. It has to be said, because
+		 * the refresh below is about to take the page off the list the next
+		 * epoch makes its holds from (note_prot: not writable, so not
+		 * "unheld"), and a history plans its anchor BEFORE it opens the next
+		 * frame's epoch. Unsaid, the page was owed to nobody once its copy was
+		 * made: the first thing that worked its protection out again - a guest
+		 * giving a range the protection it already had, or this plan finishing
+		 * in the middle of an epoch - mapped it writable, and what the guest
+		 * then wrote there was in no delta. RPCS3 re-protects its video memory
+		 * all day; a greenzone restore of Dead or Alive 5 through such an
+		 * anchor came back with four pages stale and a PPU thread at address
+		 * zero (chimera#190). Not a hot page: that one is compared, never held,
+		 * and gets its heat back when the plan lets go. */
+		if (!p->hot) p->held = true;
 		if (run_start == (size_t)-1) { run_start = run_last = i; }
 		else if (i == run_last + 1) { run_last = i; }
 		else { refresh_range(b, run_start, run_last - run_start + 1); run_start = run_last = i; }
