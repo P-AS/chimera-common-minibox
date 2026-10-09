@@ -969,6 +969,20 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 	  mb_threads_set_spec(h->threads, spec);
 	  if (spec == 3) { fprintf(stderr, "miniBox: guest declares machine spec v3 (virtual time)\n"); fflush(stderr); } }
 
+	/* A guest that exports GuestFaultHandler protects its own pages and relies
+	 * on the next access to one of them to fault. On a host whose page is
+	 * larger than the machine's that cannot be kept: the machine pages sharing
+	 * one host page share its protection, and read and write are open on the
+	 * whole host page while a neighbour is readable or writable (memblock.c,
+	 * group_native_prot) - the access goes through, and the handler never
+	 * hears of it. The machine would run differently from a 4 KiB host's, and
+	 * silently, so it is refused, by name, before it runs. */
+	if (mb_group_pages() > 1 && mb_elf_proc_addr(h->elf, "GuestFaultHandler")) {
+		snprintf(errbuf, errlen, "%s exports GuestFaultHandler, which needs a host with 4 KiB pages; this host's pages are %u KiB",
+		         module_name ? module_name : "the guest", (1u << mb_host_page_shift) >> 10);
+		return host_new_unwind(h);
+	}
+
 	mb_call_guest_simple(mb_elf_entry(h->elf), &h->context);  /* _start */
 	mb_block_deactivate(h->block); h->active = false;
 	return h;

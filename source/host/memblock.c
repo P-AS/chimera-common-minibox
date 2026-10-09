@@ -686,6 +686,9 @@ static bool status_tracked(uint8_t s) {
  * That is the price of a host page larger than the machine's - a guard page,
  * a read-only page or a free page beside readable memory reads without
  * faulting - and only a guest that touches memory it may not ever sees it.
+ * Or a guest that WANTS the fault: one that exports GuestFaultHandler watches
+ * pages it protected, and on a grouped host a watched page beside open memory
+ * is never watched. Such a guest is refused at creation (mb_host_new).
  *
  * Write is NOT a union. A tracked page held read-only (clean against the
  * baseline, held by an epoch, owed to a planned state) must fault on its next
