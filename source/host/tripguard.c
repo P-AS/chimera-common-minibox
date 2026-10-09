@@ -316,6 +316,29 @@ static bool ask_guest(uintptr_t addr, bool write) {
 	/* guest code runs from here: a fault it takes on a held page is served */
 	const int phase = fault_phase();
 	fault_phase_set(MB_PHASE_GUEST);
+#ifndef _WIN32
+	/* ...and able to fault. The handler runs with every signal blocked, and a
+	 * fault while its own is blocked is not delivered: the kernel ends the
+	 * process. The guest's handler is guest code, which writes held pages -
+	 * its own thread locals, after an epoch has held them - and that write
+	 * has to be served like any other, as it is on Windows. So the signals a
+	 * guest instruction can raise are open while it runs (handler_inner lets
+	 * a fault in this phase nest), and shut again after.
+	 *
+	 * Opened BEFORE the guest's thread pointer goes in, and shut after the
+	 * host's is back: pthread_sigmask is host libc, and host libc under the
+	 * guest's %fs writes the guest's thread block. Its first call is bound
+	 * lazily, and glibc's resolver sets and clears its scope flag at %fs:0x1c
+	 * - on an x86-64 musl thread pointer, the high half of the main thread's
+	 * `next`, which the guest's next pthread_create followed to 0x720e130. */
+	sigset_t faults, was;
+	sigemptyset(&faults);
+	sigaddset(&faults, SIGSEGV);
+	sigaddset(&faults, SIGBUS);
+	sigaddset(&faults, SIGILL);
+	sigaddset(&faults, SIGFPE);
+	pthread_sigmask(SIG_UNBLOCK, &faults, &was);
+#endif
 #ifdef MB_HAVE_FSBASE
 	/* ...and with the guest's own thread pointer, when it owns %fs. The
 	 * handler put the host's back on entry, and guest code under it reads
@@ -329,28 +352,12 @@ static bool ask_guest(uintptr_t addr, bool write) {
 	const uintptr_t sampled = guest_fs_sampled();
 	if (swap) mb_wrfsbase(sampled && sampled != mb_early_tp ? sampled : mb_guest_ctx->thread_area);
 #endif
-#ifndef _WIN32
-	/* ...and able to fault. The handler runs with every signal blocked, and a
-	 * fault while its own is blocked is not delivered: the kernel ends the
-	 * process. The guest's handler is guest code, which writes held pages -
-	 * its own thread locals, after an epoch has held them - and that write
-	 * has to be served like any other, as it is on Windows. So the signals a
-	 * guest instruction can raise are open while it runs (handler_inner lets
-	 * a fault in this phase nest), and shut again after. */
-	sigset_t faults, was;
-	sigemptyset(&faults);
-	sigaddset(&faults, SIGSEGV);
-	sigaddset(&faults, SIGBUS);
-	sigaddset(&faults, SIGILL);
-	sigaddset(&faults, SIGFPE);
-	pthread_sigmask(SIG_UNBLOCK, &faults, &was);
-#endif
 	const bool handled = g_guest_fault((uint64_t)addr, write ? 1 : 0) != 0;
-#ifndef _WIN32
-	pthread_sigmask(SIG_SETMASK, &was, NULL);
-#endif
 #ifdef MB_HAVE_FSBASE
 	if (swap) mb_wrfsbase(host_fs);
+#endif
+#ifndef _WIN32
+	pthread_sigmask(SIG_SETMASK, &was, NULL);
 #endif
 	fault_phase_set(phase);
 	return handled;
