@@ -874,12 +874,19 @@ static struct sigaction g_foreign[NSIG];
 __attribute__((no_stack_protector))
 static void handler_foreign(int sig, siginfo_t *info, void *ucontext) {
 	const struct sigaction *old = &g_foreign[sig];
-	const uintptr_t tp = mb_rdfsbase();
+	/* No %fs instruction unless the probe said they exist (mb_fs_swap), as in
+	 * handler() above. Where the OS keeps rdfsbase from userspace it is an
+	 * illegal instruction, and this runs for every wrapped signal on every
+	 * thread of the process, guest or not: unguarded it would take the
+	 * frontend down at its runtime's first signal. On such a host no guest
+	 * ever owns %fs, so there is nothing to put back either. */
+	const bool swaps = mb_fs_swap;
+	const uintptr_t tp = swaps ? mb_rdfsbase() : 0;
 	mb_context *c = mb_guest_ctx;
 	/* the guest's pointer is in when this thread was stopped in guest code, or
 	 * holds one of the guest's pointers (a transition, between the swap and
 	 * the jump) - and is not the host's own */
-	const bool guest_tp = c && c->host_fs && tp != c->host_fs
+	const bool guest_tp = swaps && c && c->host_fs && tp != c->host_fs
 		&& (rip_in_guest((uintptr_t)((ucontext_t *)ucontext)->uc_mcontext.gregs[REG_RIP])
 		    || tp == c->thread_area || (mb_early_tp && tp == mb_early_tp));
 	if (guest_tp) mb_wrfsbase(c->host_fs);
