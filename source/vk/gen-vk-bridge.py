@@ -624,6 +624,11 @@ def main():
         device = reg.canon(first) in ("VkDevice", "VkQueue", "VkCommandBuffer")
         c.append('\t{"%s", offsetof(struct vkb_fns, %s), %d},' % (name, name, 1 if device else 0))
     c.append("};\n")
+    # a command's name by its opcode, for a person reading a count of calls
+    c.append("static const char *vkb_op_name(unsigned op)\n{\n\tswitch (op) {")
+    for op, name, target in live:
+        c.append('\tcase %d: return "%s";' % (op, name))
+    c.append('\tdefault: return "";\n\t}\n}\n')
     for s in order:
         c.append("VKB_UNUSED static void vkb_x_%s(%s *d);" % (s, s))
     c.append("")

@@ -87,6 +87,19 @@ or a group of devices, and every extension nobody has asked for.
   moves - so every handle in the loaded memory names nothing. A core asks
   `chimera_vk_context_id`, sees it changed, and makes its objects again.
 
+## Where the time goes
+
+`CHIMERA_VK_STATS=1` in the host's environment makes the host half count
+every command that crosses and time it, and write the totals and the
+fourteen costliest commands to standard error when the bridge is shut down:
+
+    chimera vk stats: 1932939 calls, 2.706 s in the host half and the driver
+    chimera vk stats:       0.260 s       8771 calls   29660 ns each  vkFlushMappedMemoryRanges (125)
+
+The time is the host half's and the driver's together; what a call costs on
+its way out of the sandbox and back is not in it. Off, it is one comparison
+a call.
+
 ## One host half
 
 `vk-host.c` is the host half for everything that runs a guest: the frontend's

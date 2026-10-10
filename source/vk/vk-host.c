@@ -989,8 +989,13 @@ int chimera_vk_host_init(char *err, int errlen)
 	return 0;
 }
 
+static int s_stats;          /* CHIMERA_VK_STATS: see chimera_vk_host_dispatch */
+static void stat_print(void);
+
 void chimera_vk_host_shutdown(void)
 {
+	if (s_stats > 0)
+		stat_print();
 	destroy_context();
 	free(s_entries);
 	s_entries = NULL;
@@ -1016,8 +1021,77 @@ unsigned long chimera_vk_host_refused(long *last_op)
 	return s_refused;
 }
 
+/* ---- where the time goes, when somebody asks (CHIMERA_VK_STATS=1) --------
+ *
+ * How many times each command crossed and how long the host half and the
+ * driver took over it, written to standard error when the bridge is shut
+ * down. Off, it costs one comparison a call. */
+#define VKB_STAT_OPS 1024
+static int s_stats = -1;     /* not looked at yet */
+static struct { uint64_t calls, ns; } s_stat[VKB_STAT_OPS];
+
+static uint64_t stat_now(void)
+{
+#ifdef _WIN32
+	static LARGE_INTEGER frequency;
+	LARGE_INTEGER counter;
+	if (!frequency.QuadPart)
+		QueryPerformanceFrequency(&frequency);
+	QueryPerformanceCounter(&counter);
+	return (uint64_t)((double)counter.QuadPart * 1e9 / (double)frequency.QuadPart);
+#else
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
+}
+
+static void stat_print(void)
+{
+	uint64_t calls = 0, ns = 0;
+	for (int i = 0; i < VKB_STAT_OPS; i++) {
+		calls += s_stat[i].calls;
+		ns += s_stat[i].ns;
+	}
+	fprintf(stderr, "chimera vk stats: %llu calls, %.3f s in the host half and the driver\n",
+	        (unsigned long long)calls, (double)ns / 1e9);
+	for (int shown = 0; shown < 14; shown++) {
+		int best = -1;
+		for (int i = 0; i < VKB_STAT_OPS; i++)
+			if (s_stat[i].calls && (best < 0 || s_stat[i].ns > s_stat[best].ns))
+				best = i;
+		if (best < 0)
+			break;
+		const char *name = best >= 100 ? vkb_op_name((unsigned)best) : "(the bridge's own)";
+		fprintf(stderr, "chimera vk stats:   %9.3f s %10llu calls %7.0f ns each  %s (%d)\n", (double)s_stat[best].ns / 1e9,
+		        (unsigned long long)s_stat[best].calls, (double)s_stat[best].ns / (double)s_stat[best].calls, name, best);
+		s_stat[best].calls = 0;
+		s_stat[best].ns = 0;
+	}
+	memset(s_stat, 0, sizeof s_stat);
+}
+
+static uintptr_t dispatch_one(uintptr_t op, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e);
+
 uintptr_t VKB_GUEST_ABI chimera_vk_host_dispatch(uintptr_t op, uintptr_t a, uintptr_t b,
                                                  uintptr_t c, uintptr_t d, uintptr_t e)
+{
+	if (s_stats < 0) {
+		const char *asked = getenv("CHIMERA_VK_STATS");
+		s_stats = asked && asked[0] && asked[0] != '0';
+	}
+	if (!s_stats)
+		return dispatch_one(op, a, b, c, d, e);
+	const uint64_t began = stat_now();
+	const uintptr_t result = dispatch_one(op, a, b, c, d, e);
+	const uint64_t took = stat_now() - began;
+	const uintptr_t slot = op < VKB_STAT_OPS ? op : 0;
+	s_stat[slot].calls++;
+	s_stat[slot].ns += took;
+	return result;
+}
+
+static uintptr_t dispatch_one(uintptr_t op, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e)
 {
 	(void)b; (void)c; (void)d; (void)e;
 	switch (op) {
