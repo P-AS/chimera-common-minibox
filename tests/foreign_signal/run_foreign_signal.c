@@ -6,7 +6,14 @@
  * before miniBox, as a runtime's is, and does the same: it checks a thread
  * local of its own and that pthread_self() is the thread it was sent to. The
  * guest runs with its own thread pointer in, so unless miniBox puts the host's
- * back for the handler, both are read through the guest's. */
+ * back for the handler, both are read through the guest's.
+ *
+ * The handler must not run on the guest's STACK either, which is where the
+ * kernel puts its frame for a handler without SA_ONSTACK: that writes host
+ * data into guest memory, and a frame that reaches a clean (write-protected)
+ * tracked page cannot be delivered at all - Mono's suspend handler waits in
+ * sigsuspend for the restart signal, whose frame went one page further down
+ * and killed Chimera with a kernel SIGSEGV. */
 #include "minibox.h"
 #include <pthread.h>
 #include <signal.h>
@@ -25,10 +32,16 @@ static int fails = 0;
 #define CANARY 0x5eed5eed5eed5eedull
 static __thread volatile uint64_t t_canary = CANARY;
 static pthread_t g_main;
-static atomic_int g_seen, g_wrong, g_done;
+static atomic_int g_seen, g_wrong, g_on_guest_stack, g_done;
+/* an address on the guest's stack; the handler's frame must be nowhere near */
+static uintptr_t g_guest_stack;
+#define NEAR (64u << 20)
 
 static void runtime_handler(int sig, siginfo_t *info, void *uc) {
 	(void)sig; (void)info; (void)uc;
+	volatile uint8_t here = 0;
+	const uintptr_t sp = (uintptr_t)&here;
+	if (sp > g_guest_stack - NEAR && sp < g_guest_stack + NEAR) atomic_fetch_add(&g_on_guest_stack, 1);
 	if (t_canary != CANARY || !pthread_equal(pthread_self(), g_main)) atomic_fetch_add(&g_wrong, 1);
 	atomic_fetch_add(&g_seen, 1);
 }
@@ -69,6 +82,7 @@ int main(int argc, char **argv) {
 	wbx_activate_host(h, &r);
 	CHECK(((init_fn)proc(h, "Init"))() == 1);
 	spin_fn Spin = (spin_fn)proc(h, "Spin");
+	g_guest_stack = (uintptr_t)((spin_fn)proc(h, "StackHere"))(0);
 
 	pthread_t s;
 	CHECK(pthread_create(&s, NULL, sender, NULL) == 0);
@@ -81,11 +95,13 @@ int main(int argc, char **argv) {
 	wbx_deactivate_host(h, &r);
 	wbx_destroy_host(h, &r);
 
-	printf("Spin -> %llu; %d signals handled, %d under the wrong thread pointer\n",
-	       (unsigned long long)spun, atomic_load(&g_seen), atomic_load(&g_wrong));
+	printf("Spin -> %llu; %d signals handled, %d under the wrong thread pointer, %d on the guest's stack (near %#lx)\n",
+	       (unsigned long long)spun, atomic_load(&g_seen), atomic_load(&g_wrong),
+	       atomic_load(&g_on_guest_stack), (unsigned long)g_guest_stack);
 	CHECK(spun == n);
 	CHECK(atomic_load(&g_seen) > 100);
 	CHECK(atomic_load(&g_wrong) == 0);
+	CHECK(atomic_load(&g_on_guest_stack) == 0);
 	if (fails == 0) printf("run_foreign_signal: all checks passed\n");
 	return fails ? 1 : 0;
 }

@@ -1009,7 +1009,16 @@ static void handler_other(int sig, siginfo_t *info, void *ucontext) {
  * the host's goes in for the handler and whatever was there comes back after.
  * Anywhere else the handler is called as it was. The faults miniBox serves
  * itself (SIGSEGV, SIGBUS, SIGILL, SIGFPE) are not wrapped here: those
- * handlers already know. */
+ * handlers already know.
+ *
+ * The wrapped handlers also take SA_ONSTACK, for the same reason miniBox's own
+ * do (mb_tripguard_ensure_altstack): without it the kernel puts the handler's
+ * frame on the stack the thread is on, which in guest code is the GUEST's -
+ * host data written into guest memory, and a frame that reaches a clean
+ * (write-protected) tracked page cannot be delivered at all. Mono's suspend
+ * handler waits in sigsuspend for the restart signal, and that signal's frame,
+ * a page further down the guest's stack, killed Chimera with a kernel SIGSEGV.
+ * On a thread with no alternate stack SA_ONSTACK changes nothing. */
 static struct sigaction g_foreign[NSIG];
 
 __attribute__((no_stack_protector))
@@ -1042,7 +1051,7 @@ static void wrap_foreign_handlers(void) {
 		g_foreign[sig] = old;
 		struct sigaction sa = old;
 		sa.sa_sigaction = handler_foreign;
-		sa.sa_flags = old.sa_flags | SA_SIGINFO;
+		sa.sa_flags = old.sa_flags | SA_SIGINFO | SA_ONSTACK;
 		if (sigaction(sig, &sa, NULL) != 0) g_foreign[sig].sa_handler = SIG_DFL;
 	}
 }
