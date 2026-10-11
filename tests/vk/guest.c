@@ -1,6 +1,7 @@
 /* The Vulkan bridge's test, as a guest: vktest.h run through the bridge. */
 #include <emulibc.h>
 #include <stdint.h>
+#include <string.h>
 #include "vk-bridge.h"
 #include "vktest.h"
 
@@ -55,6 +56,28 @@ ECL_EXPORT int AskKeptInstance(void)
 }
 
 ECL_EXPORT uint64_t KeptInstance(void) { return (uint64_t)(uintptr_t)g_stale; }
+
+/* A handle handed over BY VALUE to a command that returns nothing: the kept
+ * instance's first card, kept too, and asked for its properties after the
+ * load. The host has to refuse the call. Handing the driver a null card
+ * instead ends the host. What comes back is the version the card claimed, or
+ * zero when nothing was written. */
+static VkPhysicalDevice g_stale_card;
+
+ECL_EXPORT int KeepCard(void)
+{
+	uint32_t count = 1;
+	const VkResult r = ((PFN_vkEnumeratePhysicalDevices)chimera_vk_lookup("vkEnumeratePhysicalDevices"))(g_stale, &count, &g_stale_card);
+	return (r == VK_SUCCESS || r == VK_INCOMPLETE) && count == 1 && g_stale_card ? 1 : 0;
+}
+
+ECL_EXPORT uint64_t AskKeptCard(void)
+{
+	VkPhysicalDeviceProperties props;
+	memset(&props, 0, sizeof props);
+	((PFN_vkGetPhysicalDeviceProperties)chimera_vk_lookup("vkGetPhysicalDeviceProperties"))(g_stale_card, &props);
+	return props.apiVersion;
+}
 
 /* The new context's own instance: the same place in the host's table as the
  * kept one had in the old context's, so only the context tells them apart. */

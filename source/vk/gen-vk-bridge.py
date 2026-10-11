@@ -447,11 +447,18 @@ def gen_host_command(reg, name, op, out):
         if t in NULLED_PARAM_TYPES:
             args.append("NULL")
         elif t in reg.handles and p.ptr == 0:
+            # Translated BEFORE the test of vkb_bad below, into a local: done
+            # inside the call's argument list, a handle the bridge does not
+            # know became NULL after the test had passed, and the driver was
+            # called with it.
             fn = "vkb_h0" if p.optional else "vkb_h"
-            args.append("(%s)%s((uint64_t)a->%s, %s)" % (p.type, fn, p.name, kind(reg, t)))
+            pre.append("\t\tconst %s h_%s = (%s)%s((uint64_t)a->%s, %s);"
+                       % (p.type, p.name, p.type, fn, p.name, kind(reg, t)))
+            args.append("h_%s" % p.name)
         elif t in reg.handles and p.const:
-            args.append("(const %s *)vkb_h_array(a->%s, %s, %s)"
-                        % (p.type, p.name, len_expr(params, p), kind(reg, t)))
+            pre.append("\t\tconst %s *h_%s = (const %s *)vkb_h_array(a->%s, %s, %s);"
+                       % (p.type, p.name, p.type, p.name, len_expr(params, p), kind(reg, t)))
+            args.append("h_%s" % p.name)
         elif t in reg.handles:
             n = len_expr(params, p)
             enumerating = p.len and p.len.split(",")[0] in count_params

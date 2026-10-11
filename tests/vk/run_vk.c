@@ -143,6 +143,8 @@ int main(int argc, char **argv)
 	const int_fn make_instance = (int_fn)proc("MakeInstance");
 	const int_fn ask_kept = (int_fn)proc("AskKeptInstance");
 	const u64_fn kept = (u64_fn)proc("KeptInstance");
+	const int_fn keep_card = (int_fn)proc("KeepCard");
+	const u64_fn ask_kept_card = (u64_fn)proc("AskKeptCard");
 	const int_fn make_fresh = (int_fn)proc("MakeFreshInstance");
 	const int_fn ask_fresh = (int_fn)proc("AskFreshInstance");
 	const u64_fn fresh = (u64_fn)proc("FreshInstance");
@@ -202,6 +204,8 @@ int main(int argc, char **argv)
 	const uint64_t before = context_id();
 	EXPECT(before != 0, "the context has no id");
 	EXPECT(make_instance() == VK_SUCCESS, "the guest could not make an instance to keep");
+	EXPECT(keep_card() == 1, "the guest could not keep the instance's card");
+	EXPECT(ask_kept_card() != 0, "the kept card did not answer before the load");
 	const uint64_t handle = kept();
 	EXPECT(handle != 0 && handle < (1ull << 40), "the guest's handle %llx is not a small counter",
 	       (unsigned long long)handle);
@@ -216,6 +220,12 @@ int main(int argc, char **argv)
 	const unsigned long refused_before = chimera_vk_host_refused(NULL);
 	EXPECT(ask_kept() == VK_ERROR_DEVICE_LOST, "a handle from before the load was not answered with DEVICE_LOST");
 	EXPECT(chimera_vk_host_refused(NULL) == refused_before + 1, "the stale call was not counted as refused");
+	/* the same for a handle handed over by value to a command that returns
+	 * nothing: refused and counted, with nothing written - and the host is
+	 * still here to say so */
+	const unsigned long refused_card = chimera_vk_host_refused(NULL);
+	EXPECT(ask_kept_card() == 0, "a card from before the load answered");
+	EXPECT(chimera_vk_host_refused(NULL) == refused_card + 1, "the stale card's call was not counted as refused");
 	EXPECT(ask_fresh() == VK_SUCCESS, "the new context's own instance was refused");
 	destroy_fresh();
 
