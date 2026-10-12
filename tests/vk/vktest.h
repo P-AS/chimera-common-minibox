@@ -33,6 +33,7 @@ struct vkt_result {
 	uint64_t image_hash;    /* every byte of it */
 	uint64_t copy_hash;     /* every byte of the buffer that was written and copied */
 	uint32_t round_trip;    /* bytes that came back from a second mapping as they were flushed */
+	uint64_t attach_hash;   /* the buffer the device wrote, as a NEW mapping of it first shows it */
 	uint32_t drawn_inside;  /* a pixel the triangle covers */
 	uint32_t drawn_outside; /* one it does not */
 	uint64_t drawn_hash;    /* every byte of the drawn image */
@@ -305,9 +306,21 @@ static void vkt_run(vkt_lookup get, struct vkt_result *out, int through_bridge)
 	memcpy(&out->pixel, image_bytes, 4);
 	out->image_hash = vkt_hash(image_bytes, VKT_BYTES);
 	out->copy_hash = vkt_hash(copy_bytes, VKT_BYTES);
+	/* Through the bridge a mapping is a buffer of the guest's own. This one
+	 * is scribbled over and NOT flushed, so the device still holds what it
+	 * wrote; a new mapping must show that, at once and without being asked -
+	 * not the scribble, and not whatever the new buffer happened to hold.
+	 * (Directly, the scribble is in the driver's memory: nothing to hold.) */
+	if (through_bridge)
+		memset(copy_bytes, 0xEE, VKT_BYTES);
 	VKT(vkUnmapMemory)(dev, buf_mem[0]);
 	VKT(vkUnmapMemory)(dev, buf_mem[1]);
 	VKT(vkUnmapMemory)(dev, buf_mem[2]);
+	if (through_bridge) {
+		VKT_STEP(54, VKT(vkMapMemory)(dev, buf_mem[2], 0, VK_WHOLE_SIZE, 0, &copy_bytes));
+		out->attach_hash = vkt_hash(copy_bytes, VKT_BYTES);
+		VKT(vkUnmapMemory)(dev, buf_mem[2]);
+	}
 	/* mapped again, the memory still holds what was flushed into it */
 	VKT_STEP(53, VKT(vkMapMemory)(dev, buf_mem[1], 0, VK_WHOLE_SIZE, 0, &mapped));
 	for (uint32_t i = 0; i < VKT_BYTES; i++)

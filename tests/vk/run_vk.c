@@ -174,6 +174,7 @@ int main(int argc, char **argv)
 	EXPECT(value(3) == direct.image_hash, "the image read back differs through the bridge");
 	EXPECT(direct.copy_hash == pattern_hash, "the direct run's copied buffer is not what was written");
 	EXPECT(value(4) == pattern_hash, "what the guest wrote through a mapping is not what the device copied");
+	EXPECT(value(12) == pattern_hash, "a new mapping of memory the device wrote does not show what it wrote");
 	EXPECT(direct.round_trip == VKT_BYTES && value(5) == VKT_BYTES,
 	       "a second mapping gave back %u of %u bytes directly, %u through the bridge",
 	       direct.round_trip, (unsigned)VKT_BYTES, (unsigned)value(5));

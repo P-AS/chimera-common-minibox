@@ -97,7 +97,16 @@ struct memory_state {
 	void *host;                 /* the driver's mapping, or NULL */
 	VkDeviceSize map_offset, map_size;
 	void *shadow;               /* the guest's buffer for it, or NULL */
+	uint64_t born;              /* s_work when it was allocated */
+	uint8_t written;            /* the guest has flushed bytes into it */
 };
+
+/* How many times a queue has been given work, in this process. Memory holds
+ * something only if the guest flushed bytes into it or the device wrote it,
+ * and the device writes nothing without being given work: so memory allocated
+ * since the last submit, and never flushed into, holds nothing yet (see
+ * map_attach). */
+static uint64_t s_work;
 
 struct entry {
 	uint64_t host;              /* 0 once destroyed */
@@ -607,6 +616,7 @@ static uint64_t vkb_special_vkAllocateMemory(uint64_t op, struct vkb_vkAllocateM
 		return (uint64_t)(int64_t)r;
 	}
 	state->size = info.allocationSize;
+	state->born = s_work;
 	const uint64_t id = vkb_new(VKB_K_DeviceMemory, (uint64_t)memory);
 	struct entry *e = vkb_entry(id, VKB_K_DeviceMemory);
 	if (!e) {
@@ -662,6 +672,16 @@ static uint64_t map_attach(struct vkb_map_attach_args *a)
 	if (!e || !e->memory || !e->memory->host || !a->shadow)
 		return vkb_refuse(VKB_OP_MAP_ATTACH, 0);
 	e->memory->shadow = (void *)(uintptr_t)a->shadow;
+	/* Memory nothing has written has nothing to hand over, and its bytes
+	 * are undefined: the guest's buffer is left as it is. A renderer that
+	 * makes its buffers and maps them before it draws - every one of them,
+	 * again after every load - maps a hundred megabytes of this, and the
+	 * copy was most of what making a mapping cost. */
+#ifdef VKB_TEST_BREAK_FRESH     /* a test build: all memory is taken for unwritten */
+	return 1;
+#endif
+	if (!e->memory->written && e->memory->born == s_work)
+		return 1;
 	memcpy(e->memory->shadow, e->memory->host, (size_t)e->memory->map_size);
 	return 1;
 }
@@ -688,7 +708,9 @@ static void copy_range(const VkMappedMemoryRange *range, int out)
 	struct entry *e = vkb_entry((uint64_t)range->memory, VKB_K_DeviceMemory);
 	if (!e || !e->memory || !e->memory->host || !e->memory->shadow)
 		return;
-	const struct memory_state *m = e->memory;
+	struct memory_state *m = e->memory;
+	if (out)
+		m->written = 1;
 	VkDeviceSize from = range->offset, to = range->size == VK_WHOLE_SIZE ? m->map_offset + m->map_size
 	                                                                    : range->offset + range->size;
 	if (from < m->map_offset)
@@ -1118,5 +1140,14 @@ static uintptr_t dispatch_one(uintptr_t op, uintptr_t a, uintptr_t b, uintptr_t 
 		vkb_fn.vkEnumerateInstanceVersion =
 			(PFN_vkEnumerateInstanceVersion)s_gipa(NULL, "vkEnumerateInstanceVersion");
 	vkb_begin();
+	if (op == VK_OP_vkQueueSubmit
+#ifdef VK_OP_vkQueueSubmit2
+	    || op == VK_OP_vkQueueSubmit2
+#endif
+#ifdef VK_OP_vkQueueSubmit2KHR
+	    || op == VK_OP_vkQueueSubmit2KHR
+#endif
+	    )
+		s_work++;
 	return (uintptr_t)vkb_dispatch_generated(op, (void *)a);
 }

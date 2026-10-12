@@ -64,7 +64,10 @@ enum {
 
 	/* args: struct vkb_map_attach_args. The second half of vkMapMemory:
 	 * the guest names the buffer it will use as the mapping, and the host
-	 * fills it with what the memory holds. */
+	 * fills it with what the memory holds. Memory nothing has written yet
+	 * (the guest has flushed nothing into it, and no queue was given work
+	 * since it was allocated) holds nothing, and the buffer is left as it
+	 * is. */
 	VKB_OP_MAP_ATTACH = 4
 };
 

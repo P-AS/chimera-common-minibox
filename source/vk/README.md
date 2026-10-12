@@ -85,6 +85,12 @@ or a group of devices, and every extension nobody has asked for.
   `vkFlushMappedMemoryRanges` writes it out, `vkInvalidateMappedMemoryRanges`
   reads it back, and nothing else does. Every type is reported without
   `HOST_COHERENT`, so a correct renderer says when the bytes matter.
+  Making a mapping fetches what the memory holds - unless nothing has
+  written it: memory the guest has flushed nothing into, allocated since
+  the last time a queue was given work, holds nothing, and the guest's
+  buffer is left as it is. A renderer that makes and maps its buffers before
+  it draws maps a hundred megabytes of that after every load: for xemu's
+  176 MiB the copy was 184 ms a load on a GeForce GTX 1060.
 - **No callback**: allocation callbacks are replaced by none, and nothing that
   takes a function pointer is offered.
 - **A load is a new context** (`chimera_vk_host_state_loaded`): everything is
@@ -132,12 +138,15 @@ the write names a set that does not exist. The picture is the other uniform's
 colour, the same in both runs. On a device without the extension the test says
 "NOT TESTED" and passes.
 
-Four more builds of the runner each break one thing in the host half on
+Five more builds of the runner each break one thing in the host half on
 purpose (`VKB_TEST_BREAK_*`) and must fail: a flush that writes nothing (the
 copied buffer and the triangle's colour both go wrong), an invalidate that
-reads nothing, a handle taken from any context, and a descriptor write with
-no array passed on to the driver - which kills the process inside the driver,
-and is what the refusal is for. In the unbroken run that write is refused,
+reads nothing, a handle taken from any context, all memory taken for
+unwritten when a mapping is made (a new mapping of a buffer the device wrote
+then shows something else: the test scribbles over the old mapping first,
+without flushing, so that a buffer handed out again cannot pass by luck), and
+a descriptor write with no array passed on to the driver - which kills the
+process inside the driver, and is what the refusal is for. In the unbroken run that write is refused,
 and so is a write to a set that does not exist; they are the two refused
 calls the run is allowed.
 

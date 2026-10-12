@@ -22,7 +22,8 @@ ECL_EXPORT int Run(void)
  * 4 the copied buffer's hash, 5 the bytes a second mapping gave back, 6 a
  * pixel the triangle covers, 7 one it does not, 8 the drawn image's hash,
  * 9 how many descriptors may be pushed, 10 a pixel of the triangle drawn with
- * a pushed uniform, 11 that image's hash */
+ * a pushed uniform, 11 that image's hash, 12 the hash of the buffer the
+ * device wrote as a new mapping of it first showed it */
 ECL_EXPORT uint64_t Value(int which)
 {
 	switch (which) {
@@ -38,6 +39,7 @@ ECL_EXPORT uint64_t Value(int which)
 	case 9: return g_result.push_limit;
 	case 10: return g_result.pushed_inside;
 	case 11: return g_result.pushed_hash;
+	case 12: return g_result.attach_hash;
 	default: return 0;
 	}
 }
