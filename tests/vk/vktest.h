@@ -11,7 +11,12 @@
  *
  * Then a draw, with two shaders kept compiled (triangle-spv.h): a pipeline, a
  * descriptor set whose write carries two pointers to nothing beside the one
- * that counts, push constants, a vertex buffer and a second command buffer. */
+ * that counts, push constants, a vertex buffer and a second command buffer.
+ *
+ * Then the same draw with the uniform PUSHED (VK_KHR_push_descriptor) in place
+ * of a descriptor set, where the device has that extension: the command is
+ * found by name through the device, as a renderer's loader finds it, and its
+ * write names a set that does not exist, which a pushed write may. */
 #pragma once
 
 #include <vulkan/vulkan_core.h>
@@ -31,6 +36,9 @@ struct vkt_result {
 	uint32_t drawn_inside;  /* a pixel the triangle covers */
 	uint32_t drawn_outside; /* one it does not */
 	uint64_t drawn_hash;    /* every byte of the drawn image */
+	uint32_t push_limit;    /* how many descriptors the device says may be pushed; 0 = it has no such extension */
+	uint32_t pushed_inside; /* a pixel of the triangle drawn with a pushed uniform */
+	uint64_t pushed_hash;   /* every byte of that image */
 };
 
 #define VKT_SIDE 64
@@ -87,12 +95,27 @@ static VkResult vkt_buffer(vkt_lookup get, VkDevice dev, const VkPhysicalDeviceM
 static void vkt_run(vkt_lookup get, struct vkt_result *out, int through_bridge)
 {
 	VkResult r;
+	uint32_t count_ext = 0;
 	memset(out, 0, sizeof *out);
 
 	VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "vktest",
 	                          .apiVersion = VK_API_VERSION_1_0 };
 	VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
 	VkInstance instance = VK_NULL_HANDLE;
+	/* Asking a device what it can push needs this instance extension. */
+	static const char *const props2_name = VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME;
+	static const char *const push_name = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
+	static VkExtensionProperties ext[512];
+	int has_props2 = 0, has_push = 0;
+	count_ext = 512;
+	r = VKT(vkEnumerateInstanceExtensionProperties)(NULL, &count_ext, ext);
+	VKT_NEED(92, r == VK_SUCCESS || r == VK_INCOMPLETE);
+	for (uint32_t i = 0; i < count_ext; i++)
+		has_props2 |= strcmp(ext[i].extensionName, props2_name) == 0;
+	if (has_props2) {
+		ici.enabledExtensionCount = 1;
+		ici.ppEnabledExtensionNames = &props2_name;
+	}
 	/* Which version is this: the one command a renderer calls before it has
 	 * an instance. (A 1.0 loader has no such command; every one since has.) */
 	if (VKT(vkEnumerateInstanceVersion)) {
@@ -137,6 +160,26 @@ static void vkt_run(vkt_lookup get, struct vkt_result *out, int through_bridge)
 	                                .queueCount = 1, .pQueuePriorities = &priority };
 	VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1,
 	                           .pQueueCreateInfos = &qci };
+	count_ext = 512;
+	r = VKT(vkEnumerateDeviceExtensionProperties)(pd, NULL, &count_ext, ext);
+	VKT_NEED(93, r == VK_SUCCESS || r == VK_INCOMPLETE);
+	for (uint32_t i = 0; has_props2 && i < count_ext; i++)
+		has_push |= strcmp(ext[i].extensionName, push_name) == 0;
+	if (has_push) {
+		/* how many may be pushed: a structure chained to the device's
+		 * properties, which the driver fills in where it lies */
+		PFN_vkGetPhysicalDeviceProperties2KHR props2 = (PFN_vkGetPhysicalDeviceProperties2KHR)
+			VKT(vkGetInstanceProcAddr)(instance, "vkGetPhysicalDeviceProperties2KHR");
+		VKT_NEED(94, props2);
+		VkPhysicalDevicePushDescriptorPropertiesKHR limit = {
+			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR };
+		VkPhysicalDeviceProperties2 p2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &limit };
+		props2(pd, &p2);
+		out->push_limit = limit.maxPushDescriptors;
+		VKT_NEED(95, out->push_limit >= 1);
+		dci.enabledExtensionCount = 1;
+		dci.ppEnabledExtensionNames = &push_name;
+	}
 	VkDevice dev = VK_NULL_HANDLE;
 	VKT_STEP(8, VKT(vkCreateDevice)(pd, &dci, NULL, &dev));
 	VkQueue queue = VK_NULL_HANDLE;
@@ -333,6 +376,10 @@ static void vkt_run(vkt_lookup get, struct vkt_result *out, int through_bridge)
 		VkWriteDescriptorSet nothing = write;
 		nothing.pBufferInfo = NULL;
 		VKT(vkUpdateDescriptorSets)(dev, 1, &nothing, 0, NULL);
+		/* So is a write to a set that does not exist: refused, too. */
+		VkWriteDescriptorSet nowhere = write;
+		nowhere.dstSet = (VkDescriptorSet)(uintptr_t)0x7fff00000010ull;
+		VKT(vkUpdateDescriptorSets)(dev, 1, &nowhere, 0, NULL);
 	}
 
 	VkPipelineShaderStageCreateInfo stages[2] = {
@@ -394,6 +441,73 @@ static void vkt_run(vkt_lookup get, struct vkt_result *out, int through_bridge)
 	memcpy(&out->drawn_inside, (const uint8_t *)image_bytes + (8 * VKT_SIDE + 8) * 4, 4);
 	memcpy(&out->drawn_outside, (const uint8_t *)image_bytes + (60 * VKT_SIDE + 60) * 4, 4);
 	out->drawn_hash = vkt_hash(image_bytes, VKT_BYTES);
+
+	/* ---- the same draw, its uniform pushed ---- */
+	if (has_push) {
+		PFN_vkCmdPushDescriptorSetKHR push_set = (PFN_vkCmdPushDescriptorSetKHR)
+			VKT(vkGetDeviceProcAddr)(dev, "vkCmdPushDescriptorSetKHR");
+		VKT_NEED(100, push_set);
+		VkDescriptorSetLayoutCreateInfo pushed_dslci = dslci;
+		pushed_dslci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+		VkDescriptorSetLayout pushed_set_layout = VK_NULL_HANDLE;
+		VKT_STEP(101, VKT(vkCreateDescriptorSetLayout)(dev, &pushed_dslci, NULL, &pushed_set_layout));
+		VkPipelineLayoutCreateInfo pushed_plci = plci;
+		pushed_plci.pSetLayouts = &pushed_set_layout;
+		VkPipelineLayout pushed_layout = VK_NULL_HANDLE;
+		VKT_STEP(102, VKT(vkCreatePipelineLayout)(dev, &pushed_plci, NULL, &pushed_layout));
+		VkGraphicsPipelineCreateInfo pushed_gpci = gpci;
+		pushed_gpci.layout = pushed_layout;
+		VkPipeline pushed_pipeline = VK_NULL_HANDLE;
+		VKT_STEP(103, VKT(vkCreateGraphicsPipelines)(dev, VK_NULL_HANDLE, 1, &pushed_gpci, NULL, &pushed_pipeline));
+
+		/* another colour, so that the picture says which uniform was read */
+		VkBuffer ubo2 = VK_NULL_HANDLE;
+		VkDeviceMemory ubo2_mem = VK_NULL_HANDLE;
+		void *ubo2_bytes = NULL;
+		VKT_STEP(104, vkt_buffer(get, dev, &mem, 256, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &ubo2, &ubo2_mem, &ubo2_bytes));
+		const float colour2[4] = { 0.0f, 0.5f, 0.25f, 0.5f };
+		memcpy(ubo2_bytes, colour2, sizeof colour2);
+		VkMappedMemoryRange written2 = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, .memory = ubo2_mem,
+		                                 .offset = 0, .size = VK_WHOLE_SIZE };
+		VKT_STEP(105, VKT(vkFlushMappedMemoryRanges)(dev, 1, &written2));
+
+		VkCommandBuffer pushed = VK_NULL_HANDLE;
+		VKT_STEP(106, VKT(vkAllocateCommandBuffers)(dev, &cbai, &pushed));
+		VKT_STEP(107, VKT(vkBeginCommandBuffer)(pushed, &draw_begin));
+		VKT(vkCmdBeginRenderPass)(pushed, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+		VKT(vkCmdBindPipeline)(pushed, VK_PIPELINE_BIND_POINT_GRAPHICS, pushed_pipeline);
+		/* a pushed write's set is ignored, and so allowed to be anything */
+		VkDescriptorBufferInfo ubo2_info = { ubo2, 0, 16 };
+		VkWriteDescriptorSet pushed_write = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+			.dstSet = (VkDescriptorSet)(uintptr_t)0x7fff00000010ull, .dstBinding = 0, .descriptorCount = 1,
+			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &ubo2_info };
+		push_set(pushed, VK_PIPELINE_BIND_POINT_GRAPHICS, pushed_layout, 0, 1, &pushed_write);
+		VKT(vkCmdPushConstants)(pushed, pushed_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof add, add);
+		VKT(vkCmdBindVertexBuffers)(pushed, 0, 1, &vbo, &zero);
+		VKT(vkCmdDraw)(pushed, 3, 1, 0, 0);
+		VKT(vkCmdEndRenderPass)(pushed);
+		VKT(vkCmdCopyImageToBuffer)(pushed, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf[0], 1, &region);
+		VKT_STEP(108, VKT(vkEndCommandBuffer)(pushed));
+		VKT_STEP(109, VKT(vkResetFences)(dev, 1, &fence));
+		submit.pCommandBuffers = &pushed;
+		VKT_STEP(110, VKT(vkQueueSubmit)(queue, 1, &submit, fence));
+		VKT_STEP(111, VKT(vkWaitForFences)(dev, 1, &fence, VK_TRUE, 10ull * 1000 * 1000 * 1000));
+		VKT_STEP(112, VKT(vkInvalidateMappedMemoryRanges)(dev, 1, back));
+		memcpy(&out->pushed_inside, (const uint8_t *)image_bytes + (8 * VKT_SIDE + 8) * 4, 4);
+		out->pushed_hash = vkt_hash(image_bytes, VKT_BYTES);
+
+		VKT(vkDestroyPipeline)(dev, pushed_pipeline, NULL);
+		VKT(vkUnmapMemory)(dev, ubo2_mem);
+		VKT(vkDestroyBuffer)(dev, ubo2, NULL);
+		VKT(vkFreeMemory)(dev, ubo2_mem, NULL);
+		VKT(vkDestroyPipelineLayout)(dev, pushed_layout, NULL);
+		VKT(vkDestroyDescriptorSetLayout)(dev, pushed_set_layout, NULL);
+		if (through_bridge) {
+			/* the names a renderer on a 1.1 instance asks for by */
+			VKT_NEED(113, VKT(vkGetDeviceProcAddr)(dev, "vkCmdBeginRenderingKHR"));
+			VKT_NEED(114, VKT(vkGetDeviceProcAddr)(dev, "vkCmdEndRenderingKHR"));
+		}
+	}
 	VKT(vkUnmapMemory)(dev, buf_mem[0]);
 
 	VKT(vkDestroyPipeline)(dev, pipeline, NULL);

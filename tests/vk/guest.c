@@ -20,7 +20,9 @@ ECL_EXPORT int Run(void)
 
 /* 0 the step that failed, 1 its VkResult, 2 the pixel, 3 the image's hash,
  * 4 the copied buffer's hash, 5 the bytes a second mapping gave back, 6 a
- * pixel the triangle covers, 7 one it does not, 8 the drawn image's hash */
+ * pixel the triangle covers, 7 one it does not, 8 the drawn image's hash,
+ * 9 how many descriptors may be pushed, 10 a pixel of the triangle drawn with
+ * a pushed uniform, 11 that image's hash */
 ECL_EXPORT uint64_t Value(int which)
 {
 	switch (which) {
@@ -33,6 +35,9 @@ ECL_EXPORT uint64_t Value(int which)
 	case 6: return g_result.drawn_inside;
 	case 7: return g_result.drawn_outside;
 	case 8: return g_result.drawn_hash;
+	case 9: return g_result.push_limit;
+	case 10: return g_result.pushed_inside;
+	case 11: return g_result.pushed_hash;
 	default: return 0;
 	}
 }

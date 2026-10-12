@@ -194,10 +194,32 @@ int main(int argc, char **argv)
 	EXPECT((uint32_t)value(7) == direct.drawn_outside, "the pixel outside the triangle differs through the bridge");
 	EXPECT(value(8) == direct.drawn_hash, "the drawn image differs through the bridge");
 
-	/* one call in the run is wrong on purpose - a descriptor write with nothing
-	 * to read - and it, and only it, must have been refused */
+	/* The same draw with its uniform pushed, where the device can: the other
+	 * uniform's colour, (0, 0.5, 0.25, 0.5) + (0.25, 0.25, 0.5, 0.5) =
+	 * (0.25, 0.75, 0.75, 1). */
+	if (direct.push_limit) {
+		fprintf(stderr, "direct : pushed limit %u inside %08x image %016llx\n", direct.push_limit,
+			direct.pushed_inside, (unsigned long long)direct.pushed_hash);
+		fprintf(stderr, "bridged: pushed limit %u inside %08x image %016llx\n", (uint32_t)value(9),
+			(uint32_t)value(10), (unsigned long long)value(11));
+		px = (const uint8_t *)&direct.pushed_inside;
+		EXPECT((px[0] == 0x3f || px[0] == 0x40) && (px[1] == 0xbf || px[1] == 0xc0) &&
+		       (px[2] == 0xbf || px[2] == 0xc0) && px[3] == 0xff,
+		       "the direct run's pushed triangle is %02x %02x %02x %02x, not the pushed uniform plus the push constant",
+		       px[0], px[1], px[2], px[3]);
+		EXPECT((uint32_t)value(9) == direct.push_limit, "how many descriptors may be pushed differs through the bridge");
+		EXPECT((uint32_t)value(10) == direct.pushed_inside, "the pushed triangle's colour differs through the bridge");
+		EXPECT(value(11) == direct.pushed_hash, "the image drawn with a pushed uniform differs through the bridge");
+	} else {
+		fprintf(stderr, "NOT TESTED: this device has no VK_KHR_push_descriptor, so nothing was pushed\n");
+		EXPECT(value(9) == 0, "the bridge offers push descriptors where the device has none");
+	}
+
+	/* two calls in the run are wrong on purpose - a descriptor write with
+	 * nothing to read, and one to a set that does not exist - and they, and
+	 * only they, must have been refused */
 	long last = -1;
-	EXPECT(chimera_vk_host_refused(&last) == 1, "%lu calls were refused where one was meant to be (last opcode %ld)",
+	EXPECT(chimera_vk_host_refused(&last) == 2, "%lu calls were refused where two were meant to be (last opcode %ld)",
 	       chimera_vk_host_refused(NULL), last);
 
 	/* ---- a handle from before a load ---- */
@@ -232,7 +254,8 @@ int main(int argc, char **argv)
 	/* and the new context works, with the same result */
 	const int failed_again = run();
 	EXPECT(failed_again == 0, "after a load the run failed at step %d (VkResult %d)", failed_again, (int)(int64_t)value(1));
-	EXPECT(value(3) == direct.image_hash && value(4) == pattern_hash && value(8) == direct.drawn_hash,
+	EXPECT(value(3) == direct.image_hash && value(4) == pattern_hash && value(8) == direct.drawn_hash &&
+	       value(11) == direct.pushed_hash,
 	       "after a load the results differ");
 
 	wbx_deactivate_host(g_host, &r);

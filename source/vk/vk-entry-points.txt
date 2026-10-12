@@ -222,3 +222,7 @@ vkBindImageMemory2KHR
 vkGetDeviceBufferMemoryRequirementsKHR
 vkGetDeviceImageMemoryRequirementsKHR
 vkResetQueryPoolEXT
+vkCmdPushDescriptorSet
+vkCmdPushDescriptorSetKHR
+vkCmdBeginRenderingKHR
+vkCmdEndRenderingKHR

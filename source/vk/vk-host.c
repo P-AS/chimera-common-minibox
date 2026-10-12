@@ -328,7 +328,7 @@ static const char *const kDeviceExtensions[] = {
 	"VK_EXT_post_depth_coverage", "VK_EXT_provoking_vertex", "VK_EXT_line_rasterization",
 	"VK_EXT_index_type_uint8", "VK_EXT_robustness2", "VK_EXT_depth_range_unrestricted",
 	"VK_EXT_border_color_swizzle", "VK_EXT_rgba10x6_formats", "VK_EXT_ycbcr_2plane_444_formats",
-	"VK_IMG_filter_cubic", "VK_EXT_filter_cubic",
+	"VK_IMG_filter_cubic", "VK_EXT_filter_cubic", "VK_KHR_push_descriptor",
 };
 
 static int allowed(const char *name, const char *const *list, size_t n)

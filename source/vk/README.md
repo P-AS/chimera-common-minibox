@@ -48,6 +48,11 @@ member that needs either and has neither stops it:
   anything when it is not: a descriptor write's three arrays, a framebuffer's
   attachments when it is imageless, a primary command buffer's inheritance
   info. `MEMBER_VALID_WHEN` gives each the condition under which it is read.
+  A handle that is such a member - the set a descriptor write names, which a
+  pushed write (`vkCmdPushDescriptorSet`) does not have - becomes null when
+  the bridge does not know it, and the call goes on. Where a null one would
+  be followed by the driver, the command says so (`PARAM_REFUSED_WHEN`):
+  `vkUpdateDescriptorSets` refuses a write to a set the bridge does not know.
 - **A command that is policy** - which device, which extensions, what a
   mapping is - and is written in `vk-host.c` (`HOST_SPECIAL`).
 
@@ -120,13 +125,21 @@ at nothing, on purpose. Then a handle kept across a load, which must be
 refused while the new context's own handle in the same place in the table is
 not.
 
+Where the device has `VK_KHR_push_descriptor`, the draw is done once more with
+its uniform pushed: the limit is asked for through a structure chained to the
+device's properties, the command is found by name through the device, and
+the write names a set that does not exist. The picture is the other uniform's
+colour, the same in both runs. On a device without the extension the test says
+"NOT TESTED" and passes.
+
 Four more builds of the runner each break one thing in the host half on
 purpose (`VKB_TEST_BREAK_*`) and must fail: a flush that writes nothing (the
 copied buffer and the triangle's colour both go wrong), an invalidate that
 reads nothing, a handle taken from any context, and a descriptor write with
 no array passed on to the driver - which kills the process inside the driver,
 and is what the refusal is for. In the unbroken run that write is refused,
-and it is the one refused call the run is allowed.
+and so is a write to a set that does not exist; they are the two refused
+calls the run is allowed.
 
 The shaders are kept compiled (`tests/vk/triangle-spv.h`, sources and how to
 remake them in `tests/vk/shaders`), so the test needs no shader compiler. It
@@ -140,6 +153,15 @@ card rounds the two half-way colour channels down where llvmpipe rounds
 them up, in both runs alike - and the flush, invalidate and stale-handle
 builds fail there with the messages they fail with here. The fourth broken
 build was not run on the card: it is meant to die inside the driver.
+
+The pushed draw (2026-10-12) ran on both: llvmpipe and the GTX 1060 each say
+32 descriptors may be pushed, and the bridged picture is the direct one.
+Each of its three parts was taken out once by hand and the test failed: the
+extension off the allow-list (the limit and the picture differ), the command
+off the list (the run stops where it asks for it), and the rule for a write
+to an unknown set (the host dies inside the driver). The names
+`vkCmdBeginRenderingKHR` and `vkCmdEndRenderingKHR` are only asked for, not
+called.
 
 Not yet tested: a secondary command buffer, a texture sampled, a compute
 pipeline, a sparse binding. Nothing runs the Windows test by itself: CI

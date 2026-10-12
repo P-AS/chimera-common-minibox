@@ -93,6 +93,15 @@ STRUCT_REFUSED_WHEN = {
         "d->descriptorCount && !d->pImageInfo && !d->pBufferInfo && !d->pTexelBufferView && !d->pNext",
 }
 
+# The same for one parameter of one command: a line of C true of an element
+# (named e) the driver must not be handed. A descriptor write's set is one of
+# the "only sometimes meaningful" members above - a pushed write has none - so
+# a set the bridge does not know arrives here as null, and a driver asked to
+# update the null set follows it.
+PARAM_REFUSED_WHEN = {
+    ("vkUpdateDescriptorSets", "pDescriptorWrites"): "!e->dstSet",
+}
+
 # Structures never followed: a parameter of this type is replaced by NULL.
 NULLED_PARAM_TYPES = {"VkAllocationCallbacks"}
 
@@ -477,6 +486,11 @@ def gen_host_command(reg, name, op, out):
                        "\t\tfor (uint32_t i = 0; c_%s && i < (uint32_t)(%s); i++) vkb_x_%s(&c_%s[i]);"
                        % (t, p.name, p.name, n, t, p.name, n, t, p.name))
             args.append("c_%s" % p.name)
+            rule = PARAM_REFUSED_WHEN.get((name, p.name))
+            if rule:
+                pre.append("\t\tfor (uint32_t i = 0; c_%s && i < (uint32_t)(%s); i++) {\n"
+                           "\t\t\tconst %s *e = &c_%s[i];\n\t\t\tif (%s) vkb_bad = 1;\n\t\t}"
+                           % (p.name, n, t, p.name, rule))
         else:
             args.append("a->%s" % p.name)
 
