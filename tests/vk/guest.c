@@ -23,7 +23,8 @@ ECL_EXPORT int Run(void)
  * pixel the triangle covers, 7 one it does not, 8 the drawn image's hash,
  * 9 how many descriptors may be pushed, 10 a pixel of the triangle drawn with
  * a pushed uniform, 11 that image's hash, 12 the hash of the buffer the
- * device wrote as a new mapping of it first showed it */
+ * device wrote as a new mapping of it first showed it, 13 whether an event
+ * set by a command in the queue was then found set */
 ECL_EXPORT uint64_t Value(int which)
 {
 	switch (which) {
@@ -40,6 +41,7 @@ ECL_EXPORT uint64_t Value(int which)
 	case 10: return g_result.pushed_inside;
 	case 11: return g_result.pushed_hash;
 	case 12: return g_result.attach_hash;
+	case 13: return g_result.event_set;
 	default: return 0;
 	}
 }

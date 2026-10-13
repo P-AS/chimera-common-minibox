@@ -81,6 +81,20 @@ or a group of devices, and every extension nobody has asked for.
   the first discrete one, or the one whose name contains `CHIMERA_VK_DEVICE`.
 - **Extensions are an allow-list** (`kDeviceExtensions`): an extension is
   commands and structures this bridge would have to know.
+- **A command answers to every name it has.** A command that came through an
+  extension and later joined a version of Vulkan has two names:
+  `vkCmdSetEvent2KHR` and `vkCmdSetEvent2` are one command. A renderer asks
+  for the name it was written against, so the guest's table of names answers
+  every name the registry gives a command in the list, with the same function
+  (no opcode of its own: the list is not longer for it). And the host asks
+  the driver for a command under each of its names in turn, because a driver
+  answers the newer name only to a program that asked for that version of
+  Vulkan and the extension's name only where the extension is on. Before this
+  (chimera issue 268) a renderer that asked for `vkCmdSetEvent2KHR` was
+  answered with nothing and called it; and once it was answered, the host had
+  asked a Mesa driver for `vkCmdSetEvent2` on behalf of a program that had
+  asked for Vulkan 1.2, had nothing to call, and the renderer waited for an
+  event that was never set.
 - **No memory type is coherent.** A mapping is a buffer of the guest's own;
   `vkFlushMappedMemoryRanges` writes it out, `vkInvalidateMappedMemoryRanges`
   reads it back, and nothing else does. Every type is reported without
@@ -138,8 +152,22 @@ the write names a set that does not exist. The picture is the other uniform's
 colour, the same in both runs. On a device without the extension the test says
 "NOT TESTED" and passes.
 
-Five more builds of the runner each break one thing in the host half on
-purpose (`VKB_TEST_BREAK_*`) and must fail: a flush that writes nothing (the
+The names: through the bridge the test asks for six commands by their
+extension's name (`vkCmdSetEvent2KHR`, `vkCmdPipelineBarrier2KHR`,
+`vkCreateRenderPass2KHR`, `vkCmdCopyBuffer2KHR`, `vkCmdSetCullModeEXT`,
+`vkTrimCommandPoolKHR`) and must be given the same function as for the newer
+name. Where the device has `VK_KHR_synchronization2` one of them is then
+called, in both runs: the instance asks for Vulkan 1.0, a command buffer sets
+an event with `vkCmdSetEvent2KHR`, and after the queue has finished the event
+must be set. On a device without the extension the test says "NOT TESTED" and
+passes.
+
+Six more builds of the runner each break one thing in the host half on
+purpose (`VKB_TEST_BREAK_*`) and must fail: a host that asks the driver for
+each command by one name only (`NAMES`: on Mesa the event is never set, the
+run stops at step 126 and a third call is counted as refused - on a driver
+that answers every name to every program, NVIDIA's for one, this build passes
+and the test of it cannot be used), a flush that writes nothing (the
 copied buffer and the triangle's colour both go wrong), an invalidate that
 reads nothing, a handle taken from any context, all memory taken for
 unwritten when a mapping is made (a new mapping of a buffer the device wrote
@@ -171,6 +199,20 @@ off the list (the run stops where it asks for it), and the rule for a write
 to an unknown set (the host dies inside the driver). The names
 `vkCmdBeginRenderingKHR` and `vkCmdEndRenderingKHR` are only asked for, not
 called.
+
+The names and the event (2026-10-13) ran on llvmpipe only, by `meson test`:
+the test passes, and fails at step 115 with the guest's table as it was and
+at step 126 with the host as it was. What the fix is for was seen on both:
+RPCS3 running Tekken 6, which died calling address 0 and then, with the
+guest half alone fixed, waited for ever on llvmpipe, runs on llvmpipe and on
+the GTX 1060.
+
+Four commands of extensions on the allow-list are still not in the list, so
+a renderer that asks for them is answered with nothing:
+`vkCmdSetPatchControlPointsEXT` and `vkCmdSetLogicOpEXT`
+(`VK_EXT_extended_dynamic_state2`), `vkCmdSetLineStipple`
+(`VK_EXT_line_rasterization`) and `vkCmdPushDescriptorSetWithTemplate`
+(`VK_KHR_push_descriptor`). No core here calls them.
 
 Not yet tested: a secondary command buffer, a texture sampled, a compute
 pipeline, a sparse binding. Nothing runs the Windows test by itself: CI

@@ -40,6 +40,7 @@ struct vkt_result {
 	uint32_t push_limit;    /* how many descriptors the device says may be pushed; 0 = it has no such extension */
 	uint32_t pushed_inside; /* a pixel of the triangle drawn with a pushed uniform */
 	uint64_t pushed_hash;   /* every byte of that image */
+	uint32_t event_set;     /* 1: an event set by a command in the queue was then found set; 0: the device has no VK_KHR_synchronization2 */
 };
 
 #define VKT_SIDE 64
@@ -107,7 +108,10 @@ static void vkt_run(vkt_lookup get, struct vkt_result *out, int through_bridge)
 	static const char *const props2_name = VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME;
 	static const char *const push_name = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
 	static VkExtensionProperties ext[512];
-	int has_props2 = 0, has_push = 0;
+	static const char *const sync2_name = VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME;
+	int has_props2 = 0, has_push = 0, has_sync2 = 0;
+	const char *dev_ext[2];
+	uint32_t dev_ext_count = 0;
 	count_ext = 512;
 	r = VKT(vkEnumerateInstanceExtensionProperties)(NULL, &count_ext, ext);
 	VKT_NEED(92, r == VK_SUCCESS || r == VK_INCOMPLETE);
@@ -164,8 +168,10 @@ static void vkt_run(vkt_lookup get, struct vkt_result *out, int through_bridge)
 	count_ext = 512;
 	r = VKT(vkEnumerateDeviceExtensionProperties)(pd, NULL, &count_ext, ext);
 	VKT_NEED(93, r == VK_SUCCESS || r == VK_INCOMPLETE);
-	for (uint32_t i = 0; has_props2 && i < count_ext; i++)
+	for (uint32_t i = 0; has_props2 && i < count_ext; i++) {
 		has_push |= strcmp(ext[i].extensionName, push_name) == 0;
+		has_sync2 |= strcmp(ext[i].extensionName, sync2_name) == 0;
+	}
 	if (has_push) {
 		/* how many may be pushed: a structure chained to the device's
 		 * properties, which the driver fills in where it lies */
@@ -178,9 +184,19 @@ static void vkt_run(vkt_lookup get, struct vkt_result *out, int through_bridge)
 		props2(pd, &p2);
 		out->push_limit = limit.maxPushDescriptors;
 		VKT_NEED(95, out->push_limit >= 1);
-		dci.enabledExtensionCount = 1;
-		dci.ppEnabledExtensionNames = &push_name;
+		dev_ext[dev_ext_count++] = push_name;
 	}
+	/* The extension every command of which has had a second name since 1.3:
+	 * this instance asked for 1.0, so the extension's names are the ones a
+	 * driver answers. */
+	VkPhysicalDeviceSynchronization2FeaturesKHR sync2 = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR, .synchronization2 = VK_TRUE };
+	if (has_sync2) {
+		dev_ext[dev_ext_count++] = sync2_name;
+		dci.pNext = &sync2;
+	}
+	dci.enabledExtensionCount = dev_ext_count;
+	dci.ppEnabledExtensionNames = dev_ext;
 	VkDevice dev = VK_NULL_HANDLE;
 	VKT_STEP(8, VKT(vkCreateDevice)(pd, &dci, NULL, &dev));
 	VkQueue queue = VK_NULL_HANDLE;
@@ -520,6 +536,58 @@ static void vkt_run(vkt_lookup get, struct vkt_result *out, int through_bridge)
 			VKT_NEED(113, VKT(vkGetDeviceProcAddr)(dev, "vkCmdBeginRenderingKHR"));
 			VKT_NEED(114, VKT(vkGetDeviceProcAddr)(dev, "vkCmdEndRenderingKHR"));
 		}
+	}
+	if (through_bridge) {
+		/* A command has the name of each extension it came through and one
+		 * more since it joined a version. An extension the bridge offers is
+		 * asked for by its own names, and a name that answers nothing is
+		 * called all the same: every name of a command is that command. */
+		static const char *const same[][2] = {
+			{"vkCmdSetEvent2KHR", "vkCmdSetEvent2"},
+			{"vkCmdPipelineBarrier2KHR", "vkCmdPipelineBarrier2"},
+			{"vkCreateRenderPass2KHR", "vkCreateRenderPass2"},
+			{"vkCmdCopyBuffer2KHR", "vkCmdCopyBuffer2"},
+			{"vkCmdSetCullModeEXT", "vkCmdSetCullMode"},
+			{"vkTrimCommandPoolKHR", "vkTrimCommandPool"},
+		};
+		for (size_t i = 0; i < sizeof same / sizeof same[0]; i++) {
+			const PFN_vkVoidFunction other = VKT(vkGetDeviceProcAddr)(dev, same[i][0]);
+			VKT_NEED(115, other);
+			VKT_NEED(116, other == VKT(vkGetDeviceProcAddr)(dev, same[i][1]));
+		}
+	}
+	if (has_sync2) {
+		/* And one of them is called: a command in the queue sets an event,
+		 * and the event is then set. The command is asked for by the
+		 * extension's name, which is the only one a driver need answer to
+		 * a program that asked for Vulkan 1.0. A bridge that asked the
+		 * driver for the newer name alone had nothing to call: the event
+		 * stayed as it was, and a renderer waiting for it waited for good. */
+		const PFN_vkCmdSetEvent2KHR set2 = (PFN_vkCmdSetEvent2KHR)VKT(vkGetDeviceProcAddr)(dev, "vkCmdSetEvent2KHR");
+		VKT_NEED(117, set2);
+		VkEventCreateInfo eci = { .sType = VK_STRUCTURE_TYPE_EVENT_CREATE_INFO };
+		VkEvent event = VK_NULL_HANDLE;
+		VKT_STEP(118, VKT(vkCreateEvent)(dev, &eci, NULL, &event));
+		VKT_NEED(119, VKT(vkGetEventStatus)(dev, event) == VK_EVENT_RESET);
+		VkCommandBuffer ev = VK_NULL_HANDLE;
+		VKT_STEP(120, VKT(vkAllocateCommandBuffers)(dev, &cbai, &ev));
+		VKT_STEP(121, VKT(vkBeginCommandBuffer)(ev, &begin));
+		VkMemoryBarrier2KHR barrier = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR,
+			.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR,
+			.srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT_KHR | VK_ACCESS_2_MEMORY_WRITE_BIT_KHR,
+			.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR,
+			.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT_KHR | VK_ACCESS_2_MEMORY_WRITE_BIT_KHR };
+		VkDependencyInfoKHR dependency = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR,
+			.memoryBarrierCount = 1, .pMemoryBarriers = &barrier };
+		set2(ev, event, &dependency);
+		VKT_STEP(122, VKT(vkEndCommandBuffer)(ev));
+		VKT_STEP(123, VKT(vkResetFences)(dev, 1, &fence));
+		submit.pCommandBuffers = &ev;
+		VKT_STEP(124, VKT(vkQueueSubmit)(queue, 1, &submit, fence));
+		VKT_STEP(125, VKT(vkWaitForFences)(dev, 1, &fence, VK_TRUE, 10ull * 1000 * 1000 * 1000));
+		VKT_NEED(126, VKT(vkGetEventStatus)(dev, event) == VK_EVENT_SET);
+		out->event_set = 1;
+		VKT(vkDestroyEvent)(dev, event, NULL);
 	}
 	VKT(vkUnmapMemory)(dev, buf_mem[0]);
 

@@ -358,18 +358,32 @@ static void load_functions(int device_level)
 	for (size_t i = 0; i < sizeof vkb_fn_names / sizeof vkb_fn_names[0]; i++) {
 		void **slot = (void **)((char *)&vkb_fn + vkb_fn_names[i].offset);
 		PFN_vkVoidFunction fn = NULL;
-		if (device_level) {
-			if (!vkb_fn_names[i].device)
-				continue;
-			if (gdpa && s_device)
-				fn = gdpa(s_device, vkb_fn_names[i].name);
-		} else {
-			fn = s_gipa(s_instance, vkb_fn_names[i].name);
-			/* A command that needs no instance (vkEnumerateInstanceVersion)
-			 * is asked for with none: a loader since 1.2.193 answers NULL
-			 * for it when given one. */
-			if (!fn)
-				fn = s_gipa(NULL, vkb_fn_names[i].name);
+		if (device_level && !vkb_fn_names[i].device)
+			continue;
+		/* A command is asked for by its name here and then by its other
+		 * names: vkCmdSetEvent2 is vkCmdSetEvent2KHR, and a driver may
+		 * answer only one of the two - the first only to a program that
+		 * asked for Vulkan 1.3, the second only with the extension on. A
+		 * guest that calls either gets the command (chimera issue 268). */
+		for (int n = -1; !fn && n < VKB_OTHER_NAMES; n++) {
+			const char *name = n < 0 ? vkb_fn_names[i].name : vkb_fn_names[i].also[n];
+			if (!name)
+				break;
+#ifdef VKB_TEST_BREAK_NAMES
+			if (n >= 0)
+				break;
+#endif
+			if (device_level) {
+				if (gdpa && s_device)
+					fn = gdpa(s_device, name);
+			} else {
+				fn = s_gipa(s_instance, name);
+				/* A command that needs no instance (vkEnumerateInstanceVersion)
+				 * is asked for with none: a loader since 1.2.193 answers NULL
+				 * for it when given one. */
+				if (!fn)
+					fn = s_gipa(NULL, name);
+			}
 		}
 		*slot = (void *)fn;
 	}

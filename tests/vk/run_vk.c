@@ -216,6 +216,13 @@ int main(int argc, char **argv)
 		EXPECT(value(9) == 0, "the bridge offers push descriptors where the device has none");
 	}
 
+	/* A command asked for by its extension's name, and called (issue 268 of
+	 * chimera): the run itself stops at step 126 when the event stays unset. */
+	if (direct.event_set)
+		EXPECT(value(13) == 1, "an event set by a command in the queue is not set through the bridge");
+	else
+		fprintf(stderr, "NOT TESTED: this device has no VK_KHR_synchronization2, so no command was called by an extension's name\n");
+
 	/* two calls in the run are wrong on purpose - a descriptor write with
 	 * nothing to read, and one to a set that does not exist - and they, and
 	 * only they, must have been refused */

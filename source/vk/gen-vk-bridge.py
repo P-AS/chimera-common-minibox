@@ -614,11 +614,26 @@ def main():
         ret, params = reg.commands[target]
         g.append("VKAPI_ATTR %s VKAPI_CALL vkb_g_%s(%s);"
                  % (ret, target, ", ".join(p.decl for p in params)))
-    g.append("\nstatic const struct { const char *name; void (*fn)(void); } vkb_names[] = {")
-    for op, name, target in sorted(live, key=lambda e: e[1]):
+    # A command has one name per extension it came through and one more since
+    # it joined a version: vkCmdSetEvent2KHR and vkCmdSetEvent2 are the same
+    # command. A renderer asks for whichever it was written against, so every
+    # such name of a command in the list answers, with the wrapper of the name
+    # that is in the list. An extension is offered whole or not at all: a name
+    # that came back empty here was called anyway (chimera issue 268).
+    rows = {}
+    for op, name, target in live:
         prefix = "vkb_g_" if target in (GUEST_SPECIAL | GUEST_ONLY) else "vkb_w_"
-        which = target if prefix == "vkb_g_" else name
-        g.append('\t{"%s", (void (*)(void))%s%s},' % (name, prefix, which))
+        rows[name] = prefix + (target if prefix == "vkb_g_" else name)
+    for other in sorted(set(reg.cmd_alias) | set(reg.commands)):
+        if other in rows:
+            continue
+        target = shape(other)
+        same = [name for op, name, t in live if t == target]
+        if same:
+            rows[other] = rows[target if target in same else same[0]]
+    g.append("\nstatic const struct { const char *name; void (*fn)(void); } vkb_names[] = {")
+    for name in sorted(rows):
+        g.append('\t{"%s", (void (*)(void))%s},' % (name, rows[name]))
     g.append("};\n")
     g.append("void *chimera_vk_lookup(const char *name)\n{\n"
              "\tsize_t lo = 0, hi = sizeof vkb_names / sizeof vkb_names[0];\n"
@@ -637,13 +652,24 @@ def main():
             continue
         c.append("\tPFN_%s %s;" % (name, name))
     c.append("};\nstatic struct vkb_fns vkb_fn;\n")
-    c.append("static const struct { const char *name; size_t offset; int device; } vkb_fn_names[] = {")
+    # The other names of each command (see the guest's table of names). A
+    # driver answers a command's newer name only to a program that asked for
+    # that version of Vulkan, and its extension name only where the extension
+    # is on: which one it has is the driver's business, so the host asks for
+    # each in turn.
+    others = {}
+    for other in sorted(set(reg.cmd_alias) | set(reg.commands)):
+        others.setdefault(shape(other), []).append(other)
+    most = max(len(names) for names in others.values())
+    c.append("#define VKB_OTHER_NAMES %d" % most)
+    c.append("static const struct { const char *name; size_t offset; int device; const char *also[VKB_OTHER_NAMES]; } vkb_fn_names[] = {")
     for op, name, target in live:
         if target in GUEST_ONLY:
             continue
         first = reg.commands[target][1][0].type if reg.commands[target][1] else ""
         device = reg.canon(first) in ("VkDevice", "VkQueue", "VkCommandBuffer")
-        c.append('\t{"%s", offsetof(struct vkb_fns, %s), %d},' % (name, name, 1 if device else 0))
+        also = ", ".join('"%s"' % n for n in others[target] if n != name)
+        c.append('\t{"%s", offsetof(struct vkb_fns, %s), %d, {%s}},' % (name, name, 1 if device else 0, also))
     c.append("};\n")
     # a command's name by its opcode, for a person reading a count of calls
     c.append("static const char *vkb_op_name(unsigned op)\n{\n\tswitch (op) {")
