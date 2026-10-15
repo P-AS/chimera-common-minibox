@@ -226,6 +226,11 @@ int main(int argc, char **argv)
 	/* two calls in the run are wrong on purpose - a descriptor write with
 	 * nothing to read, and one to a set that does not exist - and they, and
 	 * only they, must have been refused */
+	/* the run resets its descriptor pool a thousand times and fills it again */
+	fprintf(stderr, "bridged: %lu handle slots used\n", chimera_vk_host_handle_slots());
+	EXPECT(chimera_vk_host_handle_slots() < 500, "the table of handles grew with every pool reset (%lu slots)",
+	       chimera_vk_host_handle_slots());
+
 	long last = -1;
 	EXPECT(chimera_vk_host_refused(&last) == 2, "%lu calls were refused where two were meant to be (last opcode %ld)",
 	       chimera_vk_host_refused(NULL), last);

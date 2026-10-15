@@ -375,6 +375,12 @@ static void vkt_run(vkt_lookup get, struct vkt_result *out, int through_bridge)
 		.descriptorPool = dpool, .descriptorSetCount = 1, .pSetLayouts = &set_layout };
 	VkDescriptorSet set = VK_NULL_HANDLE;
 	VKT_STEP(65, VKT(vkAllocateDescriptorSets)(dev, &dsai, &set));
+	/* a pool reset and filled again, as many renderers do every frame: through
+	 * the bridge the table of handles must not grow with it (run_vk.c) */
+	for (int k = 0; k < 1000; k++) {
+		VKT_STEP(65, VKT(vkResetDescriptorPool)(dev, dpool, 0));
+		VKT_STEP(65, VKT(vkAllocateDescriptorSets)(dev, &dsai, &set));
+	}
 
 	VkBuffer ubo = VK_NULL_HANDLE, vbo = VK_NULL_HANDLE;
 	VkDeviceMemory ubo_mem = VK_NULL_HANDLE, vbo_mem = VK_NULL_HANDLE;

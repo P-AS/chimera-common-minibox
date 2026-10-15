@@ -112,40 +112,74 @@ struct entry {
 	uint64_t host;              /* 0 once destroyed */
 	struct memory_state *memory;  /* for a VkDeviceMemory */
 	uint32_t parent;            /* the pool a set or a command buffer dies with */
+	uint32_t first_child;       /* a pool's: the newest of what dies with it, 0 none */
+	uint32_t next_sibling;      /* a child's: the one made before it in the same pool */
 	uint8_t kind;
 	uint8_t secondary;          /* a secondary command buffer */
+	uint8_t gen;                /* how many times this slot was given out again */
 };
+
+/* A handle is (context ordinal << 32) | (slot generation << 24) | slot. The
+ * slots of what a pool takes with it - a reset descriptor pool's sets, every
+ * frame for many renderers - are given out again; the generation makes a
+ * handle to what was there before name nothing, as a destroyed handle always
+ * has. Without reuse the table only grew, by every set ever made, until the
+ * next load. */
+#define VKB_SLOT_BITS 24
+#define VKB_SLOT_MASK ((1u << VKB_SLOT_BITS) - 1)
 
 static struct entry *s_entries;     /* [0] unused */
 static uint32_t s_entry_count = 1, s_entry_room;
+static uint32_t *s_free;            /* slots a pool gave back, newest last */
+static uint32_t s_free_count, s_free_room;
+static uint32_t s_slots_peak;       /* the most slots held at once, for the tests */
 static uint32_t s_ordinal = 1;      /* which context of this process */
 static uint64_t s_context_id;       /* what a guest is told: differs in every process too */
+
+static uint32_t vkb_slot(uint64_t id) { return (uint32_t)id & VKB_SLOT_MASK; }
 
 static uint64_t vkb_register(int kind, uint64_t host, uint32_t parent)
 {
 	if (!host)
 		return 0;
-	if (s_entry_count >= s_entry_room) {
-		const uint32_t room = s_entry_room ? s_entry_room * 2 : 1024;
-		struct entry *grown = realloc(s_entries, (size_t)room * sizeof *grown);
-		if (!grown)
-			return 0;
-		if (!s_entries)
-			memset(grown, 0, sizeof *grown);
-		s_entries = grown;
-		s_entry_room = room;
+	uint32_t slot;
+	uint8_t gen = 0;
+	if (s_free_count) {
+		slot = s_free[--s_free_count];
+		gen = s_entries[slot].gen;
+	} else {
+		if (s_entry_count > VKB_SLOT_MASK)
+			return 0;               /* sixteen million live handles: no room for another */
+		if (s_entry_count >= s_entry_room) {
+			const uint32_t room = s_entry_room ? s_entry_room * 2 : 1024;
+			struct entry *grown = realloc(s_entries, (size_t)room * sizeof *grown);
+			if (!grown)
+				return 0;
+			if (!s_entries)
+				memset(grown, 0, sizeof *grown);
+			s_entries = grown;
+			s_entry_room = room;
+		}
+		slot = s_entry_count++;
+		if (slot > s_slots_peak)
+			s_slots_peak = slot;
 	}
-	struct entry *e = &s_entries[s_entry_count];
+	struct entry *e = &s_entries[slot];
 	memset(e, 0, sizeof *e);
 	e->host = host;
 	e->kind = (uint8_t)kind;
 	e->parent = parent;
-	return ((uint64_t)s_ordinal << 32) | s_entry_count++;
+	e->gen = gen;
+	if (parent) {
+		e->next_sibling = s_entries[parent].first_child;
+		s_entries[parent].first_child = slot;
+	}
+	return ((uint64_t)s_ordinal << 32) | ((uint64_t)gen << VKB_SLOT_BITS) | slot;
 }
 
 static struct entry *vkb_entry(uint64_t id, int kind)
 {
-	const uint32_t index = (uint32_t)id;
+	const uint32_t index = vkb_slot(id);
 #ifdef VKB_TEST_BREAK_STALE    /* a test build: a handle of any context is taken */
 	if (index == 0 || index >= s_entry_count)
 		return NULL;
@@ -154,6 +188,8 @@ static struct entry *vkb_entry(uint64_t id, int kind)
 		return NULL;
 #endif
 	struct entry *e = &s_entries[index];
+	if (e->gen != (uint8_t)((uint32_t)id >> VKB_SLOT_BITS))
+		return NULL;                /* the slot has been given out since */
 	return (e->host && e->kind == kind) ? e : NULL;
 }
 
@@ -165,7 +201,7 @@ static uint64_t vkb_intern(int kind, uint64_t host)
 {
 	for (uint32_t i = 1; i < s_entry_count; i++)
 		if (s_entries[i].host == host && s_entries[i].kind == kind)
-			return ((uint64_t)s_ordinal << 32) | i;
+			return ((uint64_t)s_ordinal << 32) | ((uint64_t)s_entries[i].gen << VKB_SLOT_BITS) | i;
 	return vkb_register(kind, host, 0);
 }
 
@@ -209,12 +245,39 @@ static void vkb_forget(uint64_t id, int kind)
 	e->host = 0;
 }
 
+/* What a pool takes with it: its own list, newest first, and every slot on
+ * it given back. It used to walk every handle ever made - on each descriptor
+ * pool reset, which many renderers do every frame - so a run without a load
+ * got slower the longer it went. */
 static void vkb_forget_children(uint32_t parent)
 {
-	for (uint32_t i = 1; i < s_entry_count; i++)
-		if (s_entries[i].parent == parent && s_entries[i].host)
-			s_entries[i].host = 0;
+	if (parent == 0 || parent >= s_entry_count)
+		return;
+	uint32_t i = s_entries[parent].first_child;
+	s_entries[parent].first_child = 0;
+	while (i) {
+		struct entry *e = &s_entries[i];
+		const uint32_t next = e->next_sibling;
+		free(e->memory);
+		e->memory = NULL;
+		e->host = 0;
+		e->next_sibling = 0;
+		e->gen++;
+		if (s_free_count == s_free_room) {
+			const uint32_t room = s_free_room ? s_free_room * 2 : 1024;
+			uint32_t *grown = realloc(s_free, (size_t)room * sizeof *grown);
+			if (grown) {
+				s_free = grown;
+				s_free_room = room;
+			}
+		}
+		if (s_free_count < s_free_room)
+			s_free[s_free_count++] = i;   /* (with no room, the slot is just not reused) */
+		i = next;
+	}
 }
+
+unsigned long chimera_vk_host_handle_slots(void) { return s_slots_peak; }
 
 static unsigned long s_refused;
 static long s_last_refused = -1;
@@ -780,7 +843,7 @@ static uint64_t vkb_special_vkAllocateCommandBuffers(uint64_t op, struct vkb_vkA
 	if (!a->pAllocateInfo || !a->pCommandBuffers || !vkb_fn.vkAllocateCommandBuffers)
 		return vkb_refuse(op, (uint64_t)(int64_t)VK_ERROR_DEVICE_LOST);
 	VkCommandBufferAllocateInfo info = *a->pAllocateInfo;
-	const uint32_t pool = (uint32_t)(uint64_t)info.commandPool;
+	const uint32_t pool = vkb_slot((uint64_t)info.commandPool);
 	vkb_x_VkCommandBufferAllocateInfo(&info);
 	VkCommandBuffer *out = vkb_alloc((size_t)info.commandBufferCount * sizeof *out);
 	if (vkb_bad || !out)
@@ -802,7 +865,7 @@ static uint64_t vkb_special_vkAllocateDescriptorSets(uint64_t op, struct vkb_vkA
 	if (!a->pAllocateInfo || !a->pDescriptorSets || !vkb_fn.vkAllocateDescriptorSets)
 		return vkb_refuse(op, (uint64_t)(int64_t)VK_ERROR_DEVICE_LOST);
 	VkDescriptorSetAllocateInfo info = *a->pAllocateInfo;
-	const uint32_t pool = (uint32_t)(uint64_t)info.descriptorPool;
+	const uint32_t pool = vkb_slot((uint64_t)info.descriptorPool);
 	vkb_x_VkDescriptorSetAllocateInfo(&info);
 	VkDescriptorSet *out = vkb_alloc((size_t)info.descriptorSetCount * sizeof *out);
 	if (vkb_bad || !out)
@@ -821,7 +884,7 @@ static uint64_t vkb_special_vkDestroyCommandPool(uint64_t op, struct vkb_vkDestr
 		return vkb_refuse(op, 0);
 	vkb_fn.vkDestroyCommandPool(device, pool, NULL);
 	if (pool) {
-		vkb_forget_children((uint32_t)(uint64_t)a->commandPool);
+		vkb_forget_children(vkb_slot((uint64_t)a->commandPool));
 		vkb_forget((uint64_t)a->commandPool, VKB_K_CommandPool);
 	}
 	return 0;
@@ -835,7 +898,7 @@ static uint64_t vkb_special_vkDestroyDescriptorPool(uint64_t op, struct vkb_vkDe
 		return vkb_refuse(op, 0);
 	vkb_fn.vkDestroyDescriptorPool(device, pool, NULL);
 	if (pool) {
-		vkb_forget_children((uint32_t)(uint64_t)a->descriptorPool);
+		vkb_forget_children(vkb_slot((uint64_t)a->descriptorPool));
 		vkb_forget((uint64_t)a->descriptorPool, VKB_K_DescriptorPool);
 	}
 	return 0;
@@ -848,7 +911,7 @@ static uint64_t vkb_special_vkResetDescriptorPool(uint64_t op, struct vkb_vkRese
 	if (vkb_bad || !vkb_fn.vkResetDescriptorPool)
 		return vkb_refuse(op, (uint64_t)(int64_t)VK_ERROR_DEVICE_LOST);
 	const VkResult r = vkb_fn.vkResetDescriptorPool(device, pool, a->flags);
-	vkb_forget_children((uint32_t)(uint64_t)a->descriptorPool);
+	vkb_forget_children(vkb_slot((uint64_t)a->descriptorPool));
 	return (uint64_t)(int64_t)r;
 }
 
@@ -961,6 +1024,7 @@ static void destroy_context(void)
 	for (uint32_t i = 1; i < s_entry_count; i++)
 		free(s_entries[i].memory);
 	s_entry_count = 1;
+	s_free_count = 0;
 	memset(&vkb_fn, 0, sizeof vkb_fn);
 }
 
@@ -1037,6 +1101,10 @@ void chimera_vk_host_shutdown(void)
 	s_entries = NULL;
 	s_entry_room = 0;
 	s_entry_count = 1;
+	free(s_free);
+	s_free = NULL;
+	s_free_room = 0;
+	s_free_count = 0;
 #ifdef _WIN32
 	if (s_lib)
 		FreeLibrary(s_lib);

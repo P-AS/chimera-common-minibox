@@ -46,6 +46,10 @@ const char *chimera_vk_host_description(void);
  * this above zero drew something other than what it was asked to. */
 unsigned long chimera_vk_host_refused(long *last_op);
 
+/* The most slots the table of handles has held at once in this process (for
+ * the tests: what a pool gives back is used again, so this stops growing). */
+unsigned long chimera_vk_host_handle_slots(void);
+
 #ifdef __cplusplus
 }
 #endif
