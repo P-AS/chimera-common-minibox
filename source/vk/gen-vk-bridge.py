@@ -62,6 +62,10 @@ HOST_SPECIAL = {
 # (vkCreate/DestroyDescriptorUpdateTemplate and the private data slots go with
 # them, and VK_EXT_private_data is not offered.)
 
+# Commands that write every entry of their output array even when they fail
+# (VK_NULL_HANDLE for each one that was not made).
+ALL_ENTRIES_WRITTEN = {"vkCreateGraphicsPipelines", "vkCreateComputePipelines"}
+
 # Commands the guest half answers itself, or wraps by hand (vk-guest.c): a
 # mapping is a buffer on the guest's side, and "which function has this name"
 # is a question about the guest's own table.
@@ -488,9 +492,14 @@ def gen_host_command(reg, name, op, out):
             pre.append("\t\t%s *o_%s = a->%s ? vkb_alloc((size_t)(%s) * sizeof(%s)) : NULL;"
                        % (p.type, p.name, p.name, n, p.type))
             args.append("o_%s" % p.name)
-            post.append("\t\tfor (uint32_t i = 0; ok && o_%s && i < (uint32_t)(%s); i++)\n"
+            # A pipeline create that fails for some entries still makes the
+            # others, and the driver writes VK_NULL_HANDLE for the failed ones:
+            # those are taken whatever the result, or what was made is leaked
+            # and the guest's array keeps what it held before.
+            whole = "" if name in ALL_ENTRIES_WRITTEN else "ok && "
+            post.append("\t\tfor (uint32_t i = 0; %so_%s && i < (uint32_t)(%s); i++)\n"
                         "\t\t\ta->%s[i] = (%s)%s(%s, (uint64_t)o_%s[i]);"
-                        % (p.name, n, p.name, p.type, how, kind(reg, t), p.name))
+                        % (whole, p.name, n, p.name, p.type, how, kind(reg, t), p.name))
         elif t in reg.structs and reg.needs(t) and p.ptr == 1:
             n = len_expr(params, p)
             pre.append("\t\t%s *c_%s = vkb_copy(a->%s, (size_t)(%s) * sizeof(%s));\n"

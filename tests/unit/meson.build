@@ -20,6 +20,17 @@ slots_exe = executable(
 )
 test('test_slots', slots_exe, suite: 'unit', timeout: 60)
 
+# and the settings reader beside it, the same way
+settings_exe = executable(
+  'test_settings',
+  'test_settings.c',
+  include_directories: [
+    include_directories('../../source/guest/include'),
+    include_directories('../../extern/jsmn'),
+  ],
+)
+test('test_settings', settings_exe, suite: 'unit', timeout: 60)
+
 # source/gl/gl-string-keep.inc is guest code the GPU bridge's generator pastes
 # into every core's wrapper file; plain C, so it is tested as it is.
 gl_strings_exe = executable('test_gl_strings', 'test_gl_strings.c')

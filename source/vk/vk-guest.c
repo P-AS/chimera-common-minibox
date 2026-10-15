@@ -61,7 +61,9 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkb_g_vkGetDeviceProcAddr(VkDevice devi
  * fills it. What is lent out is kept in a list, in guest memory, so that it
  * is in a savestate with the pointers a renderer holds into it. */
 
-struct mapping { uint64_t memory; void *shadow; };
+/* `block` is what was allocated, and what is freed; `shadow` (inside it) is
+ * where the mapped bytes are, handed to the guest and to the host */
+struct mapping { uint64_t memory; void *shadow; void *block; };
 static struct mapping *s_maps;
 static uint32_t s_map_count, s_map_room;
 
@@ -69,9 +71,9 @@ static void *take_mapping(uint64_t memory)
 {
 	for (uint32_t i = 0; i < s_map_count; i++) {
 		if (s_maps[i].memory == memory) {
-			void *shadow = s_maps[i].shadow;
+			void *block = s_maps[i].block;
 			s_maps[i] = s_maps[--s_map_count];
-			return shadow;
+			return block;
 		}
 	}
 	return NULL;
@@ -80,7 +82,7 @@ static void *take_mapping(uint64_t memory)
 void chimera_vk_forget_mappings(void)
 {
 	for (uint32_t i = 0; i < s_map_count; i++)
-		free(s_maps[i].shadow);
+		free(s_maps[i].block);
 	s_map_count = 0;
 }
 
@@ -101,7 +103,11 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_g_vkMapMemory(VkDevice device, VkDeviceMemory
 	if (r != VK_SUCCESS)
 		return r;
 
-	void *shadow = NULL;
+	/* The pointer minus the offset must be aligned as the device asks
+	 * (minMemoryMapAlignment, at most a page): so the shadow starts as far
+	 * into a page-aligned block as the offset is into its page. */
+	const size_t lead = (size_t)(offset & 4095);
+	void *block = NULL, *shadow = NULL;
 	if (s_map_count == s_map_room) {
 		const uint32_t room = s_map_room ? s_map_room * 2 : 16;
 		struct mapping *grown = realloc(s_maps, room * sizeof *grown);
@@ -110,8 +116,8 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_g_vkMapMemory(VkDevice device, VkDeviceMemory
 			s_map_room = room;
 		}
 	}
-	if (s_map_count < s_map_room && posix_memalign(&shadow, 4096, bytes ? bytes : 1) != 0)
-		shadow = NULL;
+	if (s_map_count < s_map_room && posix_memalign(&block, 4096, lead + (bytes ? bytes : 1)) == 0)
+		shadow = (uint8_t *)block + lead;
 	if (!shadow) {
 		struct vkb_vkUnmapMemory_args u;
 		u.device = device;
@@ -121,6 +127,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_g_vkMapMemory(VkDevice device, VkDeviceMemory
 	}
 	s_maps[s_map_count].memory = (uint64_t)(uintptr_t)memory;
 	s_maps[s_map_count].shadow = shadow;
+	s_maps[s_map_count].block = block;
 	s_map_count++;
 
 	struct vkb_map_attach_args at = { (uint64_t)(uintptr_t)memory, (uint64_t)(uintptr_t)shadow };

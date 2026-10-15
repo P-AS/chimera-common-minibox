@@ -21,6 +21,10 @@ static struct mb_host *sample_h;
 #endif
 
 struct mb_host {
+	/* GuestFaultHandler, raw and through its thunk: looked up once, on the
+	 * first activate (a strcmp over every export, twice, on every state call) */
+	uintptr_t fault_raw, fault_entry;
+	bool fault_known;
 	mb_fs *fs;
 	uintptr_t program_break;
 	mb_elf *elf;
@@ -86,6 +90,22 @@ enum {
 
 static uintptr_t serr(int e) { return (uintptr_t)(intptr_t)(-mb_linux_errno(e)); }  /* -errno as usize, in Linux numbers */
 static uintptr_t sok(mb_sword v) { return (uintptr_t)v; }
+
+/* open, and openat(AT_FDCWD), which is the same call: libcs use one or the
+ * other, so the rules must not depend on which. v3 O_TRUNC needs write access
+ * (else EACCES), and after a successful open the file is truncated, except
+ * streams (truncate refuses those with EBADF, which is ignored). openat used
+ * to skip the v3 half. */
+static uintptr_t open_file(mb_host *h, const char *p, int flags) {
+	if (mb_threads_spec(h->threads) == 3 && (flags & O_TRUNC) != 0 && (flags & 3) == 0) return serr(EACCES);
+	mb_sword r = mb_fs_open(h->fs, p, flags);
+	if (r < 0) return serr((int)-r);
+	if (mb_threads_spec(h->threads) == 3 && (flags & O_TRUNC) != 0) {
+		mb_sword t = mb_fs_truncate_fd(h->fs, (int)r, 0);
+		if (t < 0 && t != -EBADF) return serr((int)-t);
+	}
+	return sok(r);
+}
 
 static mb_prot arg_to_prot(uintptr_t a, bool *bad) {
 	*bad = false;
@@ -455,18 +475,7 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			return sok(total);
 		}
 		case NR_open:  { const char *p = guest_str(h, a1); if (!p) return serr(EFAULT);
-		                 int flags = (int)a2;
-		                 /* v3 O_TRUNC: needs write access (else EACCES); after a
-		                  * successful open the file is truncated, except streams
-		                  * (truncate refuses those with EBADF, which is ignored) */
-		                 if (mb_threads_spec(h->threads) == 3 && (flags & O_TRUNC) != 0 && (flags & 3) == 0) return serr(EACCES);
-		                 mb_sword r = mb_fs_open(h->fs, p, flags);
-		                 if (r < 0) return serr((int)-r);
-		                 if (mb_threads_spec(h->threads) == 3 && (flags & O_TRUNC) != 0) {
-		                     mb_sword t = mb_fs_truncate_fd(h->fs, (int)r, 0);
-		                     if (t < 0 && t != -EBADF) return serr((int)-t);
-		                 }
-		                 return sok(r); }
+		                 return open_file(h, p, (int)a2); }
 		case NR_sysinfo: {
 			/* fixed, plausible, deterministic: 1GB total, half free, no swap.
 			 * (struct sysinfo is 112 bytes of longs; fill what matters.) */
@@ -536,8 +545,7 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			 * meaning here. */
 			if ((int)a1 != -100) return serr(EBADF);
 			const char *p = guest_str(h, a2); if (!p) return serr(EFAULT);
-			mb_sword r = mb_fs_open(h->fs, p, (int)a3);
-			return r < 0 ? serr((int)-r) : sok(r);
+			return open_file(h, p, (int)a3);
 		}
 		case NR_newfstatat: {
 			if ((int)a1 != -100) return serr(EBADF);
@@ -837,6 +845,7 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 	/* (the image is the caller's: nothing here keeps a copy of it - one used
 	 * to be kept for the whole session and never read, 100 to 330 MB on the
 	 * big cores) */
+	if (!mb_elf_check(image, image_len, errbuf, errlen)) return NULL;
 	mb_host *h = (mb_host *)calloc(1, sizeof(mb_host));
 	h->thunks = mb_thunks_new();
 	h->threads = mb_threads_new();
@@ -1016,12 +1025,19 @@ void mb_host_activate(mb_host *h) {
 	 * is called on the faulting guest thread, which is already inside the
 	 * guest, so the host-to-guest adapter (a host thread entering) would
 	 * find no entry context to save. The guest ABI is spelled in the type. */
-	mb_tripguard_set_guest_fault_handler((mb_guest_fault_fn)mb_host_proc_addr_raw(h, "GuestFaultHandler"));
 	/* ...and entered through a thunk for a fault taken in HOST code (host C
 	 * writing a protected guest page), where the thread is not inside */
-	mb_tripguard_set_guest_fault_entry((mb_guest_fault_fn)mb_host_proc_addr(h, "GuestFaultHandler"));
+	if (!h->fault_known) {
+		h->fault_raw = mb_host_proc_addr_raw(h, "GuestFaultHandler");
+		h->fault_entry = mb_host_proc_addr(h, "GuestFaultHandler");
+		h->fault_known = true;
+	}
+	mb_tripguard_set_guest_fault_handler((mb_guest_fault_fn)h->fault_raw);
+	mb_tripguard_set_guest_fault_entry((mb_guest_fault_fn)h->fault_entry);
 #ifndef _WIN32
-	if (getenv("MB_SAMPLE_SECS")) {
+	static int sampling = -1;   /* MB_SAMPLE_SECS, read once */
+	if (sampling < 0) sampling = getenv("MB_SAMPLE_SECS") != NULL;
+	if (sampling) {
 		pthread_mutex_lock(&sample_lock);
 		sample_h = h;   /* the live host, every time: a reboot makes a new one */
 		pthread_mutex_unlock(&sample_lock);

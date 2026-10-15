@@ -182,7 +182,9 @@ static uintptr_t swap_to_next(mb_threads *t, mb_context *c, uintptr_t ret) {
 		uint64_t dl = 0;
 		for (size_t i = 0; i < t->nthreads; i++)
 			if (t->threads[i].state == T_WAITING && t->deadlines[i] != 0 && (dl == 0 || t->deadlines[i] < dl)) dl = t->deadlines[i];
-		if (dl != 0) { t->vclock_ns = dl; expire_due(t); continue; }
+		/* ...keeping what expiry stored for the parking thread itself: swap_to
+		 * below writes ret into it again */
+		if (dl != 0) { t->vclock_ns = dl; expire_due(t); ret = old->rax; continue; }
 	}
 	{
 		/* every thread waits on another and none is left to wake them: a
@@ -334,7 +336,7 @@ uintptr_t mb_threads_futex_wait_timeout(mb_threads *t, mb_context *c, uintptr_t 
 	if (t->spec != 3 || !has_deadline) return park_me(t, c, sok(0), addr);
 	/* already expired: skip the park, cost one tick, ETIMEDOUT. A
 	 * zero-timeout spin advances the clock instead of livelocking it. */
-	if (deadline <= t->vclock_ns) { t->vclock_ns += MB_V3_TICK_NS; return serr(ETIMEDOUT); }
+	if (deadline <= t->vclock_ns) { mb_threads_advance(t, MB_V3_TICK_NS); return serr(ETIMEDOUT); }
 	queue_push(get_or_make_queue(t, addr), t->active_tid);
 	gthread *self = find_thread(t, t->active_tid);
 	self->state = T_WAITING;

@@ -422,8 +422,18 @@ static bool trip(uintptr_t addr) {
 		/* Order matters: the epoch wants what the page held before THIS write,
 		 * and so does the baseline the first time round. Both read the same
 		 * bytes, so both must run before the write is let through. */
+		/* The baseline first, because it can fail: with no memory for the
+		 * copy, the write is not let through and the machine stops, where it
+		 * used to go ahead with the sealed bytes lost for good - every later
+		 * state of that page then had no baseline to be told apart from. */
+		if (!mb_page_maybe_snapshot(p, mirror_of(b, page_start))) {
+			mb_block_track_unlock(b);
+			fault_phase_set(phase);
+			mb_diag("miniBox: no memory for the baseline copy of the page at %p; the machine stops rather than lose it\n",
+				(void *)page_start);
+			return false;
+		}
 		mb_block_epoch_capture(b, pi, mirror_of(b, page_start));
-		mb_page_maybe_snapshot(p, mirror_of(b, page_start));
 		/* And a state being taken in the background wants the same bytes: this
 		 * is the last moment they exist. One atomic exchange when no state is
 		 * being taken, which is almost always. */

@@ -507,7 +507,13 @@ mb_sword mb_fs_truncate_name(mb_fs *fs, const char *name, mb_sword size) {
 	mounted_file *f = by_name(fs, name);
 	if (!f) return -ENOENT;
 	if (f->kind != F_REGULAR || !f->writable || size < 0) return -EBADF;
-	f->data = realloc(f->data, size ? size : 1); f->len = f->cap = (size_t)size;
+	uint8_t *data = realloc(f->data, size ? (size_t)size : 1);
+	if (!data) return -ENOMEM;
+	/* a file made longer reads as zeros past its old end, as on any system;
+	 * the bytes realloc brought were the host's heap, different every run */
+	if ((size_t)size > f->len) memset(data + f->len, 0, (size_t)size - f->len);
+	f->data = data;
+	f->len = f->cap = (size_t)size;
 	for (size_t j = 0; j < fs->hn; j++) {
 		if (&fs->files[fs->hs[j].file] == f && fs->hs[j].pos > f->len) fs->hs[j].pos = f->len;
 	}

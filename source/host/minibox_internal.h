@@ -198,6 +198,7 @@ typedef struct mb_block {
 	mb_range mirror;     /* always-RW second mapping, OS-chosen */
 	bool sealed;
 	bool swapped_in;
+	bool said_protect_refused;   /* refresh_range told the log once */
 	bool active;
 	uint8_t hash[32];
 	mb_handle handle;
@@ -547,6 +548,9 @@ uintptr_t mb_elf_proc_addr(const mb_elf *e, const char *name); /* 0 if absent */
 void      mb_elf_seal(mb_elf *e, mb_block *b);   /* mprotect RO sections */
 const uint8_t *mb_elf_hash(const mb_elf *e);     /* 32 bytes */
 mb_range  mb_elf_span(const uint8_t *image, size_t image_len); /* PT_LOAD span */
+/* every offset and count the two above follow lies inside the image; false
+ * (and why) for a damaged or cut-short one. Called before either. */
+bool      mb_elf_check(const uint8_t *image, size_t image_len, char *why, size_t whylen);
 
 /* ---- fs.c ---- */
 typedef struct mb_fs mb_fs;
@@ -581,7 +585,8 @@ size_t mb_fs_sysout_since(const mb_fs *fs, uint64_t mark, char *out, size_t cap)
 
 /* Internal helpers shared with tripguard (memblock.c). */
 mb_prot mb_page_native_prot(const mb_page *p);
-void    mb_page_maybe_snapshot(mb_page *p, uintptr_t mirror_addr);
+/* false only when a copy was needed and no memory could be had for it */
+bool    mb_page_maybe_snapshot(mb_page *p, uintptr_t mirror_addr);
 /* The pool of page-sized slots the copies above come from (baseline copies,
  * hot-page shadows, Windows stack shadows). Safe in the fault handler. */
 uint8_t *mb_snap_alloc(void);

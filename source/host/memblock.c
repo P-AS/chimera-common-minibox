@@ -185,18 +185,19 @@ void mb_snap_counts(size_t *free_now, size_t *mapped) {
 	snap_unlock();
 }
 
-void mb_page_maybe_snapshot(mb_page *p, uintptr_t maddr) {
+bool mb_page_maybe_snapshot(mb_page *p, uintptr_t maddr) {
 	/* a page nothing has backed yet holds zeros and cannot be read */
 	if (p->uncommitted) {
 		if (p->snap_kind == MB_SNAP_NONE) p->snap_kind = MB_SNAP_ZERO;
-		return;
+		return true;
 	}
 	if (p->snap_kind == MB_SNAP_NONE) {
 		p->snap_data = mb_snap_alloc();
-		if (!p->snap_data) return;   /* out of room: leave it clean rather than crash */
+		if (!p->snap_data) return false;   /* out of room: the caller decides */
 		memcpy(p->snap_data, (const void *)maddr, MB_PAGESIZE);
 		p->snap_kind = MB_SNAP_DATA;
 	}
+	return true;
 }
 
 static bool epoch_tracks(const mb_page *p);
@@ -285,8 +286,10 @@ static inline void bits_none(mb_block *b, uint64_t *w) { memset(w, 0, b->nwords 
  * so the bitmap cannot drift from what the OS was actually told. */
 static void note_prot(mb_block *b, size_t i, mb_prot prot) {
 	bool writable = prot == MB_PROT_RW || prot == MB_PROT_RWX || prot == MB_PROT_RWSTACK;
-	/* a hot page is writable and is never to be held, so it is not "unheld" */
-	if (writable && !b->pages[i].hot) bits_set(b->unheld_bits, i);
+	/* a hot page is writable and is never to be held, so it is not "unheld";
+	 * nor is an invisible one, which no epoch holds - noted, it was given the
+	 * protection it already had at every epoch (both guest stacks, always) */
+	if (writable && !b->pages[i].hot && !b->pages[i].invisible) bits_set(b->unheld_bits, i);
 	else bits_clr(b->unheld_bits, i);
 	/* and a page that is writable is by definition not held: `held` says
 	 * "mapped read-only although dirty" (minibox_internal.h), and this is the
@@ -508,12 +511,8 @@ mb_block *mb_block_new(mb_range addr) {
 	const size_t ngroups = (b->npages + MB_GROUP_PAGES - 1) >> MB_GROUP_SHIFT;
 	b->group_free = (uint32_t *)calloc(ngroups ? ngroups : 1, sizeof(uint32_t));
 	if (!b->pages || !b->epoch_bits || !b->stat_bits || !b->unheld_bits || !b->stack_bits || !b->hot_bits
-		|| !b->epoch_status || !b->status_map || !b->dirty_map || !b->group_free) {
-		free(b->pages); free(b->epoch_bits); free(b->stat_bits);
-		free(b->unheld_bits); free(b->stack_bits); free(b->hot_bits); free(b->epoch_status);
-		free(b->status_map); free(b->dirty_map); free(b->group_free); free(b);
-		return NULL;
-	}
+		|| !b->epoch_status || !b->status_map || !b->dirty_map || !b->group_free)
+		goto fail;
 	/* every page starts Free (below) */
 	for (size_t g = 0; g < ngroups; g++) {
 		const size_t first = g << MB_GROUP_SHIFT;
@@ -524,16 +523,26 @@ mb_block *mb_block_new(mb_range addr) {
 		b->pages[i].status = MB_ST_FREE;
 		b->pages[i].snap_kind = MB_SNAP_ZERO; /* Free pages read as zero */
 	}
-	if (mb_pal_open_handle(addr.size, &b->handle) != 0) { free(b->pages); free(b); return NULL; }
+	/* (on Windows a section of 4 GiB or less is made fully committed, which
+	 * the commit limit can refuse) */
+	if (mb_pal_open_handle(addr.size, &b->handle) != 0) goto fail;
 	mb_range m_in = { 0, addr.size };
 	if (mb_pal_map_handle(b->handle, m_in, &b->mirror) != 0) {
-		mb_pal_close_handle(b->handle); free(b->pages); free(b); return NULL;
+		mb_pal_close_handle(b->handle);
+		goto fail;
 	}
 	if (b->handle.lazy)
 		for (size_t i = 0; i < b->npages; i++) b->pages[i].uncommitted = true;
 	else
 		mb_pal_protect(b->mirror, MB_PROT_RW);
 	return b;
+fail:
+	/* one way out for every failure: the two late ones used to leak all but
+	 * the page array */
+	free(b->pages); free(b->epoch_bits); free(b->stat_bits);
+	free(b->unheld_bits); free(b->stack_bits); free(b->hot_bits); free(b->epoch_status);
+	free(b->status_map); free(b->dirty_map); free(b->group_free); free(b);
+	return NULL;
 }
 
 /* Lazy blocks: back every still-unbacked page of the run in both views
@@ -670,7 +679,14 @@ static void refresh_range(mb_block *b, size_t pstart, size_t pcount) {
 			i = j;
 			continue;
 		}
-		mb_pal_protect(r, prot);
+		if (mb_pal_protect(r, prot) != 0 && !b->said_protect_refused) {
+			/* recorded anyway - there is no stricter answer to fall back on -
+			 * but said: on Linux this is vm.max_map_count, which page-level
+			 * tracking splits a guest's mapping against */
+			b->said_protect_refused = true;
+			mb_diag("miniBox: the OS refused a protection change (%zu pages at %p); writes there may not be tracked\n",
+				j - i, (void *)r.start);
+		}
 		for (size_t k = i; k < j; k++) note_prot(b, k, prot);
 		i = j;
 	}
@@ -1021,6 +1037,8 @@ static bool group_all_free(const mb_block *b, size_t first, size_t lo, size_t hi
  * The answer is exactly the page-by-page walk's (where a guest's memory lands
  * is part of the machine, so it must never move): group_free only lets the
  * walk cross a whole group it already knows the answer for in one step. */
+/* (status_map holds each page's status packed, a byte a page against the
+ * 40-byte page record: the same answer for a fortieth of the reading) */
 static size_t find_free_pages(mb_block *b, size_t arena_start, size_t arena_count, size_t npages) {
 	size_t end = arena_start + arena_count;
 	if (npages >= MB_BIG_REQUEST_PAGES) {
@@ -1038,7 +1056,7 @@ static size_t find_free_pages(mb_block *b, size_t arena_start, size_t arena_coun
 				continue;
 			}
 			i--;
-			if (b->pages[i].status != MB_ST_FREE) { run_end = i; continue; }
+			if (b->status_map[i] != MB_ST_FREE) { run_end = i; continue; }
 			if (run_end - i >= npages) return run_end - npages;
 		}
 		return (size_t)-1;
@@ -1046,9 +1064,9 @@ static size_t find_free_pages(mb_block *b, size_t arena_start, size_t arena_coun
 	size_t best = (size_t)-1, best_len = (size_t)-1;
 	size_t i = arena_start;
 	while (i < end) {
-		if (b->pages[i].status == MB_ST_FREE) {
+		if (b->status_map[i] == MB_ST_FREE) {
 			size_t j = i;
-			while (j < end && b->pages[j].status == MB_ST_FREE) {
+			while (j < end && b->status_map[j] == MB_ST_FREE) {
 				if (group_all_free(b, j, arena_start, end)) j += MB_GROUP_PAGES;
 				else j++;
 			}
@@ -2069,6 +2087,9 @@ static int parts_read(mb_read_cb r, uintptr_t ud, delta_parts *d) {
 	if (rd(r, ud, magic, sizeof(magic))) return -EIO;
 	if (memcmp(magic, DELTA_MAGIC, sizeof(magic)) != 0) return -EINVAL;
 	if (rd(r, ud, &d->npages, sizeof(d->npages))) return -EIO;
+	/* every count below is bounded by this one, and multiplied by a page:
+	 * a count from a damaged stream must not wrap that product */
+	if (d->npages > SIZE_MAX / MB_PAGESIZE) return -EINVAL;
 	if (rd(r, ud, &d->nstatus, sizeof(d->nstatus))) return -EIO;
 	if (d->nstatus > d->npages) return -EINVAL;
 	if (d->nstatus) {

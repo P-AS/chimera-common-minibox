@@ -36,8 +36,11 @@
  * (non-sync) settings hands over a fresh JSON buffer instead - see
  * wbx_settings_use_buffer below - because the mounted file is fixed for the
  * lifetime of the core and cannot carry a later change. */
-static const char *wbx__settings_override = 0;
-static int wbx__settings_override_len = 0;
+/* One for the whole core, whichever source file asks: weak, so every file that
+ * includes this shares the one definition. As statics each file had its own,
+ * and a buffer handed over in PutSettings was not what another file read. */
+__attribute__((weak)) const char *wbx__settings_override = 0;
+__attribute__((weak)) int wbx__settings_override_len = 0;
 
 /* Point subsequent wbx_setting_* reads at `json` instead of the mounted file.
  * Call from the core's PutSettings(len) export, read what you need, then call
@@ -77,9 +80,12 @@ static inline const char *wbx__setting_raw(const char *key, char *out, int outsz
 	if (r < 1 || tok[0].type != JSMN_OBJECT) return 0;
 
 	/* flat object: OBJECT, then (key, value) pairs; the value is the token right
-	 * after its key. */
+	 * after its key. Keys only: stepping one token at a time took a string
+	 * VALUE equal to the key asked for as the key, and answered with the name
+	 * of the setting after it. */
 	size_t klen = strlen(key);
-	for (int i = 1; i + 1 < r; i++) {
+	for (int i = 1; i + 1 < r; i += 2) {
+		if (tok[i + 1].type == JSMN_OBJECT || tok[i + 1].type == JSMN_ARRAY) return 0;   /* not flat */
 		jsmntok_t *k = &tok[i];
 		if (k->type == JSMN_STRING
 			&& (size_t)(k->end - k->start) == klen

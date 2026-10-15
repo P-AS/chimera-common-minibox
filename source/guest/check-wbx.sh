@@ -29,6 +29,12 @@
 set -eu
 wbx="$1"
 [ -f "$wbx" ] || { echo "check-wbx: $wbx not found" >&2; exit 1; }
+# The checks below send the tools' errors to /dev/null and end in grep or awk,
+# so a missing tool or a file it cannot read would pass as "clean". Ask first.
+for tool in readelf objdump; do
+	command -v "$tool" >/dev/null 2>&1 || { echo "check-wbx: $tool is needed and was not found" >&2; exit 1; }
+done
+readelf -hW "$wbx" >/dev/null 2>&1 || { echo "check-wbx: $wbx is not an ELF file readelf can read" >&2; exit 1; }
 
 # Does the image declare TLS of its own? That is what miniBox itself keys the
 # %fs swap on (mb_elf_has_tls), so the check asks exactly the same question.

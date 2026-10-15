@@ -1025,6 +1025,10 @@ static void destroy_context(void)
 		free(s_entries[i].memory);
 	s_entry_count = 1;
 	s_free_count = 0;
+	/* the slots start again, so the handles do under another ordinal: one the
+	 * guest kept from before still names nothing (it used to name whatever its
+	 * slot held next, when the guest itself destroyed and made an instance) */
+	s_ordinal++;
 	memset(&vkb_fn, 0, sizeof vkb_fn);
 }
 

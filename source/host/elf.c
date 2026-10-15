@@ -66,6 +66,55 @@ static bool section_ro_after_seal(const char *n) {
 		|| strcmp(n, ".tbss") == 0 || strcmp(n, ".sealed") == 0;
 }
 
+/* Whether [off, off + size) lies inside the image, without overflowing. */
+static bool within(uint64_t off, uint64_t size, size_t len) {
+	return off <= len && size <= len - off;
+}
+
+/* Whether a string table's strings end inside it: its last byte is NUL. */
+static bool strings_end(const uint8_t *image, const Elf64_Shdr *s) {
+	return s->sh_type != SHT_NOBITS && s->sh_size != 0 && image[s->sh_offset + s->sh_size - 1] == 0;
+}
+
+/* Every offset and count the loader below follows, checked against the image
+ * before any is followed: a core.wbx that is cut short or damaged is refused
+ * by name, not read past its end (and that memory copied into the guest). */
+bool mb_elf_check(const uint8_t *image, size_t len, char *why, size_t whylen) {
+	const Elf64_Ehdr *eh = (const Elf64_Ehdr *)image;
+#define BAD(...) do { snprintf(why, whylen, __VA_ARGS__); return false; } while (0)
+	if (len < sizeof(Elf64_Ehdr) || memcmp(eh->e_ident, "\x7f""ELF", 4) != 0 || eh->e_ident[4] != 2) BAD("not an ELF64 image");
+	if (eh->e_phnum != 0 && (eh->e_phentsize < sizeof(Elf64_Phdr) || !within(eh->e_phoff, (uint64_t)eh->e_phnum * eh->e_phentsize, len)))
+		BAD("the image's program headers lie outside it");
+	if (eh->e_shnum == 0) BAD("the image has no section headers");
+	if (eh->e_shentsize != sizeof(Elf64_Shdr) || !within(eh->e_shoff, (uint64_t)eh->e_shnum * sizeof(Elf64_Shdr), len))
+		BAD("the image's section headers lie outside it");
+	const Elf64_Shdr *sh = (const Elf64_Shdr *)(image + eh->e_shoff);
+	if (eh->e_shstrndx >= eh->e_shnum) BAD("the image names no section-name table");
+	for (int i = 0; i < eh->e_shnum; i++) {
+		if (sh[i].sh_type != SHT_NOBITS && !within(sh[i].sh_offset, sh[i].sh_size, len)) BAD("section %d lies outside the image", i);
+		if (sh[i].sh_type == 2 /*SHT_SYMTAB*/ && sh[i].sh_link >= eh->e_shnum) BAD("the symbol table names no string table");
+	}
+	const Elf64_Shdr *names = &sh[eh->e_shstrndx];
+	if (!strings_end(image, names)) BAD("the section-name table is not terminated");
+	for (int i = 0; i < eh->e_shnum; i++) {
+		if (sh[i].sh_name >= names->sh_size) BAD("section %d's name lies outside its table", i);
+		if (sh[i].sh_type != 2) continue;
+		const Elf64_Shdr *strings = &sh[sh[i].sh_link];
+		if (!strings_end(image, strings)) BAD("the symbol string table is not terminated");
+		const Elf64_Sym *syms = (const Elf64_Sym *)(image + sh[i].sh_offset);
+		for (size_t k = 0; k < sh[i].sh_size / sizeof(Elf64_Sym); k++)
+			if (syms[k].st_name >= strings->sh_size) BAD("symbol %zu's name lies outside its table", k);
+	}
+	for (int i = 0; i < eh->e_phnum; i++) {
+		const Elf64_Phdr *ph = (const Elf64_Phdr *)(image + eh->e_phoff + (size_t)i * eh->e_phentsize);
+		if (ph->p_type != PT_LOAD) continue;
+		if (!within(ph->p_offset, ph->p_filesz, len) || ph->p_filesz > ph->p_memsz) BAD("segment %d lies outside the image", i);
+		if (ph->p_vaddr + ph->p_memsz < ph->p_vaddr) BAD("segment %d wraps the address space", i);
+	}
+#undef BAD
+	return true;
+}
+
 mb_range mb_elf_span(const uint8_t *image, size_t len) {
 	const Elf64_Ehdr *eh = (const Elf64_Ehdr *)image;
 	uintptr_t lo = (uintptr_t)-1, hi = 0;

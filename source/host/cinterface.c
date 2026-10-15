@@ -54,8 +54,16 @@ static void err(mb_return *ret, const char *msg) {
 static uint8_t *read_all(mb_read_callback cb, uintptr_t ud, size_t *out_len) {
 	size_t cap = 1 << 16, len = 0;
 	uint8_t *buf = (uint8_t *)malloc(cap);
+	if (!buf) return NULL;
 	for (;;) {
-		if (len == cap) { cap *= 2; buf = (uint8_t *)realloc(buf, cap); }
+		if (len == cap) {
+			/* a failed grow fails the load: a core is hundreds of megabytes,
+			 * and the old pointer is the only one to the bytes read so far */
+			uint8_t *grown = (uint8_t *)realloc(buf, cap * 2);
+			if (!grown) { free(buf); return NULL; }
+			buf = grown;
+			cap *= 2;
+		}
 		intptr_t got = cb(ud, buf + len, cap - len);
 		if (got < 0) { free(buf); return NULL; }
 		if (got == 0) break;
@@ -69,7 +77,7 @@ void wbx_create_host(const mb_memory_layout_template *layout, const char *module
                      mb_read_callback cb, uintptr_t userdata, mb_return *ret) {
 	size_t len = 0;
 	uint8_t *image = read_all(cb, userdata, &len);
-	if (!image) { err(ret, "failed to read guest image"); return; }
+	if (!image) { err(ret, "failed to read guest image (or out of memory)"); return; }
 	char e[256]; e[0] = 0;
 	mb_host *h = mb_host_new(image, len, module_name ? module_name : "guest", layout, e, sizeof(e));
 	free(image);
@@ -107,7 +115,7 @@ void wbx_seal(mb_host *obj, mb_return *ret) {
 void wbx_mount_file(mb_host *obj, const char *name, mb_read_callback cb, uintptr_t userdata, bool writable, mb_return *ret) {
 	size_t len = 0;
 	uint8_t *data = read_all(cb, userdata, &len);
-	if (!data) { err(ret, "failed to read file"); return; }
+	if (!data) { err(ret, "failed to read file (or out of memory)"); return; }
 	int rc = mb_host_mount(obj, name, data, len, writable);
 	free(data);
 	if (rc != 0) { err(ret, "mount failed (already mounted?)"); return; }
@@ -125,8 +133,10 @@ void wbx_unmount_file(mb_host *obj, const char *name, mb_write_callback cb, uint
 	uint8_t *data = NULL; size_t len = 0;
 	int rc = mb_host_unmount(obj, name, cb ? &data : NULL, &len);
 	if (rc != 0) { err(ret, "unmount failed"); return; }
-	if (cb && data) cb(userdata, data, len);
+	/* the file is gone from the machine by now: a failed hand-over is said */
+	const int32_t wrote = (cb && data) ? cb(userdata, data, len) : 0;
 	free(data);
+	if (wrote < 0) { err(ret, "the unmounted file's contents could not be written out"); return; }
 	ok(ret, 0);
 }
 
