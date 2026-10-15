@@ -7,6 +7,7 @@
 /* for syscall(): musl declares it only under _GNU_SOURCE, and this file is
  * compiled -std=c11 */
 #define _GNU_SOURCE
+#include <sys/sysinfo.h>
 #include <emulibc.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -104,6 +105,19 @@ ECL_EXPORT int SigactionAccepted(void) {
 	errno = 0;
 	if (syscall(SYS_rt_sigaction, SIGUSR1, 0, (void *)16, 8) != -1 || errno != EFAULT) return 0;
 	return 1;
+}
+
+/* sysinfo, as the kit this guest was built with is answered: 1 for the
+ * answer with mem_unit where it belongs (kit revision 1 or later), 0 for the
+ * old one (unit written into freehigh's top half), -1 for neither */
+ECL_EXPORT int SysinfoAnswer(void) {
+	struct sysinfo si;
+	memset(&si, 0xA5, sizeof si);
+	if (sysinfo(&si) != 0) return -1;
+	if (si.totalram != (1024ul << 20) || si.freeram != (512ul << 20)) return -1;
+	if (si.mem_unit == 1 && si.freehigh == 0) return 1;
+	if (si.mem_unit == 0 && si.freehigh == (1ul << 32)) return 0;
+	return -1;
 }
 
 /* no pipes in-guest: ENOSYS the caller must cope with */

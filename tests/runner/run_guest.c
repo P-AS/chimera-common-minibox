@@ -625,6 +625,13 @@ int main(int argc, char **argv) {
 		assert(!mb_fs_swap);
 		argv[1] = argv[2]; argc--;   /* consume the flag; argv[0] stays self */
 	}
+	/* --kit0: the guest was built with a kit of no revision, and must get
+	 * the answers cores built before revision 1 got */
+	bool kit0 = false;
+	if (argc > 2 && strcmp(argv[1], "--kit0") == 0) {
+		kit0 = true;
+		argv[1] = argv[2]; argc--;
+	}
 	const char *path = argc > 1 ? argv[1] : "guest.wbx";
 	mb_return r;
 
@@ -675,6 +682,9 @@ int main(int argc, char **argv) {
 		CHECK(((int_fn)proc(h, "NullCloneRefused"))() == 1);
 		CHECK(((int_fn)proc(h, "PwriteBadDescriptor"))() == 1);
 		CHECK(((int_fn)proc(h, "SocketRefused"))() == 1);
+		/* sysinfo by the guest kit's revision: this guest is built with the
+		 * current kit unless the runner was told it was not */
+		CHECK(((int_fn)proc(h, "SysinfoAnswer"))() == (kit0 ? 0 : 1));
 	}
 	/* spec v2 invariants a v3 host must preserve: this guest declares
 	 * nothing, so the clock is constant, timeouts never expire on their

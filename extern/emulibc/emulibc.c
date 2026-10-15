@@ -19,6 +19,20 @@ struct __WbxSysLayout {
 };
 ECL_INVISIBLE ECL_EXPORT struct __WbxSysLayout __wbxsysinfo;
 
+/* The guest kit's revision (MACHINE-SPEC, "Guest kit revisions"). An answer
+ * the host corrected after cores had shipped goes only to a core that says it
+ * was built with a kit that knows it; a core built before has no such symbol
+ * and is answered as it always was, so its movies replay. Every core links
+ * this file, so a core rebuilt with this kit declares it without doing
+ * anything. (Built with WBX_KIT_REVISION=0 only by miniBox's own test of the
+ * old answer.) */
+#ifndef WBX_KIT_REVISION
+#define WBX_KIT_REVISION 1
+#endif
+#if WBX_KIT_REVISION > 0
+ECL_EXPORT const unsigned int __wbx_kit_revision = WBX_KIT_REVISION;
+#endif
+
 void* alloc_helper(size_t size, const struct __AddressRange* range, unsigned long* current, const char* name)
 {
 	if (!*current)

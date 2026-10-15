@@ -261,6 +261,12 @@ Implemented syscalls and their EXACT semantics:
 - **open(2)/close(3)/lseek(8)/truncate(76)/ftruncate(77)**: VFS.
 - **clock_gettime(228)**: writes tv_sec=1495889068, tv_nsec=0 regardless of the
   clock id; returns 0. (This constant is part of the spec.)
+- **sysinfo(99)**: zero-fills the 112-byte struct, then totalram = 1 GiB and
+  freeram = 512 MiB; returns 0. mem_unit is 1, at offset 104 - for a core
+  built with guest kit revision 1 or later. A core with no revision gets the
+  old answer: the 1 written as a uint32 at offset 100, the top half of
+  freehigh, so it reads mem_unit = 0 and freehigh = 4 GiB (see "Guest kit
+  revisions").
 - **exit(60)**: thread exit (tid 1 exiting traps).
 - **futex(202)**: WAIT/WAKE/REQUEUE/LOCK_PI/UNLOCK_PI with FUTEX_PRIVATE(128)
   masked; FIFO waiter queues; timeouts ignored; else ENOSYS.
@@ -457,3 +463,24 @@ instruction stream.
   deadlines (u64 ns absolute, 0 for none) in tid order. v3 guests only ever
   write and read this format. v2 guests keep the v1/v2 format byte for byte:
   no clock, no deadlines, magic `"GuestThreadSet"`.
+
+## Guest kit revisions (2026-10-15)
+
+A machine-spec version is chosen by the core (`__wbx_machine_spec`) and
+changes how the machine behaves. A guest kit revision is narrower: it lets the
+host correct an answer that was wrong after cores had shipped, without
+changing the answer for those cores, so their movies replay as recorded.
+
+The guest kit's `emulibc.c`, which every core links, exports
+`uint32_t __wbx_kit_revision`, read at load the way `__wbx_machine_spec` is.
+A core rebuilt with the kit therefore declares its revision without doing
+anything; a core built before has no symbol and is revision 0. A symbol
+pointing outside the guest's memory refuses the load.
+
+- **Revision 1**: sysinfo's mem_unit is written at offset 104, where it
+  belongs (section 7). Revision 0 keeps the write at offset 100.
+
+The revision is independent of the machine-spec version: v2 and v3 cores alike
+get the corrected answers once rebuilt. A rebuilt core is a new package, with
+its own hash, so a project pinned to the old package keeps the old answers.
+

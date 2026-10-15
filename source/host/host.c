@@ -35,6 +35,7 @@ struct mb_host {
 	mb_thunks *thunks;
 	mb_threads *threads;
 	uint64_t getrandom_state; /* deterministic entropy stream, per host */
+	uint32_t kit_revision;    /* the guest kit the core was built with (__wbx_kit_revision; 0 before) */
 	/* what the machine's small non-memory state was when the epoch began, so a
 	 * REVERSE delta can put it back. The memory half lives in the block. */
 	uintptr_t epoch_brk;
@@ -484,7 +485,12 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			si[0] = 0;                    /* uptime */
 			si[4] = 1024ull << 20;        /* totalram */
 			si[5] = 512ull << 20;         /* freeram */
-			((uint32_t *)a1)[100 / 4] = 1; /* mem_unit at offset 100 */
+			/* mem_unit is at offset 104. It was written at 100, the top half
+			 * of freehigh, so a core read a unit of 0 and 4 GiB of free high
+			 * memory. A core built with guest kit revision 1 or later is told
+			 * the truth; one built before keeps the old answer, so its movies
+			 * replay (MACHINE-SPEC, "Guest kit revisions"). */
+			((uint32_t *)a1)[(h->kit_revision >= 1 ? 104 : 100) / 4] = 1;
 			return sok(0);
 		}
 		case NR_getrusage: {
@@ -926,6 +932,13 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 		spec = (int)v;
 	  }
 	  mb_threads_set_spec(h->threads, spec);
+	  /* the guest kit's revision, read the same way (emulibc.c); none is 0 */
+	  uintptr_t kit_addr = mb_elf_proc_addr(h->elf, "__wbx_kit_revision");
+	  h->kit_revision = 0;
+	  if (kit_addr) {
+		if (!guest_owns(h, kit_addr, 4)) { snprintf(errbuf, errlen, "guest's __wbx_kit_revision points outside its memory"); return host_new_unwind(h); }
+		memcpy(&h->kit_revision, (const void *)kit_addr, 4);
+	  }
 	  if (spec == 3) { fprintf(stderr, "miniBox: guest declares machine spec v3 (virtual time)\n"); fflush(stderr); } }
 
 	mb_call_guest_simple(mb_elf_entry(h->elf), &h->context);  /* _start */

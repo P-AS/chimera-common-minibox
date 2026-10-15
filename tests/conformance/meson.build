@@ -18,6 +18,28 @@ test('conformance-guest', run_guest,
   timeout: 120,
 )
 
+# The same guest built with a guest kit of no revision (emulibc without
+# __wbx_kit_revision): it must get the answers cores built before revision 1
+# got, sysinfo's among them (MACHINE-SPEC, "Guest kit revisions").
+emulibc_kit0 = custom_target('emulibc-kit0.c.o',
+  input: waterbox_emulibc_dir / 'emulibc.c',
+  output: 'emulibc-kit0.c.o',
+  command: [waterbox_musl_gcc, '-c', waterbox_guest_cflags, '-std=c11', '-DWBX_KIT_REVISION=0', '-o', '@OUTPUT@', '@INPUT@'],
+)
+guest_kit0_wbx = custom_target('guest-kit0.wbx',
+  input: 'guest.c',
+  output: 'guest-kit0.wbx',
+  command: [
+    waterbox_musl_gcc, waterbox_guest_cflags, waterbox_guest_ldflags,
+    '-std=c11', '-o', '@OUTPUT@', '@INPUT@', emulibc_kit0, '-lgcc',
+  ],
+)
+test('conformance-kit0', run_guest,
+  args: ['--kit0', guest_kit0_wbx],
+  suite: 'system',
+  timeout: 120,
+)
+
 # Dropped-%fs repair: guest toolchain only (Linux), like the guest itself.
 test('conformance-fs-repair', run_guest,
   args: ['--fs-repair-child', guest_wbx],
