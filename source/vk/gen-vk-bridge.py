@@ -51,6 +51,17 @@ HOST_SPECIAL = {
     "vkDestroyCommandPool", "vkDestroyDescriptorPool", "vkResetDescriptorPool",
 }
 
+# Retired in vk-entry-points.txt (a "-" line keeps its opcode, so no other
+# command's number moves for a core built before), and so answered NULL to the
+# guest: commands with handles where the registry cannot say. pData of
+# vkUpdateDescriptorSetWithTemplate holds image views, samplers and buffers at
+# offsets only the template knows, and vkSetPrivateData/vkGetPrivateData take
+# any object as a bare uint64_t. Passed through, the driver was handed the
+# guest's handle counters as objects and the host process died inside it. A
+# renderer told NULL uses vkUpdateDescriptorSets, or stops in its own sandbox.
+# (vkCreate/DestroyDescriptorUpdateTemplate and the private data slots go with
+# them, and VK_EXT_private_data is not offered.)
+
 # Commands the guest half answers itself, or wraps by hand (vk-guest.c): a
 # mapping is a buffer on the guest's side, and "which function has this name"
 # is a question about the guest's own table.

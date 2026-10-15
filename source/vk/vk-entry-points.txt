@@ -156,9 +156,9 @@ vkGetPhysicalDeviceExternalBufferProperties
 vkGetPhysicalDeviceExternalFenceProperties
 vkGetPhysicalDeviceExternalSemaphoreProperties
 vkCmdDispatchBase
-vkCreateDescriptorUpdateTemplate
-vkDestroyDescriptorUpdateTemplate
-vkUpdateDescriptorSetWithTemplate
+-vkCreateDescriptorUpdateTemplate
+-vkDestroyDescriptorUpdateTemplate
+-vkUpdateDescriptorSetWithTemplate
 vkGetDescriptorSetLayoutSupport
 vkCreateSamplerYcbcrConversion
 vkDestroySamplerYcbcrConversion
@@ -173,10 +173,10 @@ vkCmdBeginRenderPass2
 vkCmdNextSubpass2
 vkCmdEndRenderPass2
 vkGetPhysicalDeviceToolProperties
-vkCreatePrivateDataSlot
-vkDestroyPrivateDataSlot
-vkSetPrivateData
-vkGetPrivateData
+-vkCreatePrivateDataSlot
+-vkDestroyPrivateDataSlot
+-vkSetPrivateData
+-vkGetPrivateData
 vkCmdPipelineBarrier2
 vkCmdWriteTimestamp2
 vkQueueSubmit2

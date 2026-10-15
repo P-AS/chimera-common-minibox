@@ -332,7 +332,7 @@ static const char *const kDeviceExtensions[] = {
 	"VK_EXT_shader_demote_to_helper_invocation", "VK_EXT_non_seamless_cube_map",
 	"VK_EXT_extended_dynamic_state", "VK_EXT_extended_dynamic_state2", "VK_EXT_inline_uniform_block",
 	"VK_EXT_subgroup_size_control", "VK_EXT_texel_buffer_alignment", "VK_EXT_tooling_info",
-	"VK_EXT_private_data", "VK_EXT_pipeline_creation_cache_control", "VK_EXT_image_robustness",
+	"VK_EXT_pipeline_creation_cache_control", "VK_EXT_image_robustness",
 	"VK_EXT_shader_viewport_index_layer", "VK_EXT_separate_stencil_usage", "VK_EXT_descriptor_indexing",
 	"VK_EXT_post_depth_coverage", "VK_EXT_provoking_vertex", "VK_EXT_line_rasterization",
 	"VK_EXT_index_type_uint8", "VK_EXT_robustness2", "VK_EXT_depth_range_unrestricted",
@@ -906,8 +906,8 @@ static void destroy_objects(void)
 		DESTROY(QueryPool, vkDestroyQueryPool, VkQueryPool)
 		DESTROY(DeviceMemory, vkFreeMemory, VkDeviceMemory)
 		DESTROY(SamplerYcbcrConversion, vkDestroySamplerYcbcrConversion, VkSamplerYcbcrConversion)
-		DESTROY(DescriptorUpdateTemplate, vkDestroyDescriptorUpdateTemplate, VkDescriptorUpdateTemplate)
-		DESTROY(PrivateDataSlot, vkDestroyPrivateDataSlot, VkPrivateDataSlot)
+		/* (no update templates or private data slots: the bridge does not
+		 * offer them - see the generator) */
 		default: continue;      /* not the device's: an instance, a queue */
 		}
 #undef DESTROY

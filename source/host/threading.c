@@ -90,15 +90,42 @@ static void remove_queue(mb_threads *t, uintptr_t addr) {
 /* returns tid unparked (and whether more remain), or -1 */
 static int unpark_one(mb_threads *t, uintptr_t addr, uint32_t *out_tid, bool *has_more) {
 	futex_queue *q = find_queue(t, addr);
-	if (!q || q->n == 0) return -1;
-	uint32_t tid = q->tids[0];
-	memmove(&q->tids[0], &q->tids[1], (q->n-1)*sizeof(uint32_t)); q->n--;
+	gthread *g = NULL;
+	uint32_t tid = 0;
+	/* Only a thread that is waiting can be woken. An entry for one that is
+	 * not - gone, or running - is passed over: a state saved by a host from
+	 * before expired waiters left their queue can still hold such entries. */
+	while (q && q->n != 0 && g == NULL) {
+		tid = q->tids[0];
+		memmove(&q->tids[0], &q->tids[1], (q->n-1)*sizeof(uint32_t)); q->n--;
+		g = find_thread(t, tid);
+		if (g && g->state != T_WAITING) g = NULL;
+	}
+	if (g == NULL) {
+		if (q && q->n == 0) remove_queue(t, addr);
+		return -1;
+	}
 	/* woken, not expired: drop any deadline, or a later clock advance would
 	 * hand this running thread a stale ETIMEDOUT over its real return */
-	gthread *g = find_thread(t, tid); if (g) { g->state = T_RUNNABLE; t->deadlines[thread_index(t, g)] = 0; t->seqs[thread_index(t, g)] = 0; }
+	g->state = T_RUNNABLE; t->deadlines[thread_index(t, g)] = 0; t->seqs[thread_index(t, g)] = 0;
 	*out_tid = tid;
 	if (q->n == 0) { remove_queue(t, addr); *has_more = false; } else *has_more = true;
 	return 0;
+}
+
+/* A waiter that timed out is nobody's to wake any more: out of every queue.
+ * Left in, the next FUTEX_WAKE on its word counted it as woken - whether it
+ * was running by then, waiting on another word, or gone - and a real waiter
+ * behind it slept on. */
+static void unqueue(mb_threads *t, uint32_t tid) {
+	for (size_t i = 0; i < t->nfut;) {
+		futex_queue *q = &t->futicies[i];
+		size_t keep = 0;
+		for (size_t r = 0; r < q->n; r++) if (q->tids[r] != tid) q->tids[keep++] = q->tids[r];
+		q->n = keep;
+		if (q->n == 0) remove_queue(t, q->addr);
+		else i++;
+	}
 }
 
 /* ---- lifecycle ---- */
@@ -292,6 +319,7 @@ static void expire_due(mb_threads *t) {
 		if (pick == (size_t)-1) return;
 		t->threads[pick].state = T_RUNNABLE;
 		t->threads[pick].rax = serr(ETIMEDOUT);
+		unqueue(t, t->threads[pick].tid);
 		t->deadlines[pick] = 0; t->seqs[pick] = 0;
 	}
 }

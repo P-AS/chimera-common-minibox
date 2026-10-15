@@ -169,6 +169,39 @@ ECL_EXPORT int V3WaitOrder(void) {
 	return 1;
 }
 
+/* ---- a waiter that timed out leaves its queue ----
+ * E's timed wait expires and E exits. F then waits on the same word with no
+ * deadline, and one FUTEX_WAKE must reach F. The expired waiter used to stay
+ * queued: the wake went to it (one woken, though E was gone), F slept on, and
+ * the join below found every thread waiting. */
+static int fut_e;
+static volatile int ready_f;
+static long ret_e = 1, ret_f = 1;
+static void *waiter_expires(void *arg) {
+	(void)arg;
+	struct timespec to = { 0, 20000 };
+	ret_e = syscall(SYS_futex, &fut_e, 0 /*WAIT*/, 0, &to, NULL, 0);
+	return 0;
+}
+static void *waiter_forever(void *arg) {
+	(void)arg;
+	ready_f = 1;
+	ret_f = syscall(SYS_futex, &fut_e, 0 /*WAIT*/, 0, NULL, NULL, 0);
+	return 0;
+}
+ECL_EXPORT int V3ExpiredWaiterLeavesTheQueue(void) {
+	pthread_t te, tf;
+	if (pthread_create(&te, 0, waiter_expires, 0) != 0) return 0;
+	pthread_join(te, 0);
+	if (ret_e != -1) return 0;                   /* it timed out */
+	if (pthread_create(&tf, 0, waiter_forever, 0) != 0) return 0;
+	while (!ready_f) syscall(SYS_sched_yield);   /* F runs until it parks */
+	long w = syscall(SYS_futex, &fut_e, 1 /*WAKE*/, 1, NULL, NULL, 0);
+	if (w != 1) return 0;
+	pthread_join(tf, 0);                         /* F was the one woken */
+	return ret_f == 0;
+}
+
 /* ---- a thread exits while every other thread is in a timed wait ----
  * X (detached, so nobody joins it) waits for the flag main sets just before
  * it parks with a deadline, then exits. At X's exit the only other thread

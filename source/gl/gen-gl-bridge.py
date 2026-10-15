@@ -39,7 +39,7 @@ STRING_RETURNING = {"glGetString", "glGetStringi"}
 # it a guest function pointer to call on a host thread, with neither the
 # sandbox's ABI shim nor its stack: the wrapper is generated so the renderer
 # still links and still "installs" its logger, and the host quietly declines.
-HOST_IGNORES = {"glDebugMessageCallback"}
+HOST_IGNORES = {"glDebugMessageCallback", "glDebugMessageCallbackARB", "glDebugMessageCallbackKHR"}
 
 
 def parse_typedefs(header_text):
