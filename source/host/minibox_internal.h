@@ -372,6 +372,8 @@ void mb_tripguard_register(mb_block *b);
  * host thread entering the guest, and this thread is already in it. */
 typedef int (MB_GUEST_ABI *mb_guest_fault_fn)(uint64_t addr, uint64_t is_write);
 void mb_tripguard_set_guest_fault_handler(mb_guest_fault_fn fn);
+/* the same handler as a guest-entry thunk, for faults taken in host code */
+void mb_tripguard_set_guest_fault_entry(mb_guest_fault_fn fn);
 #ifndef _WIN32
 void mb_tripguard_ensure_altstack(void);  /* per-thread; see tripguard.c */
 #endif

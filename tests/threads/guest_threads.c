@@ -2,11 +2,13 @@
  * increment a shared counter under a mutex a fixed number of times, joins them,
  * and reports the total. Correct cooperative scheduling + futex-backed
  * pthread_mutex + join must yield exactly N*ITERS. */
+#define _POSIX_C_SOURCE 200809L  /* clock_gettime under -std=c11 */
 #include <emulibc.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <sys/mman.h>
+#include <time.h>
 
 #define NTHREADS 4
 #define ITERS 1000
@@ -134,6 +136,30 @@ ECL_EXPORT int GuestFaultHandler(uint64_t addr, uint64_t is_write) {
 
 /* 0 when right: the write lands, and the handler counted it in THIS thread's
  * thread local, and on its own held page */
+/* The same handler, for a fault taken in HOST code: a system call the host
+ * answers by writing into guest memory (clock_gettime's result), into a page
+ * the guest protected. The thread is outside the guest while the host runs,
+ * and the handler's own system call (mprotect) arrived with no context and
+ * ended the process (chimera issue 280). 0 when right: the call returns, the
+ * result is in the page, and the handler counted the fault once. */
+ECL_EXPORT uint64_t RunHostWriteFault(void) {
+	volatile uint8_t *page = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (page == MAP_FAILED) return 0xff;
+	page[0] = 1;
+	if (mprotect((void *)page, 4096, PROT_READ) != 0) return 0xfe;
+	const uint32_t before = t_faults;
+	g_watched = (uintptr_t)page;
+	struct timespec *ts = (struct timespec *)(uintptr_t)page;
+	const int r = clock_gettime(CLOCK_MONOTONIC, ts);   /* the host writes the page */
+	g_watched = 0;
+	uint64_t bad = 0;
+	if (r != 0) bad |= 1;
+	if (ts->tv_sec == 0 && ts->tv_nsec == 0) bad |= 2;
+	if (t_faults != before + 1) bad |= 4;
+	munmap((void *)page, 4096);
+	return bad;
+}
+
 ECL_EXPORT uint64_t RunGuestFault(void) {
 	/* volatile: the write must happen while the page is watched, not be
 	 * moved past the store that stops watching it */

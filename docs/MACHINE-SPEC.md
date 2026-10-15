@@ -352,6 +352,15 @@ itself fault on a tracked clean page - its own thread locals, held by an
 epoch - and that fault is served as any other; a fault it does not handle is
 the guest's death, as anywhere in guest code.
 
+The fault can also be taken by host code: a system call whose answer the host
+writes into guest memory (clock_gettime's result, a Vulkan command's output)
+into a page the guest protected. The thread is outside the guest then, and the
+handler is entered the way any call from the host is, through the guest-entry
+thunk, so that its own system calls (unprotecting the page) work. Before
+2026-10-15 it was called directly in that case too, and its first system call
+ended the process (Chimera issue 280). Not observable to a guest that handles
+its faults: it is now called where it used to kill the host.
+
 ## Answered instead of fatal (spec v2.2, additive)
 
 These calls used to stop the machine (section 7's "everything else" rule),

@@ -201,8 +201,11 @@ static bool tracked_status(uint8_t s) {
  * nonzero return means the guest changed the protection and the access is
  * retried. Faults on pages the guest never protected are not its business. */
 static mb_guest_fault_fn g_guest_fault;
+/* the same handler behind a guest-entry thunk: for a fault taken in HOST code */
+static mb_guest_fault_fn g_guest_fault_entered;
 
 void mb_tripguard_set_guest_fault_handler(mb_guest_fault_fn fn) { g_guest_fault = fn; }
+void mb_tripguard_set_guest_fault_entry(mb_guest_fault_fn fn) { g_guest_fault_entered = fn; }
 
 #ifdef MB_HAVE_FSBASE
 /* Is the instruction we are about to resume the guest's own? That is a property
@@ -306,8 +309,38 @@ static bool guest_protected(uintptr_t addr, bool write) {
 	return false;
 }
 
-static bool ask_guest(uintptr_t addr, bool write) {
+static bool ask_guest(uintptr_t addr, bool write, bool from_host_code) {
 	if (!g_guest_fault || !guest_protected(addr, write)) return false;
+	/* A fault in HOST code on a page the guest protected: host C writing guest
+	 * memory, inside a system call or a callback the guest made. The thread is
+	 * not in the guest then - the interop blob cleared its context slot on the
+	 * way out - so the guest's handler, which makes system calls of its own
+	 * (Xenia's unprotects the page), arrived at one with no context and the
+	 * process died in the blob (chimera issue 280: Max Payne 3 at frame 1247,
+	 * Windows, a Vulkan result written into a watched page). That call is
+	 * entered the way every call from the host is, through the guest-entry
+	 * thunk, which brings the context and the stacks for a call made from
+	 * inside a host call, and its %fs. A fault in guest code is already inside
+	 * and is called directly, as before. */
+	if (from_host_code && g_guest_fault_entered) {
+		const int phase = fault_phase();
+		fault_phase_set(MB_PHASE_GUEST);
+#ifndef _WIN32
+		sigset_t faults, was;
+		sigemptyset(&faults);
+		sigaddset(&faults, SIGSEGV);
+		sigaddset(&faults, SIGBUS);
+		sigaddset(&faults, SIGILL);
+		sigaddset(&faults, SIGFPE);
+		pthread_sigmask(SIG_UNBLOCK, &faults, &was);
+#endif
+		const bool handled = g_guest_fault_entered((uint64_t)addr, write ? 1 : 0) != 0;
+#ifndef _WIN32
+		pthread_sigmask(SIG_SETMASK, &was, NULL);
+#endif
+		fault_phase_set(phase);
+		return handled;
+	}
 	/* guest code runs from here: a fault it takes on a held page is served */
 	const int phase = fault_phase();
 	fault_phase_set(MB_PHASE_GUEST);
@@ -775,7 +808,7 @@ static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 	trail_stage(1);
 	bool tripped = write && trip(fault);
 	trail_stage(2);
-	bool asked = tripped ? false : ask_guest(fault, write);
+	bool asked = tripped ? false : ask_guest(fault, write, !rip_in_guest((uintptr_t)uc->uc_mcontext.gregs[REG_RIP]));
 	trail_stage(3);
 	bool rethrow = !tripped && !asked;
 	if (rethrow) {
@@ -1245,7 +1278,7 @@ static LONG veh_access_violation(EXCEPTION_POINTERS *ep, bool write, uintptr_t f
 	 * dirty tracking would protect it and trap on the refusal - so it is
 	 * reported, as the host being out of memory */
 	if (!oom && write && trip(fault)) return EXCEPTION_CONTINUE_EXECUTION;
-	if (!oom && ask_guest(fault, write)) return EXCEPTION_CONTINUE_EXECUTION;
+	if (!oom && ask_guest(fault, write, !rip_in_guest((uintptr_t)ep->ContextRecord->Rip))) return EXCEPTION_CONTINUE_EXECUTION;
 
 	/* Not miniBox's to handle. Say what was asked for and whether any block owns
 	 * the address - the difference between "the guest touched something it

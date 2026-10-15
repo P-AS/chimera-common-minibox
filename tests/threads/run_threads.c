@@ -42,6 +42,7 @@ int main(int argc, char **argv) {
 	run_fn RunTls = (run_fn)proc(h, "RunTls");
 	run_fn RunGuestFault = (run_fn)proc(h, "RunGuestFault");
 	run_fn RunGuestFaultDeath = (run_fn)proc(h, "RunGuestFaultDeath");
+	run_fn RunHostWriteFault = (run_fn)proc(h, "RunHostWriteFault");
 	wbx_deactivate_host(h, &r); wbx_seal(h, &r);
 	if (r.error_message[0]) { fprintf(stderr, "seal: %s\n", r.error_message); return 1; }
 	wbx_activate_host(h, &r);
@@ -62,6 +63,9 @@ int main(int argc, char **argv) {
 		const uint64_t gf = RunGuestFault();
 		printf("RunGuestFault -> %#llx (expect 0: the guest's fault handler runs as guest code, and may fault)\n", (unsigned long long)gf);
 		CHECK(gf == 0);
+		const uint64_t hf = RunHostWriteFault();
+		printf("RunHostWriteFault -> %#llx (expect 0: a fault taken in host code reaches the guest's handler, whose system call works)\n", (unsigned long long)hf);
+		CHECK(hf == 0);
 	}
 
 	/* determinism: identical results on repeat */

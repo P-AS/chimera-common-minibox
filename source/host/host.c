@@ -960,6 +960,7 @@ void mb_host_destroy(mb_host *h) {
 }
 
 uintptr_t mb_host_proc_addr_raw(mb_host *h, const char *name);
+uintptr_t mb_host_proc_addr(mb_host *h, const char *name);
 
 /* Spin sampler (MB_SAMPLE_SECS=N). A helper thread prints the active green
  * thread + guest rsp + stack top every N seconds. Locates non-syscall spins.
@@ -1014,6 +1015,9 @@ void mb_host_activate(mb_host *h) {
 	 * guest, so the host-to-guest adapter (a host thread entering) would
 	 * find no entry context to save. The guest ABI is spelled in the type. */
 	mb_tripguard_set_guest_fault_handler((mb_guest_fault_fn)mb_host_proc_addr_raw(h, "GuestFaultHandler"));
+	/* ...and entered through a thunk for a fault taken in HOST code (host C
+	 * writing a protected guest page), where the thread is not inside */
+	mb_tripguard_set_guest_fault_entry((mb_guest_fault_fn)mb_host_proc_addr(h, "GuestFaultHandler"));
 #ifndef _WIN32
 	if (getenv("MB_SAMPLE_SECS")) {
 		pthread_mutex_lock(&sample_lock);
