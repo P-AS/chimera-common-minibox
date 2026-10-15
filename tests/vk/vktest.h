@@ -41,6 +41,20 @@ struct vkt_result {
 	uint32_t pushed_inside; /* a pixel of the triangle drawn with a pushed uniform */
 	uint64_t pushed_hash;   /* every byte of that image */
 	uint32_t event_set;     /* 1: an event set by a command in the queue was then found set; 0: the device has no VK_KHR_synchronization2 */
+	uint32_t names_present; /* bit i: vkGetDeviceProcAddr answered either name of pair i (vkt_name_pairs) */
+};
+
+/* Commands with two names each, an extension's and a version's. The device
+ * has one when either name answers; the bridge must say the same as the
+ * driver, and answer both names alike. */
+static const char *const vkt_name_pairs[][2] = {
+	{"vkCmdBeginRenderingKHR", "vkCmdBeginRendering"},
+	{"vkCmdSetEvent2KHR", "vkCmdSetEvent2"},
+	{"vkCmdPipelineBarrier2KHR", "vkCmdPipelineBarrier2"},
+	{"vkCreateRenderPass2KHR", "vkCreateRenderPass2"},
+	{"vkCmdCopyBuffer2KHR", "vkCmdCopyBuffer2"},
+	{"vkCmdSetCullModeEXT", "vkCmdSetCullMode"},
+	{"vkTrimCommandPoolKHR", "vkTrimCommandPool"},
 };
 
 #define VKT_SIDE 64
@@ -537,30 +551,20 @@ static void vkt_run(vkt_lookup get, struct vkt_result *out, int through_bridge)
 		VKT(vkFreeMemory)(dev, ubo2_mem, NULL);
 		VKT(vkDestroyPipelineLayout)(dev, pushed_layout, NULL);
 		VKT(vkDestroyDescriptorSetLayout)(dev, pushed_set_layout, NULL);
-		if (through_bridge) {
-			/* the names a renderer on a 1.1 instance asks for by */
-			VKT_NEED(113, VKT(vkGetDeviceProcAddr)(dev, "vkCmdBeginRenderingKHR"));
-			VKT_NEED(114, VKT(vkGetDeviceProcAddr)(dev, "vkCmdEndRenderingKHR"));
-		}
 	}
-	if (through_bridge) {
-		/* A command has the name of each extension it came through and one
-		 * more since it joined a version. An extension the bridge offers is
-		 * asked for by its own names, and a name that answers nothing is
-		 * called all the same: every name of a command is that command. */
-		static const char *const same[][2] = {
-			{"vkCmdSetEvent2KHR", "vkCmdSetEvent2"},
-			{"vkCmdPipelineBarrier2KHR", "vkCmdPipelineBarrier2"},
-			{"vkCreateRenderPass2KHR", "vkCreateRenderPass2"},
-			{"vkCmdCopyBuffer2KHR", "vkCmdCopyBuffer2"},
-			{"vkCmdSetCullModeEXT", "vkCmdSetCullMode"},
-			{"vkTrimCommandPoolKHR", "vkTrimCommandPool"},
-		};
-		for (size_t i = 0; i < sizeof same / sizeof same[0]; i++) {
-			const PFN_vkVoidFunction other = VKT(vkGetDeviceProcAddr)(dev, same[i][0]);
-			VKT_NEED(115, other);
-			VKT_NEED(116, other == VKT(vkGetDeviceProcAddr)(dev, same[i][1]));
-		}
+	/* A command has the name of each extension it came through and one more
+	 * since it joined a version. Which the device has is the driver's to say:
+	 * a command it does not have answers nothing (the bridge used to answer
+	 * every name it knew, and a call was then refused). One it has answers
+	 * to every name through the bridge, with the same function, whichever
+	 * name the driver gave (chimera issue 268). */
+	for (size_t i = 0; i < sizeof vkt_name_pairs / sizeof vkt_name_pairs[0]; i++) {
+		const PFN_vkVoidFunction one = VKT(vkGetDeviceProcAddr)(dev, vkt_name_pairs[i][0]);
+		const PFN_vkVoidFunction two = VKT(vkGetDeviceProcAddr)(dev, vkt_name_pairs[i][1]);
+		if (one || two)
+			out->names_present |= 1u << i;
+		if (through_bridge)
+			VKT_NEED(116, one == two);
 	}
 	if (has_sync2) {
 		/* And one of them is called: a command in the queue sets an event,

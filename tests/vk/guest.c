@@ -42,6 +42,7 @@ ECL_EXPORT uint64_t Value(int which)
 	case 11: return g_result.pushed_hash;
 	case 12: return g_result.attach_hash;
 	case 13: return g_result.event_set;
+	case 14: return g_result.names_present;
 	default: return 0;
 	}
 }

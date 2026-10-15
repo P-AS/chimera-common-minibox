@@ -216,6 +216,14 @@ int main(int argc, char **argv)
 		EXPECT(value(9) == 0, "the bridge offers push descriptors where the device has none");
 	}
 
+	/* Which of the commands with two names the device has, as the driver
+	 * says and as the bridge says (vkt_name_pairs) */
+	fprintf(stderr, "direct : commands with two names present %02x; bridged %02x\n",
+		direct.names_present, (uint32_t)value(14));
+	EXPECT((uint32_t)value(14) == direct.names_present,
+	       "the bridge says the device has commands the driver does not (or not ones it does): %02x, driver %02x",
+	       (uint32_t)value(14), direct.names_present);
+
 	/* A command asked for by its extension's name, and called (issue 268 of
 	 * chimera): the run itself stops at step 126 when the event stays unset. */
 	if (direct.event_set)

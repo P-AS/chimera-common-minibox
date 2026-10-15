@@ -40,7 +40,11 @@ void chimera_vk_description(char *out, uint32_t size)
 
 /* ---- which function has this name ----------------------------------------
  *
- * A question about this half's own table; the host is not asked. */
+ * First a question about this half's own table. For a device, the host is
+ * then asked whether the driver really has the command: the table carries
+ * every command the bridge knows, and vkGetDeviceProcAddr must answer NULL
+ * for one the device does not have (a call to it was refused, and a
+ * renderer probing for an optional feature took the wrapper as a yes). */
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkb_g_vkGetInstanceProcAddr(VkInstance instance, const char *pName)
 {
@@ -51,7 +55,13 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkb_g_vkGetInstanceProcAddr(VkInstance 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkb_g_vkGetDeviceProcAddr(VkDevice device, const char *pName)
 {
 	(void)device;
-	return (PFN_vkVoidFunction)chimera_vk_lookup(pName);
+	void *fn = chimera_vk_lookup(pName);
+	if (!fn || !s_bridge)
+		return (PFN_vkVoidFunction)fn;
+	struct vkb_has_command_args a = { (uint64_t)(uintptr_t)pName, 0, 0 };
+	s_bridge(VKB_OP_HAS_COMMAND, (uint64_t)(uintptr_t)&a, 0, 0, 0, 0);
+	/* a host older than the question leaves it unanswered: as before */
+	return (PFN_vkVoidFunction)(a.answered && !a.present ? NULL : fn);
 }
 
 /* ---- mapped memory --------------------------------------------------------

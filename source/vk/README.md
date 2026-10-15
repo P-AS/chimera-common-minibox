@@ -95,6 +95,15 @@ or a group of devices, and every extension nobody has asked for.
   asked a Mesa driver for `vkCmdSetEvent2` on behalf of a program that had
   asked for Vulkan 1.2, had nothing to call, and the renderer waited for an
   event that was never set.
+- **A command the device lacks answers nothing** (2026-10-15, the owner's
+  decision). `vkGetDeviceProcAddr` first looks in the guest's table, then asks
+  the host (`VKB_OP_HAS_COMMAND`) whether the driver gave a function for the
+  command under any of its names, and answers NULL when it did not, as Vulkan
+  requires. It used to answer every name it knew: a call was then refused,
+  and a renderer that probes for an optional feature this way took the
+  answer for a yes. A host older than the question leaves it unanswered, and
+  the guest answers as before. The test compares, for seven commands with
+  two names, which the driver has directly and which the bridge says it has.
 - **No memory type is coherent.** A mapping is a buffer of the guest's own;
   `vkFlushMappedMemoryRanges` writes it out, `vkInvalidateMappedMemoryRanges`
   reads it back, and nothing else does. Every type is reported without

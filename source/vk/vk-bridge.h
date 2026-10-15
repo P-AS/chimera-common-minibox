@@ -68,7 +68,21 @@ enum {
 	 * (the guest has flushed nothing into it, and no queue was given work
 	 * since it was allocated) holds nothing, and the buffer is left as it
 	 * is. */
-	VKB_OP_MAP_ATTACH = 4
+	VKB_OP_MAP_ATTACH = 4,
+
+	/* args: struct vkb_has_command_args. Whether the device has a command:
+	 * the driver gave the host a function for it. The guest's table carries
+	 * every command the bridge knows, and vkGetDeviceProcAddr must answer
+	 * NULL for one the device does not have, or a renderer that probes for
+	 * an optional feature that way thinks it has it. A host older than this
+	 * op leaves `answered` 0, and the guest answers as it did before. */
+	VKB_OP_HAS_COMMAND = 5
+};
+
+struct vkb_has_command_args {
+	uint64_t name;      /* guest pointer to the command's name, as the renderer asked */
+	uint32_t answered;  /* set to 1 by a host that knows this op */
+	uint32_t present;   /* 1 when the device has it */
 };
 
 struct vkb_description_args {

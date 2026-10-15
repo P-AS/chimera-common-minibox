@@ -1211,6 +1211,31 @@ uintptr_t VKB_GUEST_ABI chimera_vk_host_dispatch(uintptr_t op, uintptr_t a, uint
 	return result;
 }
 
+/* VKB_OP_HAS_COMMAND: a command the host carries is there when the driver
+ * gave a function for it, under its name or one of its other names. One the
+ * host does not carry is the guest's own (vkGetDeviceProcAddr itself), and
+ * the guest had it in its table, so it is there. */
+static int has_command(struct vkb_has_command_args *args)
+{
+	const char *name = (const char *)(uintptr_t)args->name;
+	args->answered = 1;
+	args->present = 1;
+	if (!name)
+		return 1;
+	for (size_t i = 0; i < sizeof vkb_fn_names / sizeof vkb_fn_names[0]; i++) {
+		int match = strcmp(name, vkb_fn_names[i].name) == 0;
+		for (int k = 0; !match && k < VKB_OTHER_NAMES && vkb_fn_names[i].also[k]; k++)
+			match = strcmp(name, vkb_fn_names[i].also[k]) == 0;
+		if (!match)
+			continue;
+		const void *fn;
+		memcpy(&fn, (const char *)&vkb_fn + vkb_fn_names[i].offset, sizeof fn);
+		args->present = fn != NULL;
+		break;
+	}
+	return 1;
+}
+
 static uintptr_t dispatch_one(uintptr_t op, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e)
 {
 	(void)b; (void)c; (void)d; (void)e;
@@ -1227,6 +1252,8 @@ static uintptr_t dispatch_one(uintptr_t op, uintptr_t a, uintptr_t b, uintptr_t 
 	}
 	case VKB_OP_MAP_ATTACH:
 		return a ? (uintptr_t)map_attach((struct vkb_map_attach_args *)a) : 0;
+	case VKB_OP_HAS_COMMAND:
+		return a ? (uintptr_t)has_command((struct vkb_has_command_args *)a) : 0;
 	default:
 		break;
 	}
