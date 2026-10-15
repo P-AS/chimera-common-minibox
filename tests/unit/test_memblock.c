@@ -71,6 +71,42 @@ static void test_mmap_movable_bestfit(void) {
 	mb_block_free(b);
 }
 
+/* A length near 2^64 - a negative one a core worked out, passed on as it is -
+ * made start + size wrap, and the wrapped end passed the range check while the
+ * page count ran the loops far off the page arrays. */
+static void test_wrapped_length_is_refused(void) {
+	mb_block *b = fresh(0x10000);
+	mb_range whole = { b->addr.start, 0x10000 };
+	CHECK_EQ(mb_block_mmap_fixed(b, whole, MB_PROT_RW, true), 0);
+	mb_range wrap = { b->addr.start + 0x1000, (uintptr_t)0 - 0x1000 };
+	CHECK_EQ(mb_block_munmap(b, wrap), -EINVAL);
+	CHECK_EQ(mb_block_mprotect(b, wrap, MB_PROT_R), -EINVAL);
+	mb_range past = { b->addr.start + 0x2000, 0x10000 };   /* starts inside, ends past the block */
+	CHECK_EQ(mb_block_munmap(b, past), -EINVAL);
+	mb_range tail = { b->addr.start + 0xf000, 0x1000 };    /* the last page, exactly */
+	CHECK_EQ(mb_block_munmap(b, tail), 0);
+	CHECK(mb_block_maps_consistent(b));
+	mb_block_free(b);
+}
+
+/* Every slot given back can be handed out again. The free list's index stopped
+ * at 1024 entries and dropped every slot given back past that: they stayed
+ * mapped for the life of the process and were never reused. */
+static void test_snapshot_slots_come_back(void) {
+	enum { N = 3000 };
+	static uint8_t *slots[N];
+	for (int i = 0; i < N; i++) { slots[i] = mb_snap_alloc(); CHECK(slots[i] != NULL); }
+	for (int i = 0; i < N; i++) mb_snap_release(slots[i]);
+	size_t free_now = 0, mapped = 0;
+	mb_snap_counts(&free_now, &mapped);
+	CHECK_EQ(free_now, mapped);   /* all of them are back */
+	for (int i = 0; i < N; i++) slots[i] = mb_snap_alloc();
+	size_t mapped_again = 0;
+	mb_snap_counts(NULL, &mapped_again);
+	CHECK_EQ(mapped_again, mapped);   /* and a second round maps nothing new */
+	for (int i = 0; i < N; i++) mb_snap_release(slots[i]);
+}
+
 static void test_mprotect_free_enomem(void) {
 	mb_block *b = fresh(0x10000);
 	mb_range one = { b->addr.start + 0x2000, 0x1000 };  /* Free */
@@ -497,6 +533,8 @@ static void run_all(void) {
 	RUN(test_mmap_movable_bestfit);
 	RUN(test_mmap_placement_is_the_page_walks);
 	RUN(test_mprotect_free_enomem);
+	RUN(test_wrapped_length_is_refused);
+	RUN(test_snapshot_slots_come_back);
 	RUN(test_munmap_zeroes);
 	RUN(test_madvise_keeps_allocated);
 	RUN(test_mmap_fixed_overlap);

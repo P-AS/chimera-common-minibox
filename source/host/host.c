@@ -1240,13 +1240,19 @@ int mb_host_load_state(mb_host *h, mb_read_cb r, uintptr_t ud, char *errbuf, siz
 	if (h->context.dead) mb_threads_reset_active(h->threads);
 	int rc = -1;
 	uint8_t elfhash[32];
+	/* The state's break is the machine's only once its memory is: a state
+	 * refused below (another build's, another boot's) leaves both as they were.
+	 * Taken at once, a refused load handed the host a foreign break while the
+	 * guest's C library kept its own, and the next heap growth went wrong. */
+	uintptr_t brk = 0;
 	if (expect(r, ud, SAVE_START, sizeof(SAVE_START)-1)) { snprintf(errbuf, errlen, "bad start magic"); goto done; }
 	if (expect(r, ud, "FileSystem", 10) || expect(r, ud, "FileSystemEnd", 13)) { snprintf(errbuf, errlen, "bad fs magic"); goto done; }
-	if (r_all(r, ud, &h->program_break, sizeof(h->program_break))) goto done;
+	if (r_all(r, ud, &brk, sizeof(brk))) goto done;
 	if (expect(r, ud, "ElfLoader", 9)) { snprintf(errbuf, errlen, "bad elf magic"); goto done; }
 	if (r_all(r, ud, elfhash, 32)) goto done;
 	if (memcmp(elfhash, mb_elf_hash(h->elf), 32) != 0) { snprintf(errbuf, errlen, "ELF hash mismatch"); goto done; }
 	if (mb_block_load_state(h->block, r, ud) != 0) { snprintf(errbuf, errlen, "memory block load failed"); goto done; }
+	h->program_break = brk;
 	if (mb_threads_load(h->threads, &h->context, r, ud) != 0) { snprintf(errbuf, errlen, "thread set load failed"); goto done; }
 	if (expect(r, ud, SAVE_END, sizeof(SAVE_END)-1)) { snprintf(errbuf, errlen, "bad end magic"); goto done; }
 	rc = 0;
@@ -1340,11 +1346,14 @@ int mb_host_delta_apply(mb_host *h, mb_read_cb r, uintptr_t ud, char *errbuf, si
 	bool was_active = h->active; mb_host_activate(h);
 	int rc = -1;
 	uint8_t elfhash[32];
+	/* the delta's break is taken with its memory, as in mb_host_load_state */
+	uintptr_t brk = 0;
 	if (expect(r, ud, DELTA_START, sizeof(DELTA_START)-1)) { snprintf(errbuf, errlen, "bad delta magic"); goto done; }
-	if (r_all(r, ud, &h->program_break, sizeof(h->program_break))) goto done;
+	if (r_all(r, ud, &brk, sizeof(brk))) goto done;
 	if (r_all(r, ud, elfhash, 32)) goto done;
 	if (memcmp(elfhash, mb_elf_hash(h->elf), 32) != 0) { snprintf(errbuf, errlen, "ELF hash mismatch"); goto done; }
 	if (mb_block_delta_apply(h->block, r, ud) != 0) { snprintf(errbuf, errlen, "memory delta apply failed"); goto done; }
+	h->program_break = brk;
 	if (mb_threads_load(h->threads, &h->context, r, ud) != 0) { snprintf(errbuf, errlen, "thread set load failed"); goto done; }
 	if (expect(r, ud, SAVE_END, sizeof(SAVE_END)-1)) { snprintf(errbuf, errlen, "bad delta end magic"); goto done; }
 	/* the epoch is spent: it described the machine we have just left */

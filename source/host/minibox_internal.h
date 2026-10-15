@@ -582,6 +582,12 @@ size_t mb_fs_sysout_since(const mb_fs *fs, uint64_t mark, char *out, size_t cap)
 /* Internal helpers shared with tripguard (memblock.c). */
 mb_prot mb_page_native_prot(const mb_page *p);
 void    mb_page_maybe_snapshot(mb_page *p, uintptr_t mirror_addr);
+/* The pool of page-sized slots the copies above come from (baseline copies,
+ * hot-page shadows, Windows stack shadows). Safe in the fault handler. */
+uint8_t *mb_snap_alloc(void);
+void    mb_snap_release(uint8_t *p);
+/* for the tests: slots on the free list now, and slots ever mapped */
+void    mb_snap_counts(size_t *free_now, size_t *mapped);
 /* The plan's half of a write fault: this page is about to change, so if a
  * planned state still owes it, copy it first. Two words and a page copy, and
  * only while a plan is open. */

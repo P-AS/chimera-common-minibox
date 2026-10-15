@@ -131,35 +131,57 @@ static volatile int g_snap_lock;
 static void snap_lock(void) { while (__atomic_test_and_set(&g_snap_lock, __ATOMIC_ACQUIRE)) { } }
 static void snap_unlock(void) { __atomic_clear(&g_snap_lock, __ATOMIC_RELEASE); }
 
-static uint8_t *snap_alloc(void) {
+static size_t g_snap_mapped;       /* slots ever mapped, for the tests */
+
+/* Room in the free list's index for `need` slots; false when no mapping could
+ * be had. With the lock held. The index has to hold EVERY slot ever mapped,
+ * since all of them can be given back at once: it used to grow only when the
+ * list ran empty, which kept it at 1024, and every slot given back past that
+ * stayed mapped and was never handed out again - 76 MiB for one session that
+ * copied 20,000 pages, again at every reopen. */
+static bool snap_index_room(size_t need) {
+	if (need <= g_snap_free_cap) return true;
+	/* a mapping is the honest way to grow it: this can run in the handler */
+	size_t want = (g_snap_free_cap ? g_snap_free_cap * 2 : 1024);
+	while (want < need) want *= 2;
+	mb_range iin = { 0, want * sizeof(uint8_t *) }, igot;
+	if (mb_pal_map_anon(iin, MB_PROT_RW, &igot) != 0) return false;
+	uint8_t **ni = (uint8_t **)igot.start;
+	for (size_t i = 0; i < g_snap_free_count; i++) ni[i] = g_snap_free[i];
+	if (g_snap_free) { mb_range old = { (uintptr_t)g_snap_free, g_snap_free_cap * sizeof(uint8_t *) }; mb_pal_unmap_anon(old); }
+	g_snap_free = ni; g_snap_free_cap = want;
+	return true;
+}
+
+uint8_t *mb_snap_alloc(void) {
 	snap_lock();
 	if (g_snap_free_count == 0) {
+		if (!snap_index_room(g_snap_mapped + SNAP_CHUNK_PAGES)) { snap_unlock(); return NULL; }
 		mb_range in = { 0, SNAP_CHUNK_PAGES * MB_PAGESIZE }, got;
 		if (mb_pal_map_anon(in, MB_PROT_RW, &got) != 0) { snap_unlock(); return NULL; }
-		if (g_snap_free_cap < g_snap_free_count + SNAP_CHUNK_PAGES) {
-			/* the index itself may grow, and here we are outside the handler's
-			 * hot path often enough that a mapping is the honest way to do it */
-			size_t want = (g_snap_free_cap ? g_snap_free_cap * 2 : 1024);
-			while (want < g_snap_free_count + SNAP_CHUNK_PAGES) want *= 2;
-			mb_range iin = { 0, want * sizeof(uint8_t *) }, igot;
-			if (mb_pal_map_anon(iin, MB_PROT_RW, &igot) != 0) { snap_unlock(); return NULL; }
-			uint8_t **ni = (uint8_t **)igot.start;
-			for (size_t i = 0; i < g_snap_free_count; i++) ni[i] = g_snap_free[i];
-			if (g_snap_free) { mb_range old = { (uintptr_t)g_snap_free, g_snap_free_cap * sizeof(uint8_t *) }; mb_pal_unmap_anon(old); }
-			g_snap_free = ni; g_snap_free_cap = want;
-		}
 		for (size_t i = 0; i < SNAP_CHUNK_PAGES; i++)
 			g_snap_free[g_snap_free_count++] = (uint8_t *)(got.start + i * MB_PAGESIZE);
+		g_snap_mapped += SNAP_CHUNK_PAGES;
 	}
 	uint8_t *r = g_snap_free[--g_snap_free_count];
 	snap_unlock();
 	return r;
 }
 
-static void snap_release(uint8_t *p) {
+void mb_snap_release(uint8_t *p) {
 	if (!p) return;
 	snap_lock();
-	if (g_snap_free_count < g_snap_free_cap) g_snap_free[g_snap_free_count++] = p;
+	/* (the index holds every slot mapped, so this has room unless a mapping
+	 * for the index itself was refused) */
+	if (g_snap_free_count < g_snap_free_cap || snap_index_room(g_snap_free_count + 1))
+		g_snap_free[g_snap_free_count++] = p;
+	snap_unlock();
+}
+
+void mb_snap_counts(size_t *free_now, size_t *mapped) {
+	snap_lock();
+	if (free_now) *free_now = g_snap_free_count;
+	if (mapped) *mapped = g_snap_mapped;
 	snap_unlock();
 }
 
@@ -170,7 +192,7 @@ void mb_page_maybe_snapshot(mb_page *p, uintptr_t maddr) {
 		return;
 	}
 	if (p->snap_kind == MB_SNAP_NONE) {
-		p->snap_data = snap_alloc();
+		p->snap_data = mb_snap_alloc();
 		if (!p->snap_data) return;   /* out of room: leave it clean rather than crash */
 		memcpy(p->snap_data, (const void *)maddr, MB_PAGESIZE);
 		p->snap_kind = MB_SNAP_DATA;
@@ -299,7 +321,7 @@ static void note_status(mb_block *b, size_t i, uint8_t status) {
 	if (status == MB_ST_RWSTACK) { bits_set(b->stack_bits, i); return; }
 	if (bits_get(b->stack_bits, i)) {
 		bits_clr(b->stack_bits, i);
-		snap_release(b->pages[i].shadow);
+		mb_snap_release(b->pages[i].shadow);
 		b->pages[i].shadow = NULL;
 	}
 #endif
@@ -372,7 +394,7 @@ static void page_cool(mb_block *b, size_t i) {
 	if (!p->hot) return;
 	p->hot = false;
 	p->heat = 0;
-	snap_release(p->shadow);
+	mb_snap_release(p->shadow);
 	p->shadow = NULL;
 	bits_clr(b->hot_bits, i);
 	b->nhot--;
@@ -389,7 +411,7 @@ static void page_heat(mb_block *b, size_t i) {
 	if (p->hot || p->invisible || p->uncommitted || !p->dirty) return;
 	if (p->status != MB_ST_RW && p->status != MB_ST_RWX) return;
 	if (!bits_get(b->unheld_bits, i) || b->nhot >= HOT_MOST) return;
-	uint8_t *shadow = snap_alloc();
+	uint8_t *shadow = mb_snap_alloc();
 	if (!shadow) return;
 	memcpy(shadow, (const void *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)), MB_PAGESIZE);
 	p->shadow = shadow;
@@ -606,8 +628,8 @@ void mb_block_free(mb_block *b) {
 	mb_pal_unmap_handle(b->mirror);
 	mb_pal_close_handle(b->handle);
 	for (size_t i = 0; i < b->npages; i++) {
-		snap_release(b->pages[i].snap_data);
-		snap_release(b->pages[i].shadow);
+		mb_snap_release(b->pages[i].snap_data);
+		mb_snap_release(b->pages[i].shadow);
 	}
 	free(b->epoch_status);
 	free(b->epoch_bits);
@@ -709,8 +731,14 @@ static void run_close(mb_block *b, prot_run *run) {
 
 /* Returns page index start, or SIZE_MAX on EINVAL. */
 static size_t validate(mb_block *b, mb_range addr, size_t *pcount) {
-	if (addr.start < b->addr.start || mb_range_end(addr) > mb_range_end(b->addr)
-		|| addr.size == 0
+	/* Compared as lengths, never as ends: start + size wraps for a size near
+	 * 2^64 (a negative length a core worked out, which musl passes on as it
+	 * is), and a wrapped end passed every test here while the page count ran
+	 * the loops far off the page arrays - on Windows an access violation in
+	 * the host, not a guest death. */
+	if (addr.size == 0 || addr.start < b->addr.start
+		|| addr.start - b->addr.start > b->addr.size
+		|| addr.size > b->addr.size - (addr.start - b->addr.start)
 		|| addr.start != mb_align_down(addr.start) || addr.size != mb_align_down(addr.size))
 		return (size_t)-1;
 	*pcount = addr.size >> MB_PAGESHIFT;
@@ -905,7 +933,7 @@ static void get_stack_epoch(mb_block *b) {
 			/* No shadow means nothing has ever compared this page - it was
 			 * mapped since - so everything in it is owed. */
 			if (p->shadow && memcmp(live, p->shadow, MB_PAGESIZE) == 0) continue;
-			if (!p->shadow) p->shadow = snap_alloc();
+			if (!p->shadow) p->shadow = mb_snap_alloc();
 			if (p->shadow) memcpy(p->shadow, live, MB_PAGESIZE);
 			if (p->epoch_dirty) continue;
 			p->epoch_dirty = true;
@@ -1292,7 +1320,7 @@ static int seal_impl(mb_block *b) {
 		if (b->pages[i].dirty && !b->pages[i].invisible) {
 			page_cool(b, i);
 			set_dirty(b, i, false);
-			snap_release(b->pages[i].snap_data);
+			mb_snap_release(b->pages[i].snap_data);
 			b->pages[i].snap_data = NULL;
 			b->pages[i].snap_kind = MB_SNAP_NONE; /* live memory is the baseline */
 #ifdef _WIN32
