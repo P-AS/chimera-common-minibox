@@ -33,6 +33,11 @@ void chimera_vk_host_state_loaded(void);
 /* Destroy everything and let the loader go. */
 void chimera_vk_host_shutdown(void);
 
+/* Called with each command's opcode before the driver sees it (the bridge's
+ * own requests, below 100, included); NULL stops it. For a frontend's crash
+ * notes: a driver that crashes leaves its command last. */
+void chimera_vk_host_set_call_hook(void (*hook)(unsigned op));
+
 /* The device calls are landing on; "" before a guest has made one. */
 const char *chimera_vk_host_description(void);
 

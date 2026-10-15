@@ -1109,9 +1109,21 @@ static void stat_print(void)
 
 static uintptr_t dispatch_one(uintptr_t op, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e);
 
+/* Told every command before the driver is called, so a crash inside the
+ * driver leaves that command last in whatever the hook keeps (a frontend's
+ * flight recorder, read by its crash note). */
+static void (*s_call_hook)(unsigned op);
+
+void chimera_vk_host_set_call_hook(void (*hook)(unsigned op))
+{
+	s_call_hook = hook;
+}
+
 uintptr_t VKB_GUEST_ABI chimera_vk_host_dispatch(uintptr_t op, uintptr_t a, uintptr_t b,
                                                  uintptr_t c, uintptr_t d, uintptr_t e)
 {
+	if (s_call_hook)
+		s_call_hook((unsigned)op);
 	if (s_stats < 0) {
 		const char *asked = getenv("CHIMERA_VK_STATS");
 		s_stats = asked && asked[0] && asked[0] != '0';
