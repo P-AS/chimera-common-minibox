@@ -27,7 +27,6 @@ struct mb_host {
 	mb_layout layout;
 	mb_block *block;
 	bool active, sealed;
-	uint8_t *image; size_t image_len;
 	mb_context context;
 	mb_thunks *thunks;
 	mb_threads *threads;
@@ -819,22 +818,26 @@ static void run_proc_if_present(mb_host *h, const char *name) {
 	if (p) mb_call_guest_simple(p, &h->context);
 }
 
-/* mb_host_new's way out once the guest's ELF is loaded: everything it built,
- * given back in one place, so a field added to mb_host later cannot be leaked
- * by one refusal and freed by another. */
+/* mb_host_new's way out, from any point: everything it built, given back in
+ * one place, so a field added to mb_host later cannot be leaked by one refusal
+ * and freed by another. The fault handler is told first: it was pointed at
+ * this host's layout early, and a refusal that left it there sent the next
+ * fault into freed memory (the case chimera#127 fixed in mb_host_destroy). */
 static mb_host *host_new_unwind(mb_host *h) {
-	mb_block_deactivate(h->block); mb_block_free(h->block); mb_fs_free(h->fs);
+	mb_tripguard_forget_layout(&h->layout);
+	if (h->block) { mb_block_deactivate(h->block); mb_block_free(h->block); }
+	mb_fs_free(h->fs);
 	mb_elf_free(h->elf); mb_thunks_free(h->thunks); mb_threads_free(h->threads);
-	free(h->image); free(h);
+	free(h);
 	return NULL;
 }
 
 mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_name,
                      const mb_memory_layout_template *tpl, char *errbuf, size_t errlen) {
+	/* (the image is the caller's: nothing here keeps a copy of it - one used
+	 * to be kept for the whole session and never read, 100 to 330 MB on the
+	 * big cores) */
 	mb_host *h = (mb_host *)calloc(1, sizeof(mb_host));
-	h->image_len = image_len;
-	h->image = (uint8_t *)malloc(image_len);
-	memcpy(h->image, image, image_len);
 	h->thunks = mb_thunks_new();
 	h->threads = mb_threads_new();
 
@@ -854,12 +857,12 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 	 * stays 4 GiB aligned. */
 	if (all.start & 0xffffffffu) {
 		snprintf(errbuf, errlen, "HostMemoryLayout must start on a 4GiB boundary");
-		free(h->image); free(h); return NULL;
+		return host_new_unwind(h);
 	}
 
 	mb_tripguard_set_layout(&h->layout);
 	h->block = mb_block_new(all);
-	if (!h->block) { snprintf(errbuf, errlen, "failed to create memory block"); free(h->image); free(h); return NULL; }
+	if (!h->block) { snprintf(errbuf, errlen, "failed to create memory block"); return host_new_unwind(h); }
 	h->program_break = L->sbrk.start;
 	h->fs = mb_fs_new();
 	mb_context_init(&h->context, L->main_thread.start + L->main_thread.size,
@@ -872,8 +875,7 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 
 	if (mb_elf_load(image, image_len, module_name, L, h->block, &h->elf) != 0) {
 		snprintf(errbuf, errlen, "failed to load guest ELF");
-		mb_block_deactivate(h->block); mb_block_free(h->block); mb_fs_free(h->fs);
-		mb_thunks_free(h->thunks); mb_threads_free(h->threads); free(h->image); free(h); return NULL;
+		return host_new_unwind(h);
 	}
 
 	/* Decided before the guest runs a single instruction: a guest carrying
@@ -956,7 +958,7 @@ void mb_host_destroy(mb_host *h) {
 	if (h->active) mb_block_deactivate(h->block);
 	free(h->plan_head); free(h->plan_tail);
 	mb_block_free(h->block); mb_fs_free(h->fs); mb_elf_free(h->elf);
-	mb_thunks_free(h->thunks); mb_threads_free(h->threads); free(h->image); free(h);
+	mb_thunks_free(h->thunks); mb_threads_free(h->threads); free(h);
 }
 
 uintptr_t mb_host_proc_addr_raw(mb_host *h, const char *name);
