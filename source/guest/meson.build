@@ -44,10 +44,14 @@ waterbox_guest_ldflags = [
 
 # emulibc.o is a meson build artifact, compiled with the just-built musl-gcc.
 # Passing the musl-gcc custom_target as command[0] makes ninja build musl first.
+# Built by default, and musl with it: cores outside this tree link the kit, and
+# a plain build has to leave it ready for them. Meson 1.3 built it anyway,
+# because the guest tests use it; Meson 1.10 and later do not.
 waterbox_emulibc_ct = custom_target('emulibc.c.o',
   input: waterbox_emulibc_dir / 'emulibc.c',
   output: 'emulibc.c.o',
   command: [waterbox_musl_gcc, '-c', waterbox_guest_cflags, '-std=c11', '-o', '@OUTPUT@', '@INPUT@'],
+  build_by_default: true,
 )
 waterbox_emulibc_obj = waterbox_emulibc_ct
 
@@ -86,6 +90,7 @@ if waterbox_cpp_guest
     output: 'cxxglue.c.o',
     command: [waterbox_musl_gcc, '-c', waterbox_guest_cflags, '-std=c11', '-o', '@OUTPUT@', '@INPUT@'],
     depends: waterbox_libstdcxx,
+    build_by_default: true,   # and libstdc++ with it, as emulibc above
   )
 endif
 
