@@ -230,7 +230,10 @@ The guest issues a syscall as `call [0x35f00000080]` with the number in rax and
 SysV C argument order (rdi,rsi,rdx,rcx,r8,r9 - note arg4 is rcx, NOT r10 as in
 the kernel ABI; the guest treats rbx, r12-r15 and all vector registers as
 clobbered across the call). Return value in rax; errors are `-errno` with the
-error threshold at `-4096`.
+error threshold at `-4096`. Nothing of the host comes back in the other
+registers: rcx, rdx, rsi, rdi, r8-r11 and xmm0-15 read zero after the call
+(the same at the other two ways into the guest, section 9). Not a new version:
+those registers held host values before, which no movie can depend on.
 
 Implemented syscalls and their EXACT semantics:
 
@@ -309,6 +312,10 @@ save/load require no writable files mounted and the identical readonly file set.
   runs. This slot indirection is mandatory for any host pointer the guest keeps.
 - All boundary-crossing functions are SysV ABI, at most 6 integer/pointer args,
   no floats or by-value structs.
+- On entering a guest export, and on returning from a host callback, r10 and
+  xmm0-15 read zero (after a callback also rcx, rdx, rsi, rdi, r8, r9 and r11;
+  rax is the result). A guest that spills a register it never set - a varargs
+  prologue spills xmm0-7 - must not find a host address in it.
 - TLS: the guest's pthread_self reads [gs:0x18] slot 0 (Context.thread_area).
   The host installs a gs base (Windows: TEB SubSystemTib field; Linux:
   arch_prctl ARCH_SET_GS to a 4-word thread-local block, only if gs is

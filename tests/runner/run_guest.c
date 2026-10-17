@@ -672,6 +672,25 @@ int main(int argc, char **argv) {
 		CHECK(after_syscall == 0);
 		CHECK(after_extcall == 0);
 	}
+	/* nor in its xmm0-15. Before the entry case this side fills xmm0-5 (scratch
+	 * in both host ABIs) with ones, so the check does not rest on whatever the
+	 * host's own code happened to leave there. */
+	{
+		typedef uint64_t (MB_GUEST_ABI *u64_fn)(void);
+		const u64_fn entry = (u64_fn)proc(h, "EntryXmm");
+		__asm__ volatile("pcmpeqd %%xmm0, %%xmm0\n\tpcmpeqd %%xmm1, %%xmm1\n\tpcmpeqd %%xmm2, %%xmm2\n\t"
+		                 "pcmpeqd %%xmm3, %%xmm3\n\tpcmpeqd %%xmm4, %%xmm4\n\tpcmpeqd %%xmm5, %%xmm5"
+		                 ::: "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5");
+		uint64_t at_entry = entry();
+		uint64_t after_syscall = ((u64_fn)proc(h, "SyscallXmm"))();
+		uint64_t after_extcall = ((u64_fn)proc(h, "ExtcallXmm"))();
+		printf("run_guest: xmm0-15 seen by the guest on entry=%llx, after a syscall=%llx, "
+		       "after a callback=%llx\n", (unsigned long long)at_entry,
+		       (unsigned long long)after_syscall, (unsigned long long)after_extcall);
+		CHECK(at_entry == 0);
+		CHECK(after_syscall == 0);
+		CHECK(after_extcall == 0);
+	}
 	/* calls that used to stop the machine (spec v2.2): each must answer
 	 * and leave the machine alive. */
 	{

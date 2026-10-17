@@ -355,6 +355,60 @@ __asm__(
 	"\tpop %rbx\n"
 	"\tret\n");
 
+/* The same three boundaries for the vector registers: what the guest finds in
+ * xmm0-15 on entering an export, after a syscall, and after a host callback.
+ * Each reads the sixteen registers OR'ed together (0: all clear). The syscall
+ * and callback cases fill every register with ones first, so a host that
+ * leaves them alone fails as surely as one that leaves its own values there;
+ * the entry case relies on run_guest filling xmm0-5 before the call. The host
+ * used to leave its own values in them - a guest's varargs prologue spills
+ * xmm0-7, and a JVM in the box carried host heap addresses into its states
+ * that way (interop_bin.c). */
+#define FILL_XMM \
+	"\tpcmpeqd %xmm0, %xmm0\n\tpcmpeqd %xmm1, %xmm1\n\tpcmpeqd %xmm2, %xmm2\n\tpcmpeqd %xmm3, %xmm3\n" \
+	"\tpcmpeqd %xmm4, %xmm4\n\tpcmpeqd %xmm5, %xmm5\n\tpcmpeqd %xmm6, %xmm6\n\tpcmpeqd %xmm7, %xmm7\n" \
+	"\tpcmpeqd %xmm8, %xmm8\n\tpcmpeqd %xmm9, %xmm9\n\tpcmpeqd %xmm10, %xmm10\n\tpcmpeqd %xmm11, %xmm11\n" \
+	"\tpcmpeqd %xmm12, %xmm12\n\tpcmpeqd %xmm13, %xmm13\n\tpcmpeqd %xmm14, %xmm14\n\tpcmpeqd %xmm15, %xmm15\n"
+#define OR_XMM_INTO_RAX \
+	"\tpor %xmm1, %xmm0\n\tpor %xmm2, %xmm0\n\tpor %xmm3, %xmm0\n\tpor %xmm4, %xmm0\n" \
+	"\tpor %xmm5, %xmm0\n\tpor %xmm6, %xmm0\n\tpor %xmm7, %xmm0\n\tpor %xmm8, %xmm0\n" \
+	"\tpor %xmm9, %xmm0\n\tpor %xmm10, %xmm0\n\tpor %xmm11, %xmm0\n\tpor %xmm12, %xmm0\n" \
+	"\tpor %xmm13, %xmm0\n\tpor %xmm14, %xmm0\n\tpor %xmm15, %xmm0\n" \
+	"\tmovq %xmm0, %rax\n\tpsrldq $8, %xmm0\n\tmovq %xmm0, %rdx\n\tor %rdx, %rax\n"
+__asm__(
+	".text\n"
+	".globl EntryXmm\n.type EntryXmm,@function\n"
+	"EntryXmm:\n"
+	OR_XMM_INTO_RAX
+	"\tret\n"
+	".globl SyscallXmm\n.type SyscallXmm,@function\n"
+	"SyscallXmm:\n"
+	"\tpush %rbx\n"
+	FILL_XMM
+	"\txor %edi, %edi\n"
+	"\tmov $12, %eax\n"
+	"\tmovabs $0x35f00000080, %r10\n"
+	"\tcall *%r10\n"
+	OR_XMM_INTO_RAX
+	"\tpop %rbx\n"
+	"\tret\n"
+	".globl ExtcallXmm\n.type ExtcallXmm,@function\n"
+	"ExtcallXmm:\n"
+	"\tpush %rbx\n"
+	"\tmov g_log_cb(%rip), %rax\n"
+	"\ttest %rax, %rax\n"
+	"\tjz 1f\n"
+	FILL_XMM
+	"\txor %edi, %edi\n"
+	"\tcall *%rax\n"
+	OR_XMM_INTO_RAX
+	"\tpop %rbx\n"
+	"\tret\n"
+	"1:\n"
+	"\tmov $1, %eax\n"
+	"\tpop %rbx\n"
+	"\tret\n");
+
 /* Faults with rsp pointing into a guard page: a heap page is protected to
  * PROT_NONE, rsp is pointed into it, and ud2 faults. The death report must
  * complete without a nested fault - both stack readers check page
