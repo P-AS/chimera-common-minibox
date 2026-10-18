@@ -265,6 +265,113 @@ mb_guarded_escape:
 	xorl %eax, %eax
 	jmp .Llanding
 
+#ifndef _WIN32
+/* Linux: the guest's fault handler, run on the faulting thread's own stack.
+ *
+ * The signal handler used to call it itself, on the host's alternate signal
+ * stack, and a handler that gave way to another guest thread (RPCS3's waits
+ * for a flush) left its frames there for the next fault to build its own on
+ * (2026-10-18). Now the signal handler only points the interrupted thread
+ * here and returns: rsp is the thread's own, 128 bytes below where it was
+ * (the red zone of the code that faulted), rdi and rsi are the handler's
+ * arguments, and the rest of what this needs is in the thread's gs block
+ * (MB_TIB_FAULT_*), the one base that is this thread's whatever %fs holds.
+ * Every other register is the faulting code's, and all of them, the flags
+ * and the vector state are given back before the instruction runs again.
+ *
+ * Two copies of one body: the guest's (a fault in guest code; runs with the
+ * guest's %fs and counts as guest code to the fault handler) and the host's
+ * (a fault in host code; calls the guest-entry thunk). */
+	.macro FAULT_TRAMP name
+	.globl \name
+	.hidden \name
+	.type \name, @function
+	.p2align 4
+\name:
+	pushq %gs:0x28          /* R-8: the faulting rip, where `ret` goes */
+	pushq %gs:0x38          /* its rsi */
+	pushq %gs:0x30          /* its rdi */
+	pushq %gs:0x20          /* the handler */
+	pushfq
+	pushq %rax
+	pushq %rcx
+	pushq %rdx
+	pushq %rbx
+	pushq %rbp
+	pushq %r8
+	pushq %r9
+	pushq %r10
+	pushq %r11
+	pushq %r12
+	pushq %r13
+	pushq %r14
+	pushq %r15
+	movq %rsp, %rbx         /* the 14 words above; the handler at 112(%rbx) */
+	movq %rdi, %r12
+	movq %rsi, %r13
+	subq mb_xsave_size(%rip), %rsp
+	andq $-64, %rsp
+	movq mb_xsave_mask(%rip), %rax
+	testq %rax, %rax
+	jz 1f
+	movq %rax, %rdx
+	shrq $32, %rdx
+	xorl %ecx, %ecx         /* xrstor wants the header that xsave leaves alone zero */
+	movq %rcx, 512(%rsp)
+	movq %rcx, 520(%rsp)
+	movq %rcx, 528(%rsp)
+	movq %rcx, 536(%rsp)
+	movq %rcx, 544(%rsp)
+	movq %rcx, 552(%rsp)
+	movq %rcx, 560(%rsp)
+	movq %rcx, 568(%rsp)
+	xsave64 (%rsp)
+	jmp 2f
+1:	fxsave64 (%rsp)
+2:	movq %r12, %rdi
+	movq %r13, %rsi
+	cld
+	callq *112(%rbx)
+	testl %eax, %eax
+	jnz 3f
+	movq %r12, %gs:0x40     /* not the guest's: the retry is an unhandled fault */
+3:	movq mb_xsave_mask(%rip), %rax
+	testq %rax, %rax
+	jz 4f
+	movq %rax, %rdx
+	shrq $32, %rdx
+	xrstor64 (%rsp)
+	jmp 5f
+4:	fxrstor64 (%rsp)
+5:	movq %rbx, %rsp
+	popq %r15
+	popq %r14
+	popq %r13
+	popq %r12
+	popq %r11
+	popq %r10
+	popq %r9
+	popq %r8
+	popq %rbp
+	popq %rbx
+	popq %rdx
+	popq %rcx
+	popq %rax
+	popfq
+	movq 8(%rsp), %rdi      /* no flag may change from here */
+	movq 16(%rsp), %rsi
+	leaq 24(%rsp), %rsp
+	retq $128               /* to the faulting rip, rsp where it was */
+	.globl \name\()_end
+	.hidden \name\()_end
+\name\()_end:
+	.size \name, \name\()_end - \name
+	.endm
+
+	FAULT_TRAMP mb_fault_tramp_guest
+	FAULT_TRAMP mb_fault_tramp_host
+#endif
+
 #ifdef __ELF__
 	.section .note.GNU-stack,"",@progbits
 #endif

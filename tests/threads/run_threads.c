@@ -18,9 +18,9 @@ static intptr_t mem_read(uintptr_t ud,uint8_t*d,uintptr_t n){mb_t*m=(mb_t*)ud;ui
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "  FAIL %s:%d %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
 
-typedef int (*init_fn)(void);
-typedef uint64_t (*run_fn)(void);
-typedef uint64_t (*run1_fn)(uint64_t);
+typedef int (MB_GUEST_ABI *init_fn)(void);
+typedef uint64_t (MB_GUEST_ABI *run_fn)(void);
+typedef uint64_t (MB_GUEST_ABI *run1_fn)(uint64_t);
 static uintptr_t proc(mb_host *h, const char *n){mb_return r;wbx_get_proc_addr(h,n,&r);if(r.error_message[0]){fprintf(stderr,"proc %s:%s\n",n,r.error_message);exit(2);}return r.data;}
 
 int main(int argc, char **argv) {
@@ -43,6 +43,9 @@ int main(int argc, char **argv) {
 	run_fn RunGuestFault = (run_fn)proc(h, "RunGuestFault");
 	run_fn RunGuestFaultDeath = (run_fn)proc(h, "RunGuestFaultDeath");
 	run_fn RunHostWriteFault = (run_fn)proc(h, "RunHostWriteFault");
+	run_fn RunFaultYield = (run_fn)proc(h, "RunFaultYield");
+	run_fn RunFaultRegisters = (run_fn)proc(h, "RunFaultRegisters");
+	run_fn RunGuestFaultDeclined = (run_fn)proc(h, "RunGuestFaultDeclined");
 	wbx_deactivate_host(h, &r); wbx_seal(h, &r);
 	if (r.error_message[0]) { fprintf(stderr, "seal: %s\n", r.error_message); return 1; }
 	wbx_activate_host(h, &r);
@@ -66,6 +69,16 @@ int main(int argc, char **argv) {
 		const uint64_t hf = RunHostWriteFault();
 		printf("RunHostWriteFault -> %#llx (expect 0: a fault taken in host code reaches the guest's handler, whose system call works)\n", (unsigned long long)hf);
 		CHECK(hf == 0);
+		const uint64_t fy = RunFaultYield();
+		printf("RunFaultYield -> %#llx (expect 0: a handler that gives way to a thread that faults too; each runs on its own stack)\n", (unsigned long long)fy);
+		CHECK(fy == 0);
+		const uint64_t fr = RunFaultRegisters();
+		printf("RunFaultRegisters -> %#llx (expect 0: the faulting code's registers and flags are back after the handler)\n", (unsigned long long)fr);
+		CHECK(fr == 0);
+		/* a machine that died in one of these answered 0 as well */
+		char why[512];
+		wbx_get_death(h, why, sizeof why, &r);
+		CHECK(r.data == 0);
 	}
 
 	/* determinism: identical results on repeat */
@@ -105,6 +118,20 @@ int main(int argc, char **argv) {
 		wbx_deactivate_host(h, &r); wbx_load_state(h, mem_read, (uintptr_t)&st, &r); wbx_activate_host(h, &r);
 		CHECK(!r.error_message[0]);
 		CHECK(RunThreads() == after_save);   /* faults again, outside any handler */
+	}
+	/* A protected page the handler does not claim: the machine's death, as
+	 * with no handler at all, and the host lives on. */
+	{
+		RunGuestFaultDeclined();
+		char why[512];
+		wbx_get_death(h, why, sizeof why, &r);
+		printf("RunGuestFaultDeclined -> dead=%llu: %s\n", (unsigned long long)r.data, why);
+		CHECK(r.data == 1);
+		CHECK(strstr(why, "crashed") != NULL);
+		st.pos = 0;
+		wbx_deactivate_host(h, &r); wbx_load_state(h, mem_read, (uintptr_t)&st, &r); wbx_activate_host(h, &r);
+		CHECK(!r.error_message[0]);
+		CHECK(RunThreads() == after_save);
 	}
 
 	wbx_deactivate_host(h, &r); wbx_destroy_host(h, &r);

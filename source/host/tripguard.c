@@ -15,8 +15,6 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#else
-#include <signal.h>   /* ask_guest's mask, above the Linux half */
 #endif
 
 /* The block LIST changes only when a machine is created or destroyed, on the
@@ -27,12 +25,24 @@
 static mb_block *g_blocks[MAX_BLOCKS];
 static int g_nblocks = 0;
 
+/* The trampoline that runs the guest's fault handler for a fault in guest code
+ * (guarded.S, Linux) is the guest's too: it runs on the guest's stack with the
+ * guest's %fs, and a fault in it is one the guest took. */
+static bool in_guest_tramp(uintptr_t rip) {
+#ifndef _WIN32
+	return rip >= (uintptr_t)&mb_fault_tramp_guest && rip < (uintptr_t)&mb_fault_tramp_guest_end;
+#else
+	(void)rip;
+	return false;
+#endif
+}
+
 /* Whether an instruction is the guest's own: guest code lives in a registered
  * block, host code never does. */
 static bool code_in_guest(uintptr_t rip) {
 	for (int i = 0; i < g_nblocks; i++)
 		if (mb_range_contains(g_blocks[i]->addr, rip)) return true;
-	return false;
+	return in_guest_tramp(rip);
 }
 
 /* A fault the guest's own code took, with a machine to charge it to: that is a
@@ -123,9 +133,9 @@ static uintptr_t mirror_of(const mb_block *b, uintptr_t guest) {
  * phase as well as its depth, and a fault that arrives in a phase that may not
  * nest, or deeper than any guest handler has business going, is said once and
  * passed on. The shared code below sets the phase on both hosts. On Linux the
- * signal is blocked for the handler's duration except while the guest's own
- * handler runs (ask_guest unblocks it), so there too only a fault in the
- * guest phase is served, and any other is said and fatal.
+ * signal is blocked for the handler's duration and the guest's own handler
+ * runs after it, on the faulting thread's stack (send_to_guest), so there a
+ * fault inside the handler is always said and fatal.
  *
  * A guest that dies inside its own handler leaves every handler frame at once:
  * control goes to the escape, and the frames below never unwind. Whichever
@@ -145,14 +155,10 @@ enum { MB_PHASE_NONE = 0, MB_PHASE_TRACK, MB_PHASE_GUEST, MB_PHASE_REPORT };
 #ifndef _WIN32
 static __thread int g_fault_depth;
 static __thread int g_fault_phase;
-/* the guest's %fs when it faulted, sampled by the Linux handler on entry (0
- * when the fault was not in guest code, or on Windows) */
-static __thread uintptr_t g_guest_fs_at_fault;
 static int  fault_depth(void) { return g_fault_depth; }
 static void fault_depth_set(int d) { g_fault_depth = d; }
 static int  fault_phase(void) { return g_fault_phase; }
 static void fault_phase_set(int p) { g_fault_phase = p; }
-static uintptr_t guest_fs_sampled(void) { return g_guest_fs_at_fault; }
 #else
 static DWORD g_fault_tls = TLS_OUT_OF_INDEXES;   /* allocated in initialize(): depth << 8 | phase */
 static uintptr_t fault_word(void) { return (uintptr_t)TlsGetValue(g_fault_tls); }
@@ -219,7 +225,7 @@ __attribute__((no_stack_protector))
 static bool rip_in_guest(uintptr_t rip) {
 	for (int i = 0; i < g_nblocks; i++)
 		if (mb_range_contains(g_blocks[i]->addr, rip)) return true;
-	return false;
+	return in_guest_tramp(rip);
 }
 
 /* Testing hook, for hosts that do NOT drop the base: pretend one did, so the
@@ -309,6 +315,10 @@ static bool guest_protected(uintptr_t addr, bool write) {
 	return false;
 }
 
+#ifdef _WIN32
+/* Windows: the vectored handler runs on the faulting thread's own stack, so the
+ * guest's handler is called from it directly. (Linux points the thread at a
+ * trampoline instead: send_to_guest, below.) */
 static bool ask_guest(uintptr_t addr, bool write, bool from_host_code) {
 	if (!g_guest_fault || !guest_protected(addr, write)) return false;
 	/* A fault in HOST code on a page the guest protected: host C writing guest
@@ -325,48 +335,13 @@ static bool ask_guest(uintptr_t addr, bool write, bool from_host_code) {
 	if (from_host_code && g_guest_fault_entered) {
 		const int phase = fault_phase();
 		fault_phase_set(MB_PHASE_GUEST);
-#ifndef _WIN32
-		sigset_t faults, was;
-		sigemptyset(&faults);
-		sigaddset(&faults, SIGSEGV);
-		sigaddset(&faults, SIGBUS);
-		sigaddset(&faults, SIGILL);
-		sigaddset(&faults, SIGFPE);
-		pthread_sigmask(SIG_UNBLOCK, &faults, &was);
-#endif
 		const bool handled = g_guest_fault_entered((uint64_t)addr, write ? 1 : 0) != 0;
-#ifndef _WIN32
-		pthread_sigmask(SIG_SETMASK, &was, NULL);
-#endif
 		fault_phase_set(phase);
 		return handled;
 	}
 	/* guest code runs from here: a fault it takes on a held page is served */
 	const int phase = fault_phase();
 	fault_phase_set(MB_PHASE_GUEST);
-#ifndef _WIN32
-	/* ...and able to fault. The handler runs with every signal blocked, and a
-	 * fault while its own is blocked is not delivered: the kernel ends the
-	 * process. The guest's handler is guest code, which writes held pages -
-	 * its own thread locals, after an epoch has held them - and that write
-	 * has to be served like any other, as it is on Windows. So the signals a
-	 * guest instruction can raise are open while it runs (handler_inner lets
-	 * a fault in this phase nest), and shut again after.
-	 *
-	 * Opened BEFORE the guest's thread pointer goes in, and shut after the
-	 * host's is back: pthread_sigmask is host libc, and host libc under the
-	 * guest's %fs writes the guest's thread block. Its first call is bound
-	 * lazily, and glibc's resolver sets and clears its scope flag at %fs:0x1c
-	 * - on an x86-64 musl thread pointer, the high half of the main thread's
-	 * `next`, which the guest's next pthread_create followed to 0x720e130. */
-	sigset_t faults, was;
-	sigemptyset(&faults);
-	sigaddset(&faults, SIGSEGV);
-	sigaddset(&faults, SIGBUS);
-	sigaddset(&faults, SIGILL);
-	sigaddset(&faults, SIGFPE);
-	pthread_sigmask(SIG_UNBLOCK, &faults, &was);
-#endif
 #ifdef MB_HAVE_FSBASE
 	/* ...and with the guest's own thread pointer, when it owns %fs. The
 	 * handler put the host's back on entry, and guest code under it reads
@@ -384,12 +359,10 @@ static bool ask_guest(uintptr_t addr, bool write, bool from_host_code) {
 #ifdef MB_HAVE_FSBASE
 	if (swap) mb_wrfsbase(host_fs);
 #endif
-#ifndef _WIN32
-	pthread_sigmask(SIG_SETMASK, &was, NULL);
-#endif
 	fault_phase_set(phase);
 	return handled;
 }
+#endif
 
 /* Shared: handle a write fault at addr. Returns true if handled.
  *
@@ -649,7 +622,6 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
 	                                       ->uc_mcontext.gregs[REG_RIP]);
 	const uintptr_t fs_at_fault = guest_rip ? mb_rdfsbase() : 0;
 	if (guest_rip && mb_guest_ctx->host_fs) mb_wrfsbase(mb_guest_ctx->host_fs);
-	g_guest_fs_at_fault = fs_at_fault;   /* under the host's base: a host thread local */
 	const uintptr_t fault = (uintptr_t)info->si_addr;
 	const uintptr_t rip = (uintptr_t)((ucontext_t *)ucontext)->uc_mcontext.gregs[REG_RIP];
 	/* A %fs access with the base already lost is the repair, not a fault to
@@ -794,6 +766,80 @@ static void sigsafe_report_nested(uintptr_t inner_fault, uintptr_t inner_rip) {
 	(void)ignored;
 }
 
+/* What the fault trampoline (guarded.S) saves the vector state with: xsave's
+ * area for every feature the OS turned on, or fxsave's 512 bytes without it.
+ * AMX's tile data is left out of the mask: Linux makes it trap on first use,
+ * and code that never asked for it has none to keep. Set at initialize. */
+MB_HIDDEN uint64_t mb_xsave_size = 512;
+MB_HIDDEN uint64_t mb_xsave_mask = 0;
+
+static void xsave_measure(void) {
+	uint32_t a, b, c, d;
+	__asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
+	if (!(c & (1u << 27))) return;   /* no OSXSAVE: fxsave */
+	uint32_t lo, hi;
+	__asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+	__asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0xd), "c"(0));
+	if (b < 576) return;
+	mb_xsave_size = b;   /* every feature in XCR0, AMX's included: enough */
+	mb_xsave_mask = (((uint64_t)hi << 32) | lo) & ~((1ull << 17) | (1ull << 18));
+}
+
+/* A page the guest may write, as far as its own protection goes: one a frame
+ * on a guest thread's stack can be built in (an epoch may hold it; the write
+ * then trips as any other). */
+static bool guest_writable(uintptr_t addr) {
+	mb_block *b = owner_of(addr);
+	return b && tracked_status(b->pages[(addr - b->addr.start) >> MB_PAGESHIFT].status);
+}
+
+/* A fault on a page the guest protected, for the guest's own handler.
+ *
+ * Not called from here: this runs on the host's alternate signal stack, one
+ * per host thread, and a handler that gives way to another guest thread there
+ * (RPCS3's waits for a flush) left its frames on it, under the next fault's
+ * (2026-10-18). Instead the interrupted thread is pointed at a trampoline
+ * (guarded.S) that runs the handler on the thread's own stack once this has
+ * returned, and puts back every register before the instruction is retried.
+ * Below the faulting code's red zone; the trampoline's arguments that do not
+ * fit in the two registers it is handed go in this thread's gs block.
+ *
+ * A fault in guest code calls the handler directly, with the guest's %fs (the
+ * signal handler puts it back on the way out). A fault in host code - host C
+ * writing guest memory in a system call, chimera issue 280 - calls it through
+ * the guest-entry thunk, which brings the context, the stacks and the %fs.
+ *
+ * A handler that answers 0 leaves the address in the gs block, and the retry
+ * of the instruction finds it there: an unhandled fault, as with no handler.
+ * True when the thread was pointed at the trampoline. */
+static bool send_to_guest(ucontext_t *uc, uintptr_t addr, bool write, bool from_host_code) {
+	uintptr_t *tib = mb_thread_block();
+	const uintptr_t declined = tib[MB_TIB_FAULT_DECLINED];
+	tib[MB_TIB_FAULT_DECLINED] = 0;
+	if (declined == addr) return false;
+	if (!g_guest_fault || !guest_protected(addr, write)) return false;
+	const mb_guest_fault_fn fn = from_host_code && g_guest_fault_entered ? g_guest_fault_entered : g_guest_fault;
+	const uintptr_t sp = (uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
+	const uintptr_t top = sp - 128;
+	/* A guest stack must have room for the trampoline's frame, in pages the
+	 * guest may write: a fault on its own guard page (a stack that ran out)
+	 * is the guest's death, not a handler call on a stack with no room. */
+	if (!from_host_code) {
+		const uintptr_t frame = 18 * 8 + (uintptr_t)mb_xsave_size + 64 + 8 + 256;
+		for (uintptr_t a = (top - frame) & ~(uintptr_t)MB_PAGEMASK; a < top; a += MB_PAGESIZE)
+			if (!guest_writable(a)) return false;
+	}
+	tib[MB_TIB_FAULT_FN] = (uintptr_t)fn;
+	tib[MB_TIB_FAULT_RIP] = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+	tib[MB_TIB_FAULT_RDI] = (uintptr_t)uc->uc_mcontext.gregs[REG_RDI];
+	tib[MB_TIB_FAULT_RSI] = (uintptr_t)uc->uc_mcontext.gregs[REG_RSI];
+	uc->uc_mcontext.gregs[REG_RSP] = (greg_t)top;
+	uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)(from_host_code ? &mb_fault_tramp_host : &mb_fault_tramp_guest);
+	uc->uc_mcontext.gregs[REG_RDI] = (greg_t)addr;
+	uc->uc_mcontext.gregs[REG_RSI] = (greg_t)(write ? 1 : 0);
+	return true;
+}
+
 static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 	uintptr_t fault = (uintptr_t)info->si_addr;
 	ucontext_t *uc = (ucontext_t *)ucontext;
@@ -818,7 +864,7 @@ static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 	trail_stage(1);
 	bool tripped = write && trip(fault);
 	trail_stage(2);
-	bool asked = tripped ? false : ask_guest(fault, write, !rip_in_guest((uintptr_t)uc->uc_mcontext.gregs[REG_RIP]));
+	bool asked = tripped ? false : send_to_guest(uc, fault, write, !rip_in_guest((uintptr_t)uc->uc_mcontext.gregs[REG_RIP]));
 	trail_stage(3);
 	bool rethrow = !tripped && !asked;
 	if (rethrow) {
@@ -1025,6 +1071,7 @@ static void wrap_foreign_handlers(void) {
 
 static void initialize(void) {
 	trail_open();
+	xsave_measure();
 	mb_tripguard_ensure_altstack();
 	struct sigaction sa;
 	memset(&sa, 0, sizeof(sa));

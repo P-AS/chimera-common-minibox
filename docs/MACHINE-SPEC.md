@@ -377,11 +377,24 @@ fault at an address inside the block whose page the guest protected below what
 it could have (no-access, or read-only on a write). A nonzero return means the
 guest changed the protection and the access is retried; zero, or no export, is
 an unhandled fault as before. Faults on tracked clean pages (dirty-page
-tracking) and on free pages are never the guest's. The handler runs whatever
-the guest puts in it, so the host's alternate signal stack is 1 MiB. It may
-itself fault on a tracked clean page - its own thread locals, held by an
-epoch - and that fault is served as any other; a fault it does not handle is
-the guest's death, as anywhere in guest code.
+tracking) and on free pages are never the guest's. The handler runs on the
+faulting thread's own stack, below the 128-byte red zone of the code that
+faulted, and every register, the flags and the vector state of that code are
+given back before the access is retried. It may itself fault on a tracked
+clean page - its own thread locals, held by an epoch - and that fault is
+served as any other; a fault it does not handle is the guest's death, as
+anywhere in guest code. It may also make system calls that switch to another
+guest thread, which may fault and run the handler in turn.
+
+Windows calls the handler from its exception handler, which already runs on
+the faulting thread's stack. Linux used to call it from the SIGSEGV handler,
+on the host's alternate signal stack, and a handler that switched threads left
+its frames there for the next fault to overwrite (2026-10-18). Since then the
+signal handler points the thread at a trampoline in the host (guarded.S) and
+returns; the trampoline saves the registers and the vector state (xsave),
+calls the handler and restores them. A guest thread's stack needs room for
+that frame (the vector state is 512 bytes to a few KiB, by processor); a fault
+on a stack without it is the guest's death.
 
 The fault can also be taken by host code: a system call whose answer the host
 writes into guest memory (clock_gettime's result, a Vulkan command's output)

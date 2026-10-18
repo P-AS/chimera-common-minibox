@@ -70,8 +70,13 @@ static void init_interop_area(void) {
 
 #ifndef _WIN32
 /* Per-host-thread mini-TLS block reached via [gs:0x18] (index 3). Windows uses
- * the TEB's SubSystemTib field at gs:0x18 directly, so no setup is needed. */
-static __thread uintptr_t g_tib[4];
+ * the TEB's SubSystemTib field at gs:0x18 directly, so no setup is needed.
+ * Words 4 to 8 carry a fault to the guest's fault handler (MB_TIB_FAULT_*,
+ * tripguard.c): the trampoline that runs it reads them through %gs, the one
+ * base that is this thread's whichever %fs is loaded. */
+static __thread uintptr_t g_tib[16];
+
+uintptr_t *mb_thread_block(void) { return g_tib; }
 #endif
 
 
