@@ -670,10 +670,20 @@ def main():
     # such name of a command in the list answers, with the wrapper of the name
     # that is in the list. An extension is offered whole or not at all: a name
     # that came back empty here was called anyway (chimera issue 268).
+    # Two names of one command can both be in the list (vkCmdBeginRendering,
+    # and vkCmdBeginRenderingKHR added for issue 268): each has its opcode,
+    # but every name answers with the wrapper of the first one, so a renderer
+    # gets one function for the command whichever name it asks by, as from a
+    # driver. The host loads that entry under any of its names. A driver
+    # that answers both names showed the difference (NVIDIA; the bridge's
+    # test failed there at step 116, 2026-10-18).
+    first_of = {}
+    for op, name, target in live:
+        first_of.setdefault(target, name)
     rows = {}
     for op, name, target in live:
         prefix = "vkb_g_" if target in (GUEST_SPECIAL | GUEST_ONLY) else "vkb_w_"
-        rows[name] = prefix + (target if prefix == "vkb_g_" else name)
+        rows[name] = prefix + (target if prefix == "vkb_g_" else first_of[target])
     for other in sorted(set(reg.cmd_alias) | set(reg.commands)):
         if other in rows:
             continue
