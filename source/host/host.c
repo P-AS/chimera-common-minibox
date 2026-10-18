@@ -1166,7 +1166,7 @@ static int files_load_then_end(mb_host *h, mb_read_cb r, uintptr_t ud, char *err
 	if (r_all(r, ud, m, sizeof(m))) { snprintf(errbuf, errlen, "bad end magic"); return -1; }
 	if (memcmp(m, FILES_MAGIC, FILES_MAGIC_LEN) == 0) {
 		uint64_t entropy;
-		if (r_all(r, ud, &entropy, sizeof(entropy)) || mb_fs_load_handles(h->fs, r, ud) != 0) {
+		if (r_all(r, ud, &entropy, sizeof(entropy)) || mb_fs_load_handles(h->fs, r, ud) < 0) {
 			snprintf(errbuf, errlen, "open files load failed"); return -1;
 		}
 		h->getrandom_state = entropy;
@@ -1311,6 +1311,21 @@ static int expect(mb_read_cb r, uintptr_t ud, const char *magic, size_t n) {
 	return memcmp(buf, magic, n) == 0 ? 0 : -1;
 }
 
+/* A load that failed after it began replacing memory leaves a mix of two
+ * machines. MACHINE-SPEC says such a load poisons the instance, and now it
+ * does: the machine is dead until a state loads, as after a crash, so no
+ * caller plays on, records or stores it (2026-10-18). A refusal that left the
+ * machine as it was (another build's or another boot's state) does not. */
+static void poison_half_loaded(mb_host *h, const char *why) {
+	if (!h->block->load_touched) return;
+	h->context.dead = 1;
+	snprintf(h->death, sizeof h->death,
+	         "a state stopped loading half way (%s); the machine is a mix of two and runs nothing until a state loads",
+	         why);
+	mb_diag_banner("the guest died");
+	mb_diag("miniBox: %s\n", h->death);
+}
+
 int mb_host_load_state(mb_host *h, mb_read_cb r, uintptr_t ud, char *errbuf, size_t errlen) {
 	if (!h->sealed) { snprintf(errbuf, errlen, "Not sealed!"); return -1; }
 	bool was_active = h->active; mb_host_activate(h);
@@ -1318,6 +1333,7 @@ int mb_host_load_state(mb_host *h, mb_read_cb r, uintptr_t ud, char *errbuf, siz
 	 * thread, and a thread set only loads onto a machine on its first. The load
 	 * replaces every thread anyway. */
 	if (h->context.dead) mb_threads_reset_active(h->threads);
+	h->block->load_touched = false;   /* until the block says otherwise */
 	int rc = -1;
 	uint8_t elfhash[32];
 	/* The state's break is the machine's only once its memory is: a state
@@ -1340,6 +1356,7 @@ int mb_host_load_state(mb_host *h, mb_read_cb r, uintptr_t ud, char *errbuf, siz
 	h->context.dead = 0;
 	h->death[0] = '\0';
 done:
+	if (rc != 0) poison_half_loaded(h, errbuf);
 	if (!was_active) mb_host_deactivate(h);
 	return rc;
 }
@@ -1427,6 +1444,7 @@ done:
 int mb_host_delta_apply(mb_host *h, mb_read_cb r, uintptr_t ud, char *errbuf, size_t errlen) {
 	if (!h->sealed) { snprintf(errbuf, errlen, "Not sealed!"); return -1; }
 	bool was_active = h->active; mb_host_activate(h);
+	h->block->load_touched = false;   /* until the block says otherwise */
 	int rc = -1;
 	uint8_t elfhash[32];
 	/* the delta's break is taken with its memory, as in mb_host_load_state */
@@ -1443,6 +1461,7 @@ int mb_host_delta_apply(mb_host *h, mb_read_cb r, uintptr_t ud, char *errbuf, si
 	free(h->epoch_threads); h->epoch_threads = NULL; h->epoch_threads_len = 0;
 	rc = 0;
 done:
+	if (rc != 0) poison_half_loaded(h, errbuf);
 	if (!was_active) mb_host_deactivate(h);
 	return rc;
 }

@@ -203,6 +203,9 @@ typedef struct mb_block {
 	mb_range addr;       /* fixed guest address range */
 	mb_range mirror;     /* always-RW second mapping, OS-chosen */
 	bool sealed;
+	/* the last load or delta got as far as changing pages: when it failed,
+	 * the machine is a mix of two (mb_host_load_state poisons it) */
+	bool load_touched;
 	bool swapped_in;
 	bool said_protect_refused;   /* refresh_range told the log once */
 	bool active;

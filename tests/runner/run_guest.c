@@ -949,6 +949,58 @@ int main(int argc, char **argv) {
 		CHECK(!r.error_message[0]);
 		wbx_activate_host(h, &r);
 		CHECK(DiscRead4() == 0x8B8A8988u);           /* disc2, bytes 8..11 */
+		/* A state naming a file that is not mounted here (a disc renamed since):
+		 * it loads, leaving the open files as they are, as every state did
+		 * before they were recorded - refusing would come after the memory
+		 * was replaced. */
+		membuf good = {0};
+		wbx_deactivate_host(h, &r);
+		wbx_save_state(h, mem_write, (uintptr_t)&good, &r);  /* disc2 at 12 */
+		CHECK(!r.error_message[0]);
+		wbx_activate_host(h, &r);
+		CHECK(DiscRead4() == 0x8F8E8D8Cu);           /* disc2, bytes 12..15 */
+		membuf ren = { malloc(good.len), good.len, good.len, 0 };
+		memcpy(ren.buf, good.buf, good.len);
+		size_t rec = 0;
+		while (rec + 14 <= ren.len && memcmp(ren.buf + rec, "OpenFileTable1", 14) != 0) rec++;
+		size_t nm = rec;
+		while (nm + 5 <= ren.len && memcmp(ren.buf + nm, "disc2", 5) != 0) nm++;
+		CHECK(rec < nm && nm + 5 <= ren.len);
+		if (nm + 5 <= ren.len) ren.buf[nm + 4] = 'X';   /* "discX" */
+		wbx_deactivate_host(h, &r);
+		wbx_load_state(h, mem_read, (uintptr_t)&ren, &r);
+		CHECK(!r.error_message[0]);
+		wbx_activate_host(h, &r);
+		CHECK(DiscRead4() == 0x93929190u);           /* disc2, bytes 16..19: left as it was */
+		/* A state that stops loading half way, cut short inside its thread set,
+		 * after its memory went in: the machine is dead until a state loads.
+		 * One refused before any memory moved (another machine's hash) is not. */
+		size_t ts = 0;
+		while (ts + 14 <= good.len && memcmp(good.buf + ts, "GuestThreadSet", 14) != 0) ts++;
+		CHECK(ts + 20 <= good.len);
+		memreader cut = { good.buf, ts + 20, 0 };
+		char why[512];
+		wbx_deactivate_host(h, &r);
+		wbx_load_state(h, mem_reader, (uintptr_t)&cut, &r);
+		CHECK(r.error_message[0] != 0);
+		wbx_get_death(h, why, sizeof why, &r);
+		printf("run_guest: a state cut short in its thread set: dead=%llu: %s\n", (unsigned long long)r.data, why);
+		CHECK(r.data == 1 && strstr(why, "half way") != NULL);
+		good.pos = 0;
+		wbx_load_state(h, mem_read, (uintptr_t)&good, &r);
+		CHECK(!r.error_message[0]);
+		wbx_get_death(h, why, sizeof why, &r);
+		CHECK(r.data == 0);
+		ren.buf[60] ^= 0xFF;                          /* inside the ELF hash: refused up front */
+		ren.pos = 0;
+		wbx_load_state(h, mem_read, (uintptr_t)&ren, &r);
+		CHECK(r.error_message[0] != 0);
+		wbx_get_death(h, why, sizeof why, &r);
+		CHECK(r.data == 0);
+		wbx_activate_host(h, &r);
+		CHECK(DiscRead4() == 0x8F8E8D8Cu);           /* the good state's machine: disc2 at 12 */
+		free(good.buf);
+		free(ren.buf);
 		CHECK(DiscClose() == 0);
 		free(fst.buf);
 	}

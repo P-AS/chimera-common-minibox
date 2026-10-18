@@ -219,7 +219,8 @@ OpenFileTable1: magic "OpenFileTable1"; u64 the getrandom stream's state;
             position, u32 name length, the mounted file's name (2026-10-18).
             Deltas carry the same record after their thread set. A state or
             delta written before has no such record; it loads leaving the
-            open descriptors and the stream as they are. (The FileSystem
+            open descriptors and the stream as they are. So does one naming
+            a file that is not mounted (a disc renamed since). (The FileSystem
             section above is written empty by this host: the open files are
             here.)
 magic  "ˇsoHxoqɹǝʇɐMpǝʇɐʌᴉʇɔ∀"  (SAVE_END_MAGIC, upside-down "ActivatedWaterboxHost")
@@ -233,7 +234,10 @@ Load reconstructs each page from the (old_dirty, new_dirty) pair:
 Verification: ELF hash mismatch is a hard error; readonly-file hash and
 name/order mismatches are hard errors; block address mismatch is a hard error;
 block hash mismatch is a warning only (the reference does not fail on it - a
-known soft spot). A failed load poisons the instance.
+known soft spot). A load refused before any memory moved (the magics, the ELF
+hash, the block's hash and address) leaves the machine as it was; a load that
+fails after that has a mix of two machines, and poisons the instance: it is
+dead, as after a crash, until a state loads (2026-10-18).
 
 ## 7. Syscall surface (observable)
 

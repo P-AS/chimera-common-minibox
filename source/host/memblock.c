@@ -1749,6 +1749,7 @@ int mb_block_plan_finish(mb_block *b) {
 
 int mb_block_load_state(mb_block *b, mb_read_cb r, uintptr_t ud) {
 	if (!b->sealed) return -EINVAL;
+	b->load_touched = false;
 	/* A load replaces the machine the plan is describing, so the plan is
 	 * finished first - the caller is meant to have done that, and doing it here
 	 * as well is the difference between a stale state and a corrupt one. */
@@ -1813,6 +1814,7 @@ int mb_block_load_state(mb_block *b, mb_read_cb r, uintptr_t ud) {
 	 * now says, or writes to it go unrecorded. */
 	int rc = 0;
 	prot_run run = { 0, 0, false };
+	b->load_touched = true;   /* every refusal that leaves the machine as it was is above */
 	size_t i = 0;
 	while (i < b->npages) {
 		if ((i & 7) == 0 && i + 8 <= b->npages) {
@@ -2312,6 +2314,7 @@ done:
  * protection actually moved are told to the OS. */
 int mb_block_delta_apply(mb_block *b, mb_read_cb r, uintptr_t ud) {
 	if (!b->sealed) return -EINVAL;
+	b->load_touched = false;
 	char magic[sizeof(DELTA_MAGIC) - 1];
 	if (rd(r, ud, magic, sizeof(magic))) return -EIO;
 	if (memcmp(magic, DELTA_MAGIC, sizeof(magic)) != 0) return -EINVAL;
@@ -2328,6 +2331,7 @@ int mb_block_delta_apply(mb_block *b, mb_read_cb r, uintptr_t ud) {
 	 * tracker's word about it stays true. Hence the single exit. */
 	int rc = -EIO;
 	prot_run run = { 0, 0, false };
+	b->load_touched = true;   /* every refusal that leaves the machine as it was is above */
 	for (uint64_t k = 0; k < nstatus; k++) {
 		uint64_t idx = 0; uint8_t s = 0;
 		if (rd(r, ud, &idx, sizeof(idx)) || rd(r, ud, &s, 1)) goto done;

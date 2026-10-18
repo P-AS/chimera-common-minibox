@@ -303,8 +303,11 @@ static int read_all(mb_read_cb r, uintptr_t ud, void *d, size_t n) {
 	return 0;
 }
 
-/* The table mb_fs_save_handles wrote, in place of this one - all of it or,
- * when a file it names is not mounted or the record is not one, none of it. */
+/* The table mb_fs_save_handles wrote, in place of this one: 0. When a file it
+ * names is not mounted here (a disc renamed since, say), the table is left as
+ * it is, which is what every state did before 2026-10-18, and the answer is 1
+ * - refusing would come after the memory was already replaced. -1 when the
+ * record is not one. */
 int mb_fs_load_handles(mb_fs *fs, mb_read_cb r, uintptr_t ud) {
 	uint32_t n;
 	if (read_all(r, ud, &n, 4) || n > 65536) return -1;
@@ -319,8 +322,16 @@ int mb_fs_load_handles(mb_fs *fs, mb_read_cb r, uintptr_t ud) {
 		name[len] = '\0';
 		mounted_file *f = by_name(fs, name);
 		if (!f) {
-			fprintf(stderr, "miniBox: the state has \"%s\" open, which is not mounted\n", name);
-			free(hs); return -1;
+			fprintf(stderr, "miniBox: the state has \"%s\" open, which is not mounted here;"
+			        " the open files are left as they are\n", name);
+			free(hs);
+			/* the rest of the record still has to be read past */
+			for (k++; k < n; k++) {
+				int32_t fd2; uint64_t pos2; uint32_t len2;
+				if (read_all(r, ud, &fd2, 4) || read_all(r, ud, &pos2, 8) || read_all(r, ud, &len2, 4)
+					|| len2 >= sizeof(name) || read_all(r, ud, name, len2)) return -1;
+			}
+			return 1;
 		}
 		last = fd;
 		hs[k].fd = fd;
