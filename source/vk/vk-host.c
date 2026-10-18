@@ -43,30 +43,73 @@ static void *s_lib;
  * #307, #308), while standalone Dolphin started on the same driver, and the
  * thread is a difference between the two that a core cannot see. A thread
  * made here has no COM apartment and a stack of its own size. Creating an
- * object on one thread and using it on another is what Vulkan allows. */
+ * object on one thread and using it on another is what Vulkan allows.
+ *
+ * The thread is made once and kept for the life of the process, so anything
+ * a driver ties to the thread that created its instance (a hidden window,
+ * per-thread state) lives as long as the instance. The window thread waits
+ * for it while still answering messages other threads send to its windows:
+ * a driver or an overlay that sends one during creation would otherwise wait
+ * for a thread that waits for it. */
 #ifdef _WIN32
-struct own_thread_call {
-	void (*fn)(void *);
-	void *ctx;
-};
+static SRWLOCK s_own_lock = SRWLOCK_INIT;
+static HANDLE s_own_thread, s_own_go, s_own_done;
+static void (*s_own_fn)(void *);
+static void *s_own_ctx;
 
 static DWORD WINAPI own_thread_main(LPVOID p)
 {
-	struct own_thread_call *c = p;
-	c->fn(c->ctx);
+	(void)p;
+	for (;;) {
+		WaitForSingleObject(s_own_go, INFINITE);
+		s_own_fn(s_own_ctx);
+		SetEvent(s_own_done);
+	}
 	return 0;
+}
+
+/* waits for h, handling the messages other threads send to this thread's
+ * windows (only sent ones: posted messages, input among them, stay queued) */
+static void wait_answering(HANDLE h)
+{
+	for (;;) {
+		const DWORD r = MsgWaitForMultipleObjects(1, &h, FALSE, INFINITE, QS_SENDMESSAGE);
+		if (r == WAIT_OBJECT_0)
+			return;
+		if (r == WAIT_OBJECT_0 + 1) {
+			MSG m;
+			PeekMessageW(&m, NULL, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
+			continue;
+		}
+		WaitForSingleObject(h, INFINITE);
+		return;
+	}
 }
 
 static void on_own_thread(void (*fn)(void *), void *ctx)
 {
-	struct own_thread_call c = { fn, ctx };
-	HANDLE t = CreateThread(NULL, 8u << 20, own_thread_main, &c, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
-	if (!t) {
-		fn(ctx);
-		return;
+	AcquireSRWLockExclusive(&s_own_lock);
+	if (!s_own_thread) {
+		s_own_go = CreateEventW(NULL, FALSE, FALSE, NULL);
+		s_own_done = CreateEventW(NULL, FALSE, FALSE, NULL);
+		if (s_own_go && s_own_done)
+			s_own_thread = CreateThread(NULL, 8u << 20, own_thread_main, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+		if (!s_own_thread) {
+			if (s_own_go)
+				CloseHandle(s_own_go);
+			if (s_own_done)
+				CloseHandle(s_own_done);
+			s_own_go = s_own_done = NULL;
+			ReleaseSRWLockExclusive(&s_own_lock);
+			fn(ctx);
+			return;
+		}
 	}
-	WaitForSingleObject(t, INFINITE);
-	CloseHandle(t);
+	s_own_fn = fn;
+	s_own_ctx = ctx;
+	SetEvent(s_own_go);
+	wait_answering(s_own_done);
+	ReleaseSRWLockExclusive(&s_own_lock);
 }
 #else
 static void on_own_thread(void (*fn)(void *), void *ctx)
@@ -600,14 +643,26 @@ static VkPhysicalDevice choose_device(void)
 struct create_instance_call {
 	PFN_vkCreateInstance fn;
 	const VkInstanceCreateInfo *info;
-	VkInstance *instance;
 	VkResult r;
 };
 
+/* the instance, its functions and the device chosen, all on the one thread
+ * (above): enumerating adapters is driver work too */
 static void create_instance_there(void *p)
 {
 	struct create_instance_call *c = p;
-	c->r = c->fn(c->info, NULL, c->instance);
+	VkInstance instance = VK_NULL_HANDLE;
+	c->r = c->fn(c->info, NULL, &instance);
+	if (c->r < 0)
+		return;
+	s_instance = instance;
+	load_functions(0);
+	s_physical = choose_device();
+	if (!s_physical) {
+		vkb_fn.vkDestroyInstance(s_instance, NULL);
+		s_instance = VK_NULL_HANDLE;
+		c->r = VK_ERROR_INITIALIZATION_FAILED;
+	}
 }
 
 static uint64_t vkb_special_vkCreateInstance(uint64_t op, struct vkb_vkCreateInstance_args *a)
@@ -623,21 +678,12 @@ static uint64_t vkb_special_vkCreateInstance(uint64_t op, struct vkb_vkCreateIns
 	for (uint32_t i = 0; i < info.enabledExtensionCount; i++)
 		if (!ALLOWED_INSTANCE(info.ppEnabledExtensionNames[i]))
 			return (uint64_t)(int64_t)VK_ERROR_EXTENSION_NOT_PRESENT;
-	VkInstance instance = VK_NULL_HANDLE;
-	struct create_instance_call call = { create, &info, &instance, VK_ERROR_INITIALIZATION_FAILED };
+	struct create_instance_call call = { create, &info, VK_ERROR_INITIALIZATION_FAILED };
 	on_own_thread(create_instance_there, &call);
 	const VkResult r = call.r;
 	if (r < 0)
 		return (uint64_t)(int64_t)r;
-	s_instance = instance;
-	load_functions(0);
-	s_physical = choose_device();
-	if (!s_physical) {
-		vkb_fn.vkDestroyInstance(s_instance, NULL);
-		s_instance = VK_NULL_HANDLE;
-		return (uint64_t)(int64_t)VK_ERROR_INITIALIZATION_FAILED;
-	}
-	*a->pInstance = (VkInstance)vkb_new(VKB_K_Instance, (uint64_t)(uintptr_t)instance);
+	*a->pInstance = (VkInstance)vkb_new(VKB_K_Instance, (uint64_t)(uintptr_t)s_instance);
 	return (uint64_t)(int64_t)r;
 }
 
