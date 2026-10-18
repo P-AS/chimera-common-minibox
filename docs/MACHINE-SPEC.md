@@ -214,6 +214,14 @@ GuestFpuState1: magic "GuestFpuState1"; u16 x87 control word; u32 MXCSR
             record; it loads with 0x037F and 0x1F80.
 GuestThreadSet: magic "GuestThreadSet"; thread states; magic "GuestThreadSet"
             (single-thread implementations: active_tid must be 1)
+OpenFileTable1: magic "OpenFileTable1"; u64 the getrandom stream's state;
+            u32 count; per open descriptor, in descriptor order: i32 fd, u64
+            position, u32 name length, the mounted file's name (2026-10-18).
+            Deltas carry the same record after their thread set. A state or
+            delta written before has no such record; it loads leaving the
+            open descriptors and the stream as they are. (The FileSystem
+            section above is written empty by this host: the open files are
+            here.)
 magic  "ˇsoHxoqɹǝʇɐMpǝʇɐʌᴉʇɔ∀"  (SAVE_END_MAGIC, upside-down "ActivatedWaterboxHost")
 ```
 

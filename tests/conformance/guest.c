@@ -23,6 +23,7 @@
 #include <signal.h>
 #include <sys/resource.h>
 #include <sys/mman.h>
+#include <sys/random.h>
 
 /* Savestated state (plain globals -> .bss / savestated memory). */
 static uint64_t g_acc;
@@ -126,6 +127,14 @@ ECL_EXPORT void FpuSet(uint32_t fcw, uint32_t mxcsr) {
 }
 ECL_EXPORT uint64_t FpuAfterSyscall(void) { (void)getpid(); return fpu_read(); }
 ECL_EXPORT uint64_t FpuAfterCallback(void) { if (g_log_cb) g_log_cb(0); return fpu_read(); }
+
+/* Open files and the entropy stream are part of a state (2026-10-18): a disc
+ * read through a descriptor, which a disc swap closes and opens again */
+static int g_disc = -1;
+ECL_EXPORT int DiscOpen(int which) { g_disc = open(which ? "disc2" : "disc1", O_RDONLY); return g_disc; }
+ECL_EXPORT int DiscClose(void) { const int r = close(g_disc); g_disc = -1; return r; }
+ECL_EXPORT uint32_t DiscRead4(void) { uint32_t v = 0; return read(g_disc, &v, 4) == 4 ? v : 0xFFFFFFFFu; }
+ECL_EXPORT uint64_t Entropy(void) { uint64_t v = 0; return getrandom(&v, sizeof v, 0) == (ssize_t)sizeof v ? v : 0; }
 
 /* sysinfo, as the kit this guest was built with is answered: 1 for the
  * answer with mem_unit where it belongs (kit revision 1 or later), 0 for the

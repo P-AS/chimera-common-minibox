@@ -1141,6 +1141,45 @@ static int r_all(mb_read_cb r, uintptr_t ud, void *d, size_t n) {
 	return 0;
 }
 
+/* The open files and the getrandom stream (2026-10-18), after the thread set
+ * in states and deltas alike. Part of the machine: a guest that closed one
+ * disc and opened the next got the same descriptor, and a load to before the
+ * swap went on reading the second disc; a guest that reads on without seeking
+ * read from where the abandoned future had left the file. A delta carries it
+ * whole, like the thread set, and composing two keeps the later one's (it is
+ * in the tail that mb_host_delta_compose copies). A state or delta from
+ * before has no record; it loads leaving both as they are. */
+static int expect(mb_read_cb r, uintptr_t ud, const char *magic, size_t n);
+static const char FILES_MAGIC[] = "OpenFileTable1";
+#define FILES_MAGIC_LEN 14
+
+static int files_save(mb_host *h, mb_write_cb w, uintptr_t ud) {
+	if (w_all(w, ud, FILES_MAGIC, FILES_MAGIC_LEN)) return -1;
+	if (w_all(w, ud, &h->getrandom_state, sizeof(h->getrandom_state))) return -1;
+	return mb_fs_save_handles(h->fs, w, ud);
+}
+
+/* After the thread set: the record when there is one, then the end magic. */
+static int files_load_then_end(mb_host *h, mb_read_cb r, uintptr_t ud, char *errbuf, size_t errlen) {
+	_Static_assert(sizeof(SAVE_END) - 1 > FILES_MAGIC_LEN, "the end magic is told apart by its start");
+	uint8_t m[FILES_MAGIC_LEN];
+	if (r_all(r, ud, m, sizeof(m))) { snprintf(errbuf, errlen, "bad end magic"); return -1; }
+	if (memcmp(m, FILES_MAGIC, FILES_MAGIC_LEN) == 0) {
+		uint64_t entropy;
+		if (r_all(r, ud, &entropy, sizeof(entropy)) || mb_fs_load_handles(h->fs, r, ud) != 0) {
+			snprintf(errbuf, errlen, "open files load failed"); return -1;
+		}
+		h->getrandom_state = entropy;
+		if (expect(r, ud, SAVE_END, sizeof(SAVE_END)-1)) { snprintf(errbuf, errlen, "bad end magic"); return -1; }
+		return 0;
+	}
+	if (memcmp(m, SAVE_END, FILES_MAGIC_LEN) != 0
+		|| expect(r, ud, SAVE_END + FILES_MAGIC_LEN, sizeof(SAVE_END)-1-FILES_MAGIC_LEN)) {
+		snprintf(errbuf, errlen, "bad end magic"); return -1;
+	}
+	return 0;
+}
+
 int mb_host_save_state(mb_host *h, mb_write_cb w, uintptr_t ud, char *errbuf, size_t errlen) {
 	if (!h->sealed) { snprintf(errbuf, errlen, "Not sealed!"); return -1; }
 	bool was_active = h->active; mb_host_activate(h);
@@ -1154,6 +1193,7 @@ int mb_host_save_state(mb_host *h, mb_write_cb w, uintptr_t ud, char *errbuf, si
 	if (w_all(w, ud, "ElfLoader", 9) || w_all(w, ud, mb_elf_hash(h->elf), 32)) goto done;
 	if (mb_block_save_state(h->block, w, ud) != 0) goto done;
 	if (mb_threads_save(h->threads, &h->context, w, ud) != 0) goto done;
+	if (files_save(h, w, ud)) goto done;
 	if (w_all(w, ud, SAVE_END, sizeof(SAVE_END)-1)) goto done;
 	rc = 0;
 done:
@@ -1218,6 +1258,7 @@ static int host_state_surround(mb_host *h) {
 
 	mb_memsink tail = { h->plan_tail, room, 0 };
 	if (mb_threads_save(h->threads, &h->context, memsink_write, (uintptr_t)&tail) != 0) return -1;
+	if (files_save(h, memsink_write, (uintptr_t)&tail)) return -1;
 	if (w_all(memsink_write, (uintptr_t)&tail, SAVE_END, sizeof(SAVE_END) - 1)) return -1;
 	h->plan_tail_len = tail.n;
 	return 0;
@@ -1293,7 +1334,7 @@ int mb_host_load_state(mb_host *h, mb_read_cb r, uintptr_t ud, char *errbuf, siz
 	if (mb_block_load_state(h->block, r, ud) != 0) { snprintf(errbuf, errlen, "memory block load failed"); goto done; }
 	h->program_break = brk;
 	if (mb_threads_load(h->threads, &h->context, r, ud) != 0) { snprintf(errbuf, errlen, "thread set load failed"); goto done; }
-	if (expect(r, ud, SAVE_END, sizeof(SAVE_END)-1)) { snprintf(errbuf, errlen, "bad end magic"); goto done; }
+	if (files_load_then_end(h, r, ud, errbuf, errlen)) goto done;
 	rc = 0;
 	/* a whole machine that did exist: whatever killed the last one is gone */
 	h->context.dead = 0;
@@ -1344,7 +1385,9 @@ int mb_host_epoch_begin(mb_host *h, char *errbuf, size_t errlen) {
 	free(h->epoch_threads); h->epoch_threads = NULL; h->epoch_threads_len = 0;
 	{
 		hostbuf t = { 0 };
-		if (mb_threads_save(h->threads, &h->context, hostbuf_write, (uintptr_t)&t) != 0) {
+		/* the thread set and the open files, as a reverse delta will want them */
+		if (mb_threads_save(h->threads, &h->context, hostbuf_write, (uintptr_t)&t) != 0
+			|| files_save(h, hostbuf_write, (uintptr_t)&t) != 0) {
 			free(t.buf);
 			snprintf(errbuf, errlen, "thread set capture failed");
 			goto done;
@@ -1369,6 +1412,7 @@ int mb_host_delta_save(mb_host *h, bool forward, mb_write_cb w, uintptr_t ud, ch
 	if (mb_block_delta_save(h->block, forward, w, ud) != 0) { snprintf(errbuf, errlen, "memory delta failed"); goto done; }
 	if (forward) {
 		if (mb_threads_save(h->threads, &h->context, w, ud) != 0) goto done;
+		if (files_save(h, w, ud)) goto done;
 	} else {
 		if (w_all(w, ud, h->epoch_threads, h->epoch_threads_len)) goto done;
 	}
@@ -1394,7 +1438,7 @@ int mb_host_delta_apply(mb_host *h, mb_read_cb r, uintptr_t ud, char *errbuf, si
 	if (mb_block_delta_apply(h->block, r, ud) != 0) { snprintf(errbuf, errlen, "memory delta apply failed"); goto done; }
 	h->program_break = brk;
 	if (mb_threads_load(h->threads, &h->context, r, ud) != 0) { snprintf(errbuf, errlen, "thread set load failed"); goto done; }
-	if (expect(r, ud, SAVE_END, sizeof(SAVE_END)-1)) { snprintf(errbuf, errlen, "bad delta end magic"); goto done; }
+	if (files_load_then_end(h, r, ud, errbuf, errlen)) goto done;
 	/* the epoch is spent: it described the machine we have just left */
 	free(h->epoch_threads); h->epoch_threads = NULL; h->epoch_threads_len = 0;
 	rc = 0;

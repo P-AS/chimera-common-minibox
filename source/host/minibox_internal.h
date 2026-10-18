@@ -614,6 +614,9 @@ mb_sword mb_fs_truncate_name(mb_fs *fs, const char *name, mb_sword size);
 mb_sword mb_fs_truncate_fd(mb_fs *fs, int fd, mb_sword size);
 mb_sword mb_fs_sync_fd(mb_fs *fs, int fd);
 size_t   mb_fs_sysout_tail(const mb_fs *fs, char *out, size_t cap);
+/* the open descriptors, for states and deltas (fs.c, 2026-10-18) */
+int      mb_fs_save_handles(const mb_fs *fs, mb_write_cb w, uintptr_t ud);
+int      mb_fs_load_handles(mb_fs *fs, mb_read_cb r, uintptr_t ud);
 /* The core log: copy every guest stdout/stderr write into this file (UTF-8
  * path, appended), or stop with NULL. 0 or -errno. */
 int      mb_set_output_file(const char *path);

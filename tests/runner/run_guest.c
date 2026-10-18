@@ -129,6 +129,15 @@ static mb_host *make_host(const char *path, uint32_t seed) {
 	memreader mr = { (const uint8_t *)&seed, sizeof(seed), 0 };
 	wbx_mount_file(h, "seed", mem_reader, (uintptr_t)&mr, false, &r);
 	CHECK(!r.error_message[0]);
+	/* two read-only discs for the open-files checks: byte i of disc N is
+	 * N * 0x40 + i */
+	static uint8_t disc1[64], disc2[64];
+	for (int i = 0; i < 64; i++) { disc1[i] = (uint8_t)(0x40 + i); disc2[i] = (uint8_t)(0x80 + i); }
+	memreader d1 = { disc1, sizeof disc1, 0 }, d2 = { disc2, sizeof disc2, 0 };
+	wbx_mount_file(h, "disc1", mem_reader, (uintptr_t)&d1, false, &r);
+	CHECK(!r.error_message[0]);
+	wbx_mount_file(h, "disc2", mem_reader, (uintptr_t)&d2, false, &r);
+	CHECK(!r.error_message[0]);
 	return h;
 }
 
@@ -850,6 +859,98 @@ int main(int argc, char **argv) {
 		seen = ((u64_fn)proc(h, "FpuSeen"))();
 		CHECK((seen >> 32) == 0x037F && ((uint32_t)seen & ~FPU_FLAGS) == 0x1F80);
 		free(fs.buf);
+	}
+
+	/* Open files and the getrandom stream are in states and deltas
+	 * (2026-10-18). A descriptor closed after the save and opened again on
+	 * another file - a disc swap gets the same number - reads the first file
+	 * after the load, from where it was; the entropy stream goes on from where
+	 * it was. A state from before (no OpenFileTable1 record) loads leaving
+	 * both as they are. */
+	{
+		typedef int (MB_GUEST_ABI *disc_open_fn)(int);
+		typedef int (MB_GUEST_ABI *int_fn)(void);
+		typedef uint32_t (MB_GUEST_ABI *u32_fn)(void);
+		typedef uint64_t (MB_GUEST_ABI *u64_fn)(void);
+		disc_open_fn DiscOpen = (disc_open_fn)proc(h, "DiscOpen");
+		int_fn DiscClose = (int_fn)proc(h, "DiscClose");
+		u32_fn DiscRead4 = (u32_fn)proc(h, "DiscRead4");
+		u64_fn Entropy = (u64_fn)proc(h, "Entropy");
+		const int fd = DiscOpen(0);
+		CHECK(fd >= 3);
+		CHECK(DiscRead4() == 0x43424140u);           /* disc1, bytes 0..3 */
+		membuf fst = {0};
+		wbx_deactivate_host(h, &r);
+		wbx_save_state(h, mem_write, (uintptr_t)&fst, &r);
+		CHECK(!r.error_message[0]);
+		CHECK(state_contains(&fst, "OpenFileTable1"));
+		wbx_activate_host(h, &r);
+		const uint32_t next = DiscRead4();           /* bytes 4..7 */
+		const uint64_t e1 = Entropy();
+		CHECK(DiscClose() == 0);
+		CHECK(DiscOpen(1) == fd);                     /* the next disc, the same descriptor */
+		CHECK(DiscRead4() == 0x83828180u);
+		fst.pos = 0;
+		wbx_deactivate_host(h, &r);
+		wbx_load_state(h, mem_read, (uintptr_t)&fst, &r);
+		CHECK(!r.error_message[0]);
+		wbx_activate_host(h, &r);
+		const uint32_t again = DiscRead4();
+		printf("run_guest: after a load the descriptor reads %08x (it read %08x there before the swap)\n",
+		       (unsigned)again, (unsigned)next);
+		CHECK(next == 0x47464544u && again == next);
+		CHECK(Entropy() == e1);
+		/* a delta carries them too: from a state taken at the mark, the delta
+		 * lands on the machine after a swap, descriptor and stream included */
+		membuf mark = {0};
+		wbx_deactivate_host(h, &r);
+		wbx_save_state(h, mem_write, (uintptr_t)&mark, &r);
+		CHECK(!r.error_message[0]);
+		wbx_epoch_begin(h, &r);
+		CHECK(!r.error_message[0]);
+		wbx_activate_host(h, &r);
+		CHECK(DiscRead4() == 0x4B4A4948u);           /* disc1, bytes 8..11 */
+		(void)Entropy();
+		CHECK(DiscClose() == 0);
+		CHECK(DiscOpen(1) == fd);
+		CHECK(DiscRead4() == 0x83828180u);           /* disc2, bytes 0..3 */
+		membuf fwd = {0};
+		wbx_deactivate_host(h, &r);
+		wbx_save_delta(h, true, mem_write, (uintptr_t)&fwd, &r);
+		if (r.error_message[0]) printf("run_guest: save_delta: %s\n", r.error_message);
+		CHECK(!r.error_message[0]);
+		wbx_activate_host(h, &r);
+		const uint32_t then = DiscRead4();           /* disc2, bytes 4..7 */
+		const uint64_t e3 = Entropy();
+		mark.pos = 0;
+		wbx_deactivate_host(h, &r);
+		wbx_load_state(h, mem_read, (uintptr_t)&mark, &r);
+		CHECK(!r.error_message[0]);
+		wbx_load_delta(h, mem_read, (uintptr_t)&fwd, &r);
+		if (r.error_message[0]) printf("run_guest: load_delta: %s\n", r.error_message);
+		CHECK(!r.error_message[0]);
+		wbx_activate_host(h, &r);
+		CHECK(then == 0x87868584u && DiscRead4() == then);
+		CHECK(Entropy() == e3);
+		free(mark.buf);
+		free(fwd.buf);
+		/* the state with the record cut out, as an older build wrote it: it
+		 * loads, and the descriptor goes on as it is now (disc2 at 8) */
+		size_t at = 0;
+		while (at + 14 <= fst.len && memcmp(fst.buf + at, "OpenFileTable1", 14) != 0) at++;
+		size_t end = at;
+		while (end + 8 <= fst.len && memcmp(fst.buf + end, "\xcb\x87soHxoq", 8) != 0) end++;
+		CHECK(at < end && end + 8 <= fst.len);
+		memmove(fst.buf + at, fst.buf + end, fst.len - end);
+		fst.len -= end - at;
+		fst.pos = 0;
+		wbx_deactivate_host(h, &r);
+		wbx_load_state(h, mem_read, (uintptr_t)&fst, &r);
+		CHECK(!r.error_message[0]);
+		wbx_activate_host(h, &r);
+		CHECK(DiscRead4() == 0x8B8A8988u);           /* disc2, bytes 8..11 */
+		CHECK(DiscClose() == 0);
+		free(fst.buf);
 	}
 
 	wbx_deactivate_host(h, &r);

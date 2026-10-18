@@ -272,6 +272,67 @@ mb_sword mb_fs_close(mb_fs *fs, int fd) {
 	return 0;
 }
 
+/* The open files, for states and deltas (2026-10-18): which descriptor has
+ * which file open, and where in it. A descriptor names a file by its mount
+ * name, not its place in the list: the set of mounts at a load is the same
+ * (section 6's file-set rule) but need not be in the same order. Written in
+ * descriptor order, so the same machine writes the same bytes. */
+int mb_fs_save_handles(const mb_fs *fs, mb_write_cb w, uintptr_t ud) {
+	const uint32_t n = (uint32_t)fs->hn;
+	if (w(ud, (const uint8_t *)&n, 4) < 0) return -1;
+	int last = -1;
+	for (uint32_t k = 0; k < n; k++) {
+		const open_handle *next = NULL;
+		for (size_t i = 0; i < fs->hn; i++)
+			if (fs->hs[i].fd > last && (!next || fs->hs[i].fd < next->fd)) next = &fs->hs[i];
+		if (!next) return -1;
+		last = next->fd;
+		const char *name = fs->files[next->file].name;
+		const uint32_t len = (uint32_t)strlen(name);
+		const int32_t fd = next->fd;
+		const uint64_t pos = next->pos;
+		if (w(ud, (const uint8_t *)&fd, 4) < 0 || w(ud, (const uint8_t *)&pos, 8) < 0
+			|| w(ud, (const uint8_t *)&len, 4) < 0 || w(ud, (const uint8_t *)name, len) < 0) return -1;
+	}
+	return 0;
+}
+
+static int read_all(mb_read_cb r, uintptr_t ud, void *d, size_t n) {
+	uint8_t *p = (uint8_t *)d;
+	while (n) { intptr_t g = r(ud, p, n); if (g <= 0) return -1; p += g; n -= (size_t)g; }
+	return 0;
+}
+
+/* The table mb_fs_save_handles wrote, in place of this one - all of it or,
+ * when a file it names is not mounted or the record is not one, none of it. */
+int mb_fs_load_handles(mb_fs *fs, mb_read_cb r, uintptr_t ud) {
+	uint32_t n;
+	if (read_all(r, ud, &n, 4) || n > 65536) return -1;
+	open_handle *hs = (open_handle *)calloc(n ? n : 1, sizeof(open_handle));
+	if (!hs) return -1;
+	char name[4096];
+	int last = -1;
+	for (uint32_t k = 0; k < n; k++) {
+		int32_t fd; uint64_t pos; uint32_t len;
+		if (read_all(r, ud, &fd, 4) || read_all(r, ud, &pos, 8) || read_all(r, ud, &len, 4)
+			|| fd <= last || len >= sizeof(name) || read_all(r, ud, name, len)) { free(hs); return -1; }
+		name[len] = '\0';
+		mounted_file *f = by_name(fs, name);
+		if (!f) {
+			fprintf(stderr, "miniBox: the state has \"%s\" open, which is not mounted\n", name);
+			free(hs); return -1;
+		}
+		last = fd;
+		hs[k].fd = fd;
+		hs[k].file = (size_t)(f - fs->files);
+		/* a writable file may be shorter than when the state was taken */
+		hs[k].pos = pos < f->len ? (size_t)pos : f->len;
+	}
+	free(fs->hs);
+	fs->hs = hs; fs->hn = n; fs->hcap = n ? n : 1;
+	return 0;
+}
+
 mb_sword mb_fs_read(mb_fs *fs, int fd, uint8_t *buf, size_t n) {
 	open_handle *h = handle_by_fd(fs, fd);
 	if (!h) return -ENOENT;
