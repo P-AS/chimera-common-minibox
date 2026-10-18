@@ -176,7 +176,10 @@ def main():
             key_index = "(unsigned)index" if any(arg == "index" for _, arg in args) else "CHIMERA_GL_STRING_NO_INDEX"
             guest.append(f"""static const GLubyte *GLAD_API_PTR w_{name}({signature})
 {{
-	static char buffer[4096];
+	/* 64 KiB: an extension list is longer than 4 KiB on a desktop driver
+	 * (NVIDIA's runs to 10 KB and more), and was cut at 4095 bytes - the
+	 * extensions past the cut were simply not there (2026-10-18) */
+	static char buffer[65536];
 	const char *kept;
 	struct {struct} chimera_a;
 """ + "".join(f"\tchimera_a.{arg} = {arg};\n" for _, arg in args) + f"""	g_bridge(CHIMERA_GL_OP_{name}, (uint64_t)(uintptr_t)&chimera_a,

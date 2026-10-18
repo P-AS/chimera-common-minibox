@@ -83,12 +83,31 @@ static void no_room_is_null(void)
 	CHECK(strcmp(chimera_gl_string_keep(VENDOR, CHIMERA_GL_STRING_NO_INDEX, "NVIDIA Corporation"), "NVIDIA Corporation") == 0);
 }
 
+/* A desktop driver's extension list is longer than 4 KiB (NVIDIA's runs past
+ * 10 KB); the wrapper's buffer was 4096 bytes and cut it there, and the
+ * extensions after the cut were not there (2026-10-18). The wrapper's buffer
+ * is 64 KiB now; this holds the keeper behind it to a list that size. */
+static void a_long_extension_list_is_kept_whole(void)
+{
+	static char list[12000];
+	size_t at = 0;
+	for (int i = 0; at + 40 < sizeof list; i++)
+		at += (size_t)snprintf(list + at, sizeof list - at, "GL_EXT_extension_number_%d ", i);
+	const char *kept = chimera_gl_string_keep(EXTENSIONS, CHIMERA_GL_STRING_NO_INDEX, list);
+	CHECK(kept != NULL);
+	if (kept) {
+		CHECK_EQ(strlen(kept), strlen(list));
+		CHECK(strstr(kept, "GL_EXT_extension_number_300 ") != NULL);
+	}
+}
+
 static void run_all(void)
 {
 	RUN(two_answers_held_at_once_are_two_strings);
 	RUN(the_same_question_gets_the_same_pointer);
 	RUN(an_index_is_part_of_the_question);
 	RUN(another_drivers_answer_replaces_the_old_one);
+	RUN(a_long_extension_list_is_kept_whole);
 	RUN(no_room_is_null);
 }
 
