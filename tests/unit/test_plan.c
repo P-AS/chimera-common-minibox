@@ -83,6 +83,40 @@ static void test_plan_matches_save(void) {
 	mb_block_free(b);
 }
 
+/* A plan given less room than the state needs refuses before it holds or
+ * writes anything; given exactly the room, it plans what save writes. The
+ * host plans this way instead of asking the size first, which walked every
+ * page once more (2026-10-18). Invisible pages are dirty too, and are not in
+ * the count. */
+static void test_plan_within_its_room(void) {
+	mb_block *b = fresh_rw(0x80000);
+	mb_range inv = { b->addr.start + 0x70000, 0x4000 };   /* before the seal, as a guest marks it */
+	CHECK_EQ(mb_block_mark_invisible(b, inv), 0);
+	for (uintptr_t i = 0; i < 0x80000; i += 64) gp(b, i)[0] = (uint8_t)(i * 7 + 1);
+	CHECK_EQ(mb_block_seal(b), 0);
+	for (uintptr_t i = 0; i < 0x40000; i += MB_PAGESIZE) gp(b, i)[0] = (uint8_t)(i / MB_PAGESIZE);
+	gp(b, 0x70010)[0] = 9;                                 /* written, and in no state */
+	membuf st = {0};
+	CHECK_EQ(mb_block_save_state(b, membuf_write, (uintptr_t)&st), 0);
+	const size_t size = mb_block_state_size(b);
+	CHECK_EQ(size, st.len);
+	uint8_t *dest = (uint8_t *)calloc(1, size + 1);
+	CHECK(dest != NULL);
+	dest[0] = 0xEE;
+	CHECK_EQ(mb_block_state_plan_within(b, dest, size - 1), 0);
+	CHECK_EQ(dest[0], 0xEE);                 /* nothing written */
+	CHECK(!b->plan_active);                  /* nothing held */
+	const size_t at = mb_block_state_plan_within(b, dest, size);
+	CHECK(at != 0);
+	CHECK_EQ(at + mb_block_plan_count(b) * MB_PAGESIZE, size);
+	CHECK_EQ(mb_block_plan_finish(b), 0);
+	CHECK_EQ(memcmp(dest, st.buf, size), 0);
+	free(dest);
+	membuf_free(&st);
+	CHECK(mb_block_maps_consistent(b));
+	mb_block_free(b);
+}
+
 /* The machine runs while the state is being filled - which is the whole point -
  * and every page it writes must still come out as it was when the plan was
  * made, not as the writes left it. */
@@ -410,6 +444,7 @@ static void test_a_writer_waits_out_a_copy(void) {
 
 static void run_all(void) {
 	RUN(test_plan_matches_save);
+	RUN(test_plan_within_its_room);
 	RUN(test_writes_during_a_plan);
 	RUN(test_filled_by_a_thread);
 	RUN(test_a_planned_state_loads);

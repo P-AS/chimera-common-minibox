@@ -674,6 +674,8 @@ void    mb_block_plan_capture(mb_block *b, size_t pi);
  * a write to a page nobody has copied yet is copied by the fault handler. */
 size_t  mb_block_state_size(mb_block *b);
 size_t  mb_block_state_plan(mb_block *b, uint8_t *dest);
+/* the same, refusing (0) when the state would not fit in `capacity` bytes */
+size_t  mb_block_state_plan_within(mb_block *b, uint8_t *dest, size_t capacity);
 size_t  mb_block_plan_fill(mb_block *b, size_t from, size_t to);
 size_t  mb_block_plan_count(const mb_block *b);
 int     mb_block_plan_finish(mb_block *b);

@@ -1405,15 +1405,18 @@ size_t mb_host_state_size(mb_host *h) {
 
 size_t mb_host_state_plan(mb_host *h, uint8_t *dest, size_t size) {
 	if (!h->sealed || dest == NULL || h->plan_head == NULL) return 0;
+	if (size < h->plan_head_len + h->plan_tail_len) return 0;
 	bool was_active = h->active; mb_host_activate(h);
 	size_t total = 0;
-	const size_t block = mb_block_state_size(h->block);
-	if (block != 0 && h->plan_head_len + block + h->plan_tail_len <= size) {
-		memcpy(dest, h->plan_head, h->plan_head_len);
-		if (mb_block_state_plan(h->block, dest + h->plan_head_len) != 0) {
-			memcpy(dest + h->plan_head_len + block, h->plan_tail, h->plan_tail_len);
-			total = h->plan_head_len + block + h->plan_tail_len;
-		}
+	/* The block plans within the room left and says how much it took: asking
+	 * its size first walked every page once more (2026-10-18). */
+	memcpy(dest, h->plan_head, h->plan_head_len);
+	const size_t data_at = mb_block_state_plan_within(h->block, dest + h->plan_head_len,
+	                                                  size - h->plan_head_len - h->plan_tail_len);
+	if (data_at != 0) {
+		const size_t block = data_at + mb_block_plan_count(h->block) * MB_PAGESIZE;
+		memcpy(dest + h->plan_head_len + block, h->plan_tail, h->plan_tail_len);
+		total = h->plan_head_len + block + h->plan_tail_len;
 	}
 	if (!was_active) mb_host_deactivate(h);
 	return total;

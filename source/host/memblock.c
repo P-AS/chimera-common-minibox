@@ -1659,15 +1659,40 @@ static bool plan_can_hold(const mb_page *p) {
 	return p->status == MB_ST_RW || p->status == MB_ST_RWX || p->status == MB_ST_RWSTACK;
 }
 
+/* The next page from i on that a state carries (dirty and not invisible), or
+ * npages. Found through the dirty map, a byte a page read eight at a time, and
+ * not through the 40-byte page records: an anchor of the PS3 core's 5.2
+ * million pages walked those four times, 32 ms a walk (2026-10-18). Invisible
+ * pages are dirty too (mb_block_mark_invisible), so a dirty byte still asks
+ * its page. */
+static size_t next_state_page(const mb_block *b, size_t i) {
+	while (i < b->npages) {
+		if ((i & 7) == 0 && b->npages - i >= 8) {
+			uint64_t w;
+			memcpy(&w, b->dirty_map + i, 8);
+			if (w == 0) { i += 8; continue; }
+		}
+		if (b->dirty_map[i] && !b->pages[i].invisible) return i;
+		i++;
+	}
+	return b->npages;
+}
+
+static size_t count_state_pages(const mb_block *b) {
+	size_t n = 0;
+	for (size_t i = next_state_page(b, 0); i < b->npages; i = next_state_page(b, i + 1)) n++;
+	return n;
+}
+
+static size_t state_header_size(const mb_block *b) {
+	return sizeof(MAGIC) - 1 + 32 + sizeof(b->addr) + b->npages * 2;
+}
+
 /* What mb_block_save_state would write, to the byte. */
 static size_t state_size_impl(mb_block *b) {
 	if (!b->sealed) return 0;
 	get_stack_dirty(b);
-	size_t n = sizeof(MAGIC) - 1 + 32 + sizeof(b->addr) + b->npages * 2;
-	for (size_t i = 0; i < b->npages; i++) {
-		if (!b->pages[i].invisible && b->pages[i].dirty) n += MB_PAGESIZE;
-	}
-	return n;
+	return state_header_size(b) + count_state_pages(b) * MB_PAGESIZE;
 }
 
 size_t mb_block_state_size(mb_block *b) {
@@ -1680,14 +1705,12 @@ size_t mb_block_state_size(mb_block *b) {
 /* Writes everything but the page data into `dest`, holds the pages the data
  * will come from, and records where each one goes. Returns the offset page data
  * starts at, or 0 on failure. */
-static size_t state_plan_impl(mb_block *b, uint8_t *dest) {
+static size_t state_plan_impl(mb_block *b, uint8_t *dest, size_t capacity) {
 	if (!b->sealed || b->plan_active || dest == NULL) return 0;
 	get_stack_dirty(b);
 
-	size_t count = 0;
-	for (size_t i = 0; i < b->npages; i++) {
-		if (!b->pages[i].invisible && b->pages[i].dirty) count++;
-	}
+	const size_t count = count_state_pages(b);
+	if (state_header_size(b) + count * MB_PAGESIZE > capacity) return 0;
 	b->plan_list = (size_t *)calloc(count ? count : 1, sizeof(size_t));
 	if (!b->plan_list) return 0;
 
@@ -1709,8 +1732,7 @@ static size_t state_plan_impl(mb_block *b, uint8_t *dest) {
 	 * frame, is held for this one: its bytes have to stand still exactly like
 	 * everything else's, and it gets its heat back the moment the plan ends. */
 	size_t run_start = (size_t)-1, run_last = 0;
-	for (size_t i = 0; i < b->npages; i++) {
-		if (b->pages[i].invisible || !b->pages[i].dirty) continue;
+	for (size_t i = next_state_page(b, 0); i < b->npages; i = next_state_page(b, i + 1)) {
 		mb_page *p = &b->pages[i];
 		p->plan_slot = (uint32_t)b->plan_count;
 		b->plan_list[b->plan_count++] = i;
@@ -1748,12 +1770,14 @@ static size_t state_plan_impl(mb_block *b, uint8_t *dest) {
 	return at;
 }
 
-size_t mb_block_state_plan(mb_block *b, uint8_t *dest) {
+size_t mb_block_state_plan_within(mb_block *b, uint8_t *dest, size_t capacity) {
 	mb_block_track_lock(b);
-	const size_t r = state_plan_impl(b, dest);
+	const size_t r = state_plan_impl(b, dest, capacity);
 	mb_block_track_unlock(b);
 	return r;
 }
+
+size_t mb_block_state_plan(mb_block *b, uint8_t *dest) { return mb_block_state_plan_within(b, dest, SIZE_MAX); }
 
 /* Who copies a held page, and when it is safe to change it.
  *
