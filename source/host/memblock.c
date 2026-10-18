@@ -28,6 +28,16 @@ static uintptr_t mirror_addr(const mb_block *b, uintptr_t guest) {
 	return guest - b->addr.start + b->mirror.start;
 }
 
+/* A page's bytes for reading: the mirror, or zeros where nothing backs the
+ * page - a lazy block's page never used, or one in a piece given back to the
+ * OS (mb_pal_release). Committing such a page only to read it, as a state or
+ * a delta did, made the piece again the frame after it was given back. */
+static const uint8_t g_zero_page[MB_PAGESIZE];
+static const void *page_bytes(const mb_block *b, size_t i) {
+	if (b->pages[i].uncommitted) return g_zero_page;
+	return (const void *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT));
+}
+
 static mb_prot status_prot(uint8_t s) {
 	switch (s) {
 		case MB_ST_NONE: return MB_PROT_NONE;
@@ -579,12 +589,12 @@ static int ensure_committed(mb_block *b, size_t pstart, size_t pcount) {
 		size_t j = i + 1;
 		while (j < pstart + pcount && b->pages[j].uncommitted) j++;
 		mb_range m = { mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)), (j - i) << MB_PAGESHIFT };
-		if (mb_pal_commit(m, MB_PROT_RW) != 0) return -ENOMEM;
+		if (mb_pal_commit(b->handle, m, MB_PROT_RW) != 0) return -ENOMEM;
 		if (b->swapped_in) {
 			/* a mirror committed without its guest view stays uncommitted: the
 			 * next attempt commits the mirror again, which the OS allows */
 			mb_range g = { b->addr.start + (i << MB_PAGESHIFT), (j - i) << MB_PAGESHIFT };
-			if (mb_pal_commit(g, MB_PROT_NONE) != 0) return -ENOMEM;
+			if (mb_pal_commit(b->handle, g, MB_PROT_NONE) != 0) return -ENOMEM;
 		}
 		for (size_t k = i; k < j; k++) b->pages[k].uncommitted = false;
 		i = j;
@@ -615,7 +625,7 @@ void mb_block_activate(mb_block *b) {
 				size_t j = i + 1;
 				while (j < b->npages && !b->pages[j].uncommitted) j++;
 				mb_range g = { b->addr.start + (i << MB_PAGESHIFT), (j - i) << MB_PAGESHIFT };
-				mb_pal_commit(g, MB_PROT_NONE);
+				mb_pal_commit(b->handle, g, MB_PROT_NONE);
 				i = j;
 			}
 		}
@@ -636,7 +646,7 @@ void mb_block_free(mb_block *b) {
 	if (!b) return;
 	if (b->swapped_in) {
 		mb_tripguard_unregister(b);
-		mb_pal_unmap_handle(b->addr);
+		mb_pal_unmap_handle(b->handle, b->addr);
 		b->swapped_in = false;
 	}
 	/* The mirror is a VIEW of the block's section (mb_pal_map_handle), so it is
@@ -646,8 +656,9 @@ void mb_block_free(mb_block *b) {
 	 * with it the section and its commit) behind until, a few dozen reboots in,
 	 * the next block could not be created at all ("failed to create memory
 	 * block"). munmap takes either kind, which is why Linux never showed it. */
-	mb_pal_unmap_handle(b->mirror);
+	mb_pal_unmap_handle(b->handle, b->mirror);
 	mb_pal_close_handle(b->handle);
+	free(b->read_views);
 	for (size_t i = 0; i < b->npages; i++) {
 		mb_snap_release(b->pages[i].snap_data);
 		mb_snap_release(b->pages[i].shadow);
@@ -686,6 +697,24 @@ static void say_protect_refused(mb_block *b, mb_range r) {
 		b->said_protect_refused == 8 ? " - not said again for this block" : "");
 }
 
+/* A protection change over a run of the guest's view. In a block of pieces
+ * each piece is a view of its own, and Windows changes the protection of one
+ * view at a time, so the run is split at the pieces' edges. */
+static int protect_run(mb_block *b, mb_range r, mb_prot prot) {
+	const uintptr_t unit = b->handle.pieces ? mb_pal_release_unit(b->handle) : 0;
+	if (unit == 0) return mb_pal_protect(r, prot);
+	int bad = 0;
+	uintptr_t at = r.start;
+	const uintptr_t end = r.start + r.size;
+	while (at < end) {
+		const uintptr_t edge = b->addr.start + ((at - b->addr.start) / unit + 1) * unit;
+		mb_range part = { at, (edge < end ? edge : end) - at };
+		if (mb_pal_protect(part, prot) != 0) bad = -1;
+		at += part.size;
+	}
+	return bad;
+}
+
 static void refresh_range(mb_block *b, size_t pstart, size_t pcount) {
 	if (!b->swapped_in) return;
 	size_t i = pstart;
@@ -721,14 +750,14 @@ static void refresh_range(mb_block *b, size_t pstart, size_t pcount) {
 				size_t e = k + 1;
 				while (e < j && !b->pages[e].uncommitted) e++;
 				mb_range sub = { b->addr.start + (k << MB_PAGESHIFT), (e - k) << MB_PAGESHIFT };
-				if (mb_pal_protect(sub, prot) != 0) say_protect_refused(b, sub);
+				if (protect_run(b, sub, prot) != 0) say_protect_refused(b, sub);
 				for (size_t m = k; m < e; m++) note_prot(b, m, prot);
 				k = e;
 			}
 			i = j;
 			continue;
 		}
-		if (mb_pal_protect(r, prot) != 0) say_protect_refused(b, r);
+		if (protect_run(b, r, prot) != 0) say_protect_refused(b, r);
 		for (size_t k = i; k < j; k++) note_prot(b, k, prot);
 		i = j;
 	}
@@ -1089,11 +1118,32 @@ const void *mb_block_read_view(mb_block *b, uintptr_t addr, uintptr_t len) {
 			size_t j = i + 1;
 			while (j <= last && b->pages[j].uncommitted) j++;
 			mb_range m = { mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)), (j - i) << MB_PAGESHIFT };
-			if (mb_pal_commit(m, MB_PROT_RW) != 0) backed = false;
+			if (mb_pal_commit(b->handle, m, MB_PROT_RW) != 0) backed = false;
 			i = j;
 		}
 		mb_block_track_unlock(b);
 		if (!backed) return NULL;
+	}
+	if (b->handle.pieces) {
+		/* remembered, so no piece under it is given back */
+		const size_t first = (addr - b->addr.start) >> MB_PAGESHIFT;
+		const size_t end = ((addr - b->addr.start + len - 1) >> MB_PAGESHIFT) + 1;
+		bool known = false;
+		mb_block_track_lock(b);
+		for (size_t v = 0; v < b->nread_views && !known; v++)
+			known = b->read_views[v][0] <= first && end <= b->read_views[v][1];
+		if (!known) {
+			size_t (*grown)[2] = realloc(b->read_views, (b->nread_views + 1) * sizeof *grown);
+			if (grown) {
+				b->read_views = grown;
+				b->read_views[b->nread_views][0] = first;
+				b->read_views[b->nread_views][1] = end;
+				b->nread_views++;
+				known = true;
+			}
+		}
+		mb_block_track_unlock(b);
+		if (!known) return NULL;   /* not remembered: its pieces could go */
 	}
 	return (const void *)mirror_addr(b, addr);
 }
@@ -1257,9 +1307,39 @@ int mb_block_mprotect(mb_block *b, mb_range addr, mb_prot prot) {
 #define RELEASE_MIN_PAGES 16
 static void zero_run(mb_block *b, size_t start, size_t count) {
 	if (count == 0) return;
-	if (count >= RELEASE_MIN_PAGES
+	if (count >= RELEASE_MIN_PAGES && !b->handle.pieces
 		&& mb_pal_release(b->handle, start << MB_PAGESHIFT, count << MB_PAGESHIFT) == 0) return;
 	memset((void *)mirror_addr(b, b->addr.start + (start << MB_PAGESHIFT)), 0, count << MB_PAGESHIFT);
+}
+
+/* A block of pieces (pal_win.c) gives a piece back to the OS when every page
+ * in it is Free: unmapped from both views, its section closed, its pages
+ * uncommitted again and read as zeros (page_bytes) until the guest maps
+ * there and they are committed afresh. Not a piece with a hot page (it is
+ * compared through the mirror every frame) or an invisible one, nor one a
+ * read view points into (mb_block_read_view promised that pointer). Before,
+ * a lazy block kept every page the guest had ever used until it was freed
+ * whole (2026-10-18). */
+static void release_free_pieces(mb_block *b, size_t ps, size_t pcount) {
+	const size_t per = (size_t)(mb_pal_release_unit(b->handle) >> MB_PAGESHIFT);
+	if (per == 0 || pcount == 0) return;
+	for (size_t k = ps / per; k * per < ps + pcount && k * per < b->npages; k++) {
+		const size_t first = k * per, end = first + per < b->npages ? first + per : b->npages;
+		bool give = false;
+		for (size_t i = first; i < end; i++) {
+			const mb_page *p = &b->pages[i];
+			if (p->status != MB_ST_FREE || p->hot || p->invisible) { give = false; break; }
+			if (!p->uncommitted) give = true;
+		}
+		for (size_t v = 0; give && v < b->nread_views; v++)
+			if (b->read_views[v][0] < end && first < b->read_views[v][1]) give = false;
+		if (!give) continue;
+		if (mb_pal_release(b->handle, first << MB_PAGESHIFT, (end - first) << MB_PAGESHIFT) != 0) continue;
+		for (size_t i = first; i < end; i++) {
+			b->pages[i].uncommitted = true;
+			note_prot(b, i, MB_PROT_NONE);
+		}
+	}
 }
 
 /* zero + free (munmap) or keep-allocated (madvise dontneed) */
@@ -1289,7 +1369,10 @@ static void free_pages(mb_block *b, size_t ps, size_t pcount, bool advise_only) 
 	}
 	zero_run(b, run_start, run);
 	if (advise_only) refresh_range(b, ps, pcount);
-	else set_protections(b, ps, pcount, MB_ST_FREE);
+	else {
+		set_protections(b, ps, pcount, MB_ST_FREE);
+		if (b->handle.pieces) release_free_pieces(b, ps, pcount);
+	}
 }
 
 static int munmap_impl(mb_block *b, mb_range addr, bool advise_only) {
@@ -1615,9 +1698,7 @@ int mb_block_save_state(mb_block *b, mb_write_cb w, uintptr_t ud) {
 	if (wr(w, ud, b->dirty_map, b->npages)) return -EIO;
 	for (size_t i = 0; i < b->npages; i++) {
 		if (!b->pages[i].invisible && b->pages[i].dirty) {
-			uintptr_t maddr = mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT));
-			if (ensure_committed(b, i, 1) != 0) return -ENOMEM;
-			if (wr(w, ud, (const void *)maddr, MB_PAGESIZE)) return -EIO;
+			if (wr(w, ud, page_bytes(b, i), MB_PAGESIZE)) return -EIO;
 		}
 	}
 	return 0;
@@ -1736,14 +1817,12 @@ static size_t state_plan_impl(mb_block *b, uint8_t *dest, size_t capacity) {
 		mb_page *p = &b->pages[i];
 		p->plan_slot = (uint32_t)b->plan_count;
 		b->plan_list[b->plan_count++] = i;
-		/* a dirty page was written, so it is committed: this cannot be refused */
-		(void)ensure_committed(b, i, 1);
-		if (!plan_can_hold(p)) {
+		if (p->uncommitted || !plan_can_hold(p)) {
 			/* A page that cannot be held has to be copied now, while nothing
 			 * is running: there are a few hundred of them (two guest stacks)
-			 * against tens of thousands that can wait. */
-			memcpy(b->plan_dest + b->plan_data_at + (size_t)p->plan_slot * MB_PAGESIZE,
-			       (const void *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)), MB_PAGESIZE);
+			 * against tens of thousands that can wait. A page nothing backs
+			 * (one freed in a piece given back) is zeros, copied now too. */
+			memcpy(b->plan_dest + b->plan_data_at + (size_t)p->plan_slot * MB_PAGESIZE, page_bytes(b, i), MB_PAGESIZE);
 			continue;
 		}
 		__atomic_store_n(&p->plan_hold, 1, __ATOMIC_RELEASE);
@@ -2170,8 +2249,7 @@ int mb_block_delta_save(mb_block *b, bool forward, mb_write_cb w, uintptr_t ud) 
 			uint64_t idx = i;
 			if (!b->pages[i].dirty) idx |= DELTA_IDX_CLEAN;   /* given back: baseline again, and clean */
 			if (wr(w, ud, &idx, sizeof(idx))) return -EIO;
-			if (ensure_committed(b, i, 1) != 0) return -ENOMEM;   /* the live page, as the frame left it */
-			if (wr(w, ud, (const void *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)), MB_PAGESIZE)) return -EIO;
+			if (wr(w, ud, page_bytes(b, i), MB_PAGESIZE)) return -EIO;   /* the live page, as the frame left it */
 		}
 	}
 	mb_block_track_lock(b);
@@ -2194,7 +2272,7 @@ int mb_block_delta_save(mb_block *b, bool forward, mb_write_cb w, uintptr_t ud) 
 					if (b->pages[i].status == MB_ST_FREE) freed++;
 				}
 				if (b->pages[i].hot) hot++;
-				const uint64_t *p = (const uint64_t *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT));
+				const uint64_t *p = (const uint64_t *)page_bytes(b, i);
 				size_t k = 0;
 				while (k < MB_PAGESIZE / 8 && p[k] == 0) k++;
 				if (k == MB_PAGESIZE / 8) zero++;

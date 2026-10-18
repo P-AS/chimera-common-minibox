@@ -638,6 +638,76 @@ static void test_read_view_lazy(void) {
 }
 #endif
 
+#ifdef _WIN32
+static bool committed_at(uintptr_t addr) {
+	MEMORY_BASIC_INFORMATION mbi;
+	return VirtualQuery((void *)addr, &mbi, sizeof mbi) == sizeof mbi && mbi.State == MEM_COMMIT;
+}
+static int32_t count_write(uintptr_t ud, const uint8_t *d, uintptr_t n) { (void)d; *(size_t *)ud += n; return 0; }
+
+/* A lazy block is made of pieces (pal_win.c), and a piece whose pages are all
+ * freed goes back to Windows, in both views: before, nothing a lazy block had
+ * used was given back until the block was (2026-10-18). Its neighbours keep
+ * their bytes; a state reads its pages as zeros and leaves it given back; the
+ * guest can map there again; and a piece under a read view is kept. */
+static void test_pieces_go_back(void) {
+	mb_block *b = fresh(LAZY_SIZE);
+	CHECK(b->handle.pieces);
+	if (!b->handle.pieces) { mb_block_free(b); return; }
+	const uintptr_t piece = mb_pal_release_unit(b->handle);
+	CHECK_EQ(piece, (uintptr_t)16 << 20);
+	const size_t per = (size_t)(piece >> MB_PAGESHIFT);
+	mb_range four = { b->addr.start, 4 * piece };
+	CHECK_EQ(mb_block_mmap_fixed(b, four, MB_PROT_RW, true), 0);
+	/* backed at once, across the pieces' edges: one commit cannot cross from
+	 * one piece's view into the next, and a run that tried was refused and
+	 * left to be backed a page at a time on fault - the PS3 core's first
+	 * allocation was refused outright */
+	CHECK(!b->pages[3 * per + 5].uncommitted);
+	CHECK(committed_at(b->addr.start + 3 * piece + 0x5000) && committed_at(b->mirror.start + 3 * piece + 0x5000));
+	for (uintptr_t off = 0; off < 4 * piece; off += 0x1000) gp(b, off)[0] = 0x5a;
+	CHECK_EQ(mb_block_seal(b), 0);
+	CHECK(committed_at(b->mirror.start + piece) && committed_at(b->addr.start + piece));
+
+	/* the second piece, freed whole: given back */
+	mb_range second = { b->addr.start + piece, piece };
+	CHECK_EQ(mb_block_munmap(b, second), 0);
+	CHECK(b->pages[per].uncommitted && b->pages[2 * per - 1].uncommitted);
+	CHECK(!committed_at(b->mirror.start + piece));
+	CHECK(!committed_at(b->addr.start + piece));
+	CHECK_EQ(gp(b, 0)[0], 0x5a);
+	CHECK_EQ(gp(b, 2 * piece)[0], 0x5a);
+
+	/* a state carries its pages, as zeros, and does not take it back */
+	size_t bytes = 0;
+	CHECK_EQ(mb_block_save_state(b, count_write, (uintptr_t)&bytes), 0);
+	CHECK(bytes > per * MB_PAGESIZE);
+	CHECK(b->pages[per].uncommitted);
+	CHECK(!committed_at(b->mirror.start + piece));
+
+	/* half a piece freed is not given back, only zeroed */
+	mb_range half = { b->addr.start + 2 * piece, piece / 2 };
+	CHECK_EQ(mb_block_munmap(b, half), 0);
+	CHECK(!b->pages[2 * per].uncommitted);
+
+	/* a read view keeps the fourth piece */
+	CHECK(mb_block_read_view(b, b->addr.start + 3 * piece, 0x1000) != NULL);
+	mb_range fourth = { b->addr.start + 3 * piece, piece };
+	CHECK_EQ(mb_block_munmap(b, fourth), 0);
+	CHECK(!b->pages[3 * per].uncommitted);
+	CHECK(committed_at(b->mirror.start + 3 * piece));
+
+	/* mapped again, it is backed again, empty */
+	CHECK_EQ(mb_block_mmap_fixed(b, second, MB_PROT_RW, true), 0);
+	CHECK_EQ(gp(b, piece + 0x2000)[0], 0);
+	gp(b, piece + 0x2000)[0] = 0x77;
+	CHECK_EQ(gp(b, piece + 0x2000)[0], 0x77);
+	CHECK_EQ(((volatile uint8_t *)(b->mirror.start + piece + 0x2000))[0], 0x77);
+	CHECK(mb_block_maps_consistent(b));
+	mb_block_free(b);
+}
+#endif
+
 static void run_all(void) {
 	test_free_releases_the_mirror();
 	RUN(test_dirty_offset);
@@ -674,6 +744,7 @@ static void run_all(void) {
 		RUN(test_refused_again_is_out_of_memory);
 		RUN(test_refused_commit_stops_a_move);
 		RUN(test_read_view_lazy);
+		RUN(test_pieces_go_back);
 	}
 #endif
 }

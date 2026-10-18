@@ -49,7 +49,7 @@ int mb_pal_map_handle(mb_handle h, mb_range in, mb_range *out) {
 	return 0;
 }
 
-void mb_pal_unmap_handle(mb_range addr) { munmap((void *)addr.start, addr.size); }
+void mb_pal_unmap_handle(mb_handle h, mb_range addr) { (void)h; munmap((void *)addr.start, addr.size); }
 
 int mb_pal_map_anon(mb_range in, mb_prot prot, mb_range *out) {
 	int flags = MAP_PRIVATE | MAP_ANONYMOUS;
@@ -72,9 +72,12 @@ int mb_pal_protect(mb_range addr, mb_prot prot) {
 	return mprotect((void *)addr.start, addr.size, prot_to_native(prot));
 }
 
-int mb_pal_commit(mb_range addr, mb_prot prot) {
+int mb_pal_commit(mb_handle h, mb_range addr, mb_prot prot) {
+	(void)h;
 	return mprotect((void *)addr.start, addr.size, prot_to_native(prot));
 }
+
+uintptr_t mb_pal_release_unit(mb_handle h) { (void)h; return MB_PAGESIZE; }
 
 int mb_pal_release(mb_handle h, uintptr_t offset, uintptr_t len) {
 	return fallocate((int)h.h, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)offset, (off_t)len);

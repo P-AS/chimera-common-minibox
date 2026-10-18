@@ -86,27 +86,37 @@ typedef enum { MB_PROT_NONE, MB_PROT_R, MB_PROT_RW, MB_PROT_RX, MB_PROT_RWX,
 
 /* ---- PAL (pal_linux.c / pal_win.c): thin wrappers over the OS. Ranges aligned. ---- */
 typedef struct {
-	uintptr_t h;   /* memfd (Linux) or file mapping HANDLE (Windows) */
+	uintptr_t h;   /* memfd (Linux), file mapping HANDLE (Windows), or the
+	                  pieces of a lazy Windows block (pal_win.c) */
 	bool lazy;     /* Windows, blocks over 4 GiB: the section is reserved, not
 	                  committed; memblock commits page runs before first use */
+	bool pieces;   /* a lazy Windows block made of a section per piece
+	                  (mb_pal_release_unit bytes), each of which can go back to
+	                  the OS whole: a view of one section cannot give a page
+	                  back (2026-10-18) */
 } mb_handle;
 int      mb_pal_open_handle(uintptr_t size, mb_handle *out);   /* 0 ok */
 void     mb_pal_close_handle(mb_handle h);
 /* map_handle: start==0 -> OS chooses; else fixed. Returns actual range, no access. */
 int      mb_pal_map_handle(mb_handle h, mb_range in, mb_range *out);
-void     mb_pal_unmap_handle(mb_range addr);
+void     mb_pal_unmap_handle(mb_handle h, mb_range addr);
 int      mb_pal_map_anon(mb_range in, mb_prot prot, mb_range *out);
 void     mb_pal_unmap_anon(mb_range addr);
 int      mb_pal_protect(mb_range addr, mb_prot prot);          /* 0 ok */
 /* Lazy blocks (handle.lazy): back a range of a reserved section with the given
  * protection. On Linux nothing is ever lazy and this is mprotect. */
-int      mb_pal_commit(mb_range addr, mb_prot prot);           /* 0 ok */
+int      mb_pal_commit(mb_handle h, mb_range addr, mb_prot prot);   /* 0 ok */
 /* Give the memory behind [offset, offset + len) of the handle back to the OS,
  * reading back as zeros in every view: what munmap and MADV_DONTNEED want.
- * Linux punches a hole in the memfd. Windows cannot: a page committed in a
- * view of a section stays committed (VirtualFree refuses it, error 87), so
- * there it answers -1 and the caller writes zeros. 0 ok. */
+ * Linux punches a hole in the memfd, any page. Windows cannot give back a
+ * page of a view of a section (VirtualFree refuses it, error 87): a block
+ * made of pieces gives back whole pieces (offset and len multiples of the
+ * unit; the pages are then uncommitted in every view), and any other answers
+ * -1, where the caller writes zeros. 0 ok. */
 int      mb_pal_release(mb_handle h, uintptr_t offset, uintptr_t len);
+/* what mb_pal_release gives back at a time: a page (Linux), a piece (a
+ * Windows block of pieces), or 0 (nothing) */
+uintptr_t mb_pal_release_unit(mb_handle h);
 /* ---- sha256.c ---- */
 typedef struct { uint32_t h[8]; uint64_t len; uint8_t buf[64]; size_t fill; } mb_sha256;
 void mb_sha256_init(mb_sha256 *c);
@@ -202,6 +212,10 @@ typedef struct mb_block {
 	size_t npages;
 	mb_range addr;       /* fixed guest address range */
 	mb_range mirror;     /* always-RW second mapping, OS-chosen */
+	/* ranges handed out by mb_block_read_view, as page indices [first, end):
+	 * a piece under one is never given back, so the pointer stays good */
+	size_t (*read_views)[2];
+	size_t nread_views;
 	bool sealed;
 	/* the last load or delta got as far as changing pages: when it failed,
 	 * the machine is a mix of two (mb_host_load_state poisons it) */

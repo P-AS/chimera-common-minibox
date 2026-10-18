@@ -484,8 +484,19 @@ differently with a memory search open. `wbx_guest_read_view` hands it a
 pointer to the same bytes through the block's mirror, which never faults; a
 page the guest gave back reads as zeros there. A page of a lazy block (Windows,
 over 4 GiB) with no memory behind it yet is given memory in the mirror alone
-and reads zero. Writes still go through the guest's view, where dirty
-tracking sees them.
+and reads zero, and a piece of such a block that a read view points into is
+never given back to the OS (below). Writes still go through the guest's view,
+where dirty tracking sees them.
+
+On Windows a lazy block is made of 16 MiB pieces, each its own section, and
+both of its views are built of them on reserved address space (2026-10-18):
+a page of a view of a section cannot be given back on its own, so before,
+memory a guest freed in a lazy block stayed taken until the block was. A
+piece whose pages are all Free goes back to the OS when they become so
+(unless a page in it is compared every frame, or invisible), and is made
+again, empty, when the guest maps there next. Not observable to a guest:
+Free pages read as zeros either way. MB_NO_PIECES set in the environment, or
+a Windows without placeholders (before Windows 10 1803), keeps one section.
 
 ## A broken guest ends the machine, not the host (2026-10-18)
 
