@@ -1152,8 +1152,21 @@ int mb_block_mprotect(mb_block *b, mb_range addr, mb_prot prot) {
 	return r;
 }
 
+/* Zeros over a run of pages. A long run goes back to the OS instead, which
+ * reads back as zeros in both views (Linux: a hole punched in the block's
+ * memfd): memory the guest gave up is given up. A short run, and one the OS
+ * will not take back (Windows), is written over. */
+#define RELEASE_MIN_PAGES 16
+static void zero_run(mb_block *b, size_t start, size_t count) {
+	if (count == 0) return;
+	if (count >= RELEASE_MIN_PAGES
+		&& mb_pal_release(b->handle, start << MB_PAGESHIFT, count << MB_PAGESHIFT) == 0) return;
+	memset((void *)mirror_addr(b, b->addr.start + (start << MB_PAGESHIFT)), 0, count << MB_PAGESHIFT);
+}
+
 /* zero + free (munmap) or keep-allocated (madvise dontneed) */
 static void free_pages(mb_block *b, size_t ps, size_t pcount, bool advise_only) {
+	size_t run_start = ps, run = 0;   /* pages still to be zeroed, in a row */
 	for (size_t i = ps; i < ps + pcount; i++) {
 		uintptr_t maddr = mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT));
 		/* the zeroing below goes through the mirror and never faults, so a state
@@ -1161,13 +1174,22 @@ static void free_pages(mb_block *b, size_t ps, size_t pcount, bool advise_only) 
 		 * MADV_DONTNEED are how malloc gives memory back */
 		mb_block_plan_capture(b, i);
 		mb_page_maybe_snapshot(&b->pages[i], maddr);
-		/* before the memset below, not after: an open epoch's pre-image of this
-		 * page is what it held while the guest still had it */
+		/* before the zeroing below, not after: an open epoch's pre-image of
+		 * this page is what it held while the guest still had it */
 		epoch_note_status_change(b, i, MB_ST_FREE);
-		if (!b->pages[i].uncommitted) memset((void *)maddr, 0, MB_PAGESIZE);
+		/* A page that still holds the zeros it was sealed with (clean, with a
+		 * zero baseline) is zero already. Writing zeros over it gave memory to
+		 * pages nothing had touched: RPCS3 gives back 4 GiB of untouched
+		 * reservation at boot, and that wrote 4 GiB (2026-10-18). */
+		const mb_page *p = &b->pages[i];
+		const bool zero_already = p->uncommitted
+			|| (!p->dirty && !p->invisible && p->snap_kind == MB_SNAP_ZERO);
+		if (zero_already) { zero_run(b, run_start, run); run = 0; }
+		else { if (run == 0) run_start = i; run++; }
 		/* undirty pages whose sealed baseline was already zero */
 		set_dirty(b, i, !b->pages[i].invisible && b->pages[i].snap_kind != MB_SNAP_ZERO);
 	}
+	zero_run(b, run_start, run);
 	if (advise_only) refresh_range(b, ps, pcount);
 	else set_protections(b, ps, pcount, MB_ST_FREE);
 }

@@ -5,6 +5,7 @@
 #include "test_util.h"
 #ifndef _WIN32
 #include <sys/mman.h>
+#include <sys/stat.h>
 #else
 #include <windows.h>
 #endif
@@ -143,6 +144,45 @@ static void test_madvise_keeps_allocated(void) {
 	CHECK_EQ(mb_block_madvise_dontneed(b, one), 0);
 	CHECK(!freed(b, 4));            /* still allocated... */
 	CHECK_EQ(gp(b, 0x4000)[0], 0);  /* ...but zeroed */
+	CHECK(mb_block_maps_consistent(b));
+	mb_block_free(b);
+}
+
+/* munmap and MADV_DONTNEED give memory back (2026-10-18): a long run of
+ * written pages is released and reads back zero in both views, and a range
+ * nothing wrote is not written to by the freeing. On Linux the memfd's
+ * allocated size says so; Windows cannot release (mb_pal_release), and there
+ * only the zeros are checked. */
+static void test_free_gives_memory_back(void) {
+	const uintptr_t size = 0x200000, half = 0x100000;   /* 512 pages */
+	mb_block *b = fresh(size);
+	mb_range whole = { b->addr.start, size };
+	CHECK_EQ(mb_block_mmap_fixed(b, whole, MB_PROT_RW, true), 0);
+	for (uintptr_t off = 0; off < half; off += 0x1000) gp(b, off)[17] = 0x5a;
+#ifndef _WIN32
+	struct stat st;
+	CHECK_EQ(fstat((int)b->handle.h, &st), 0);
+	const long long written = (long long)st.st_blocks;   /* 512-byte units */
+	CHECK(written >= (long long)(half / 512));
+#endif
+	mb_range used = { b->addr.start, half };
+	CHECK_EQ(mb_block_munmap(b, used), 0);
+	/* in pieces too short to release: these must not be written over */
+	for (uintptr_t off = half; off < size; off += 0x8000) {
+		mb_range piece = { b->addr.start + off, 0x8000 };
+		CHECK_EQ(mb_block_madvise_dontneed(b, piece), 0);
+	}
+#ifndef _WIN32
+	CHECK_EQ(fstat((int)b->handle.h, &st), 0);
+	printf("test_memblock: the block's memory held %lld KiB written, %lld KiB after freeing it\n",
+	       written / 2, (long long)st.st_blocks / 2);
+	CHECK((long long)st.st_blocks < written / 8);
+#endif
+	CHECK_EQ(mb_block_mmap_fixed(b, used, MB_PROT_RW, false), 0);
+	for (uintptr_t off = 0; off < size; off += 0x1000) {
+		CHECK_EQ(gp(b, off)[17], 0);
+		CHECK_EQ(((volatile uint8_t *)(b->mirror.start + off))[17], 0);
+	}
 	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
@@ -537,6 +577,7 @@ static void run_all(void) {
 	RUN(test_snapshot_slots_come_back);
 	RUN(test_munmap_zeroes);
 	RUN(test_madvise_keeps_allocated);
+	RUN(test_free_gives_memory_back);
 	RUN(test_mmap_fixed_overlap);
 	RUN(test_mremap_inplace);
 	RUN(test_mremap_maymove);

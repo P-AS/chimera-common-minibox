@@ -113,4 +113,12 @@ int mb_pal_commit(mb_range addr, mb_prot prot) {
 	return -1;
 }
 
+/* Measured 2026-10-18: VirtualFree(MEM_DECOMMIT) on a view of a SEC_RESERVE
+ * section fails with error 87; MEM_RESET keeps the bytes; DiscardVirtualMemory
+ * frees them, but what reads back is undefined, which a machine cannot use. */
+int mb_pal_release(mb_handle h, uintptr_t offset, uintptr_t len) {
+	(void)h; (void)offset; (void)len;
+	return -1;
+}
+
 #endif

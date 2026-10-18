@@ -3,6 +3,7 @@
 #ifndef _WIN32
 #define _GNU_SOURCE
 #include "minibox_internal.h"
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -67,6 +68,10 @@ int mb_pal_protect(mb_range addr, mb_prot prot) {
 
 int mb_pal_commit(mb_range addr, mb_prot prot) {
 	return mprotect((void *)addr.start, addr.size, prot_to_native(prot));
+}
+
+int mb_pal_release(mb_handle h, uintptr_t offset, uintptr_t len) {
+	return fallocate((int)h.h, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)offset, (off_t)len);
 }
 
 #endif

@@ -101,6 +101,12 @@ int      mb_pal_protect(mb_range addr, mb_prot prot);          /* 0 ok */
 /* Lazy blocks (handle.lazy): back a range of a reserved section with the given
  * protection. On Linux nothing is ever lazy and this is mprotect. */
 int      mb_pal_commit(mb_range addr, mb_prot prot);           /* 0 ok */
+/* Give the memory behind [offset, offset + len) of the handle back to the OS,
+ * reading back as zeros in every view: what munmap and MADV_DONTNEED want.
+ * Linux punches a hole in the memfd. Windows cannot: a page committed in a
+ * view of a section stays committed (VirtualFree refuses it, error 87), so
+ * there it answers -1 and the caller writes zeros. 0 ok. */
+int      mb_pal_release(mb_handle h, uintptr_t offset, uintptr_t len);
 /* ---- sha256.c ---- */
 typedef struct { uint32_t h[8]; uint64_t len; uint8_t buf[64]; size_t fill; } mb_sha256;
 void mb_sha256_init(mb_sha256 *c);
