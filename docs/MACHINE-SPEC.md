@@ -208,10 +208,10 @@ The stream is (all integers little-endian, magic strings as raw UTF-8 bytes):
 
 ```
 magic  "ActivatedWaterboxHost_v1"
-FileSystem: magic "FileSystem"; per mounted savestateable file a record (name
-            magic, then class-specific state: readonly files store only the
-            seek position and are hash-verified; writable files are illegal at
-            save time); magic "FileSystemEnd"
+FileSystem: magic "FileSystem"; magic "FileSystemEnd" - nothing between
+            them in this host (the reference put a record per mounted file
+            there; the open files are in OpenFileTable1 below, and no file's
+            bytes or hash are in a state)
 u64    program_break
 ElfLoader: magic "ElfLoader"; the ELF SHA-256 (hard-verified on load)
 MemoryBlock: magic "ActivatedMemoryBlock"; the seal hash; the block AddressRange
@@ -241,8 +241,9 @@ Load reconstructs each page from the (old_dirty, new_dirty) pair:
 (true,false) restore baseline (ZeroFilled->zero, Data->memcpy, None->error);
 (true,true) read 4096 from stream. Then set status, refresh protections.
 
-Verification: ELF hash mismatch is a hard error; readonly-file hash and
-name/order mismatches are hard errors; block address mismatch is a hard error;
+Verification: ELF hash mismatch is a hard error; block address mismatch is a
+hard error; a file the open-file table names that is not mounted leaves the
+open descriptors as they are (above);
 block hash mismatch is a hard error too (the reference only warns, a known
 soft spot there): a state of another sealed baseline is refused before any
 memory moves. A load refused before any memory moved (the magics, the ELF
@@ -292,7 +293,34 @@ Implemented syscalls and their EXACT semantics:
   memory is not the guest's to write. Any other request writes nothing.
 - **read(0)/write(1)/readv(19)/writev(20)**: VFS I/O; iov entries with
   iov_base==0 are skipped.
+- **pread64(17)**: reads at an offset and leaves the descriptor's position
+  alone (pwrite64, its twin, is in the v2.2 list below).
 - **open(2)/close(3)/lseek(8)/truncate(76)/ftruncate(77)**: VFS.
+- **openat(257)/newfstatat(262)**: open and stat, for the directory AT_FDCWD
+  (-100) only; any other directory descriptor is EBADF (the namespace is
+  flat, section 8).
+- **dup(32)**: a second descriptor on the same file (section 8).
+- **readlink(89)/readlinkat(267)**: nothing is a link and there is no /proc:
+  EINVAL for a name that is mounted, ENOENT for one that is not. Nothing is
+  written to the buffer.
+- **fcntl(72)**: F_GETFD and F_GETFL answer 0; F_SETFD and F_SETFL are
+  accepted and change nothing (there is no exec and no non-blocking mode);
+  anything else is EINVAL.
+- **sync(162)** returns 0; **fsync(74)/fdatasync(75)/syncfs(306)** return 0
+  for an open descriptor and EBADF otherwise (the files live in host memory).
+- **getrandom(318)**: fills the buffer from a fixed-seed splitmix64 stream
+  that starts the same in every host and is saved in states (section 6); a
+  buffer the guest does not own is EFAULT.
+- **prctl(157)**: PR_SET_NAME (15) is accepted and ignored; anything else is
+  EINVAL.
+- **tkill(200)/tgkill(234)**: signal 0 answers whether the thread exists
+  (0 or ESRCH); any other signal is the guest's death ("the core aborted"
+  for SIGABRT). **exit_group(231)** is the guest's death too, with its
+  status.
+- **getuid(102)/geteuid(107)/getgid(104)/getegid(108)**: 1000.
+- **sched_setaffinity(203)** returns 0; **sched_getaffinity(204)** writes a
+  zero mask (up to 4096 bytes) and returns 8; a size under 8 or a null mask
+  is EINVAL.
 - **clock_gettime(228)**: writes tv_sec=1495889068, tv_nsec=0 regardless of the
   clock id; returns 0. (This constant is part of the spec.)
 - **sysinfo(99)**: zero-fills the 112-byte struct, then totalram = 1 GiB and
@@ -311,9 +339,10 @@ Implemented syscalls and their EXACT semantics:
   **rt_sigprocmask(14)** -> 0 with the old mask written as empty (nothing is
   delivered, so nothing is blocked; EFAULT for a mask the guest cannot use,
   EINVAL for a size over 128; 2026-10-18), **getpid(39)/getppid(110)** -> 1.
-- Everything else: trap to the debugger (breakpoint) then return ENOSYS. This
-  forbids getrandom, gettimeofday/time, sockets, fork/execve, openat, arch_prctl
-  from the guest, poll/select, and all other host-observing calls.
+- Everything else is the guest's death, named ("the core asked for system
+  call N ..., which the sandbox does not provide"): gettimeofday/time, fork/execve, arch_prctl,
+  poll/select and every other host-observing call. Sockets and pipes are
+  answered with a refusal instead (v2.2, below).
 
 ## 8. Virtual filesystem (observable)
 
@@ -321,10 +350,16 @@ A flat list of named in-memory files (no directories). Preloaded: /dev/stdin
 (fd 0, empty reader, always 0 bytes), /dev/stdout (fd 1), /dev/stderr (fd 2),
 these last two forwarding to the host console and non-unmountable; host write
 errors are swallowed (never surfaced to the guest). Mounted files (via
-wbx_mount_file) are readonly (SHA-256-bound to savestates) or writable
-(transient; block savestating). One fd per file; opening an already-open file
--> EACCES; fd allocation is lowest-unused; close resets seek to 0; open checks
-only O_ACCMODE. Fabricated stat: st_dev=1, st_ino=1, st_nlink=0, st_blksize=4096,
+wbx_mount_file) are read-only or writable. A read-only file may be open many
+times at once, each descriptor with its own position starting at 0; a
+writable file is open once at a time (a second open is EACCES). dup gives a
+new descriptor on the same read-only file with its own position, starting
+where the old one is (POSIX shares one; no caller needs that); dup of a
+writable file is EACCES. fd allocation is lowest-unused; open checks only
+O_ACCMODE. The open descriptors and their positions are in states (section
+6, OpenFileTable1); a writable file's bytes are not, and stay as they are
+across a load, so a core keeps data it writes in its own memory instead
+(Chimera mounts every file read-only). Fabricated stat: st_dev=1, st_ino=1, st_nlink=0, st_blksize=4096,
 S_IFREG if seekable else S_IFIFO, constant timestamps (1262304000000 s,
 500000000 ns).
 
