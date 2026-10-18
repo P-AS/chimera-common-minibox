@@ -1301,8 +1301,8 @@ static void stat_print(void)
 		calls += s_stat[i].calls;
 		ns += s_stat[i].ns;
 	}
-	fprintf(stderr, "chimera vk stats: %llu calls, %.3f s in the host half and the driver\n",
-	        (unsigned long long)calls, (double)ns / 1e9);
+	fprintf(stderr, "chimera vk stats: %llu calls, %.3f s in the host half and the driver; %lu device waits before a status question (CHIMERA_VK_SETTLED)\n",
+	        (unsigned long long)calls, (double)ns / 1e9, chimera_vk_host_settles());
 	for (int shown = 0; shown < 14; shown++) {
 		int best = -1;
 		for (int i = 0; i < VKB_STAT_OPS; i++)
@@ -1376,6 +1376,65 @@ static int has_command(struct vkb_has_command_args *args)
 	return 1;
 }
 
+/* CHIMERA_VK_SETTLED=1: a question about how far the GPU has got - a fence,
+ * an event, a semaphore's count, whether query results are there yet, or a
+ * wait with a timeout short of forever - is answered as if the GPU had
+ * finished everything already submitted: the device is waited on first, and
+ * the wait itself then only looks. The answer then depends on what was
+ * submitted and not on how fast the GPU is (analysis of 2026-10-18). Off
+ * unless asked for: what it costs is being measured (each such question
+ * waits for the whole device). s_settles counts the waits. */
+static int s_settled = -1;
+static unsigned long s_settles;
+
+static void settle_before(uintptr_t op, void *args)
+{
+	uint64_t device = 0;
+	switch (op) {
+	case VK_OP_vkGetFenceStatus:
+		device = (uint64_t)((struct vkb_vkGetFenceStatus_args *)args)->device;
+		break;
+	case VK_OP_vkGetEventStatus:
+		device = (uint64_t)((struct vkb_vkGetEventStatus_args *)args)->device;
+		break;
+	case VK_OP_vkGetSemaphoreCounterValue:
+		device = (uint64_t)((struct vkb_vkGetSemaphoreCounterValue_args *)args)->device;
+		break;
+	case VK_OP_vkGetQueryPoolResults: {
+		struct vkb_vkGetQueryPoolResults_args *q = args;
+		if (q->flags & VK_QUERY_RESULT_WAIT_BIT)
+			return;
+		device = (uint64_t)q->device;
+		break;
+	}
+	case VK_OP_vkWaitForFences: {
+		struct vkb_vkWaitForFences_args *w = args;
+		if (w->timeout == UINT64_MAX)
+			return;
+		device = (uint64_t)w->device;
+		w->timeout = 0;
+		break;
+	}
+	case VK_OP_vkWaitSemaphores: {
+		struct vkb_vkWaitSemaphores_args *w = args;
+		if (w->timeout == UINT64_MAX)
+			return;
+		device = (uint64_t)w->device;
+		w->timeout = 0;
+		break;
+	}
+	default:
+		return;
+	}
+	struct entry *e = vkb_entry(device, VKB_K_Device);
+	if (e && vkb_fn.vkDeviceWaitIdle) {
+		vkb_fn.vkDeviceWaitIdle((VkDevice)e->host);
+		s_settles++;
+	}
+}
+
+unsigned long chimera_vk_host_settles(void) { return s_settles; }
+
 static uintptr_t dispatch_one(uintptr_t op, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e)
 {
 	(void)b; (void)c; (void)d; (void)e;
@@ -1414,5 +1473,11 @@ static uintptr_t dispatch_one(uintptr_t op, uintptr_t a, uintptr_t b, uintptr_t 
 #endif
 	    )
 		s_work++;
+	if (s_settled < 0) {
+		const char *asked = getenv("CHIMERA_VK_SETTLED");
+		s_settled = asked && asked[0] && asked[0] != '0';
+	}
+	if (s_settled)
+		settle_before(op, (void *)a);
 	return (uintptr_t)vkb_dispatch_generated(op, (void *)a);
 }

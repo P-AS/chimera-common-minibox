@@ -45,6 +45,8 @@ const char *chimera_vk_host_description(void);
  * driver does not have - and the opcode of the last one. A run that ends with
  * this above zero drew something other than what it was asked to. */
 unsigned long chimera_vk_host_refused(long *last_op);
+/* CHIMERA_VK_SETTLED=1: how many times a GPU status question waited for the device first */
+unsigned long chimera_vk_host_settles(void);
 
 /* The most slots the table of handles has held at once in this process (for
  * the tests: what a pool gives back is used again, so this stops growing). */
