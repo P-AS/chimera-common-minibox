@@ -34,6 +34,48 @@ static void *s_lib;
 #endif
 
 /* ---------------------------------------------------------------------------
+ * The instance and the device are created on a thread of their own, on
+ * Windows. A core calls in on the thread that runs it, which in Chimera is
+ * the window's: .NET makes that a single-threaded COM apartment. A standalone
+ * emulator creates its instance on a thread of its own. Intel's
+ * 31.0.101.211x driver threw an exception it never caught inside
+ * vkCreateInstance called on Chimera's window thread (chimera#278, #306,
+ * #307, #308), while standalone Dolphin started on the same driver, and the
+ * thread is a difference between the two that a core cannot see. A thread
+ * made here has no COM apartment and a stack of its own size. Creating an
+ * object on one thread and using it on another is what Vulkan allows. */
+#ifdef _WIN32
+struct own_thread_call {
+	void (*fn)(void *);
+	void *ctx;
+};
+
+static DWORD WINAPI own_thread_main(LPVOID p)
+{
+	struct own_thread_call *c = p;
+	c->fn(c->ctx);
+	return 0;
+}
+
+static void on_own_thread(void (*fn)(void *), void *ctx)
+{
+	struct own_thread_call c = { fn, ctx };
+	HANDLE t = CreateThread(NULL, 8u << 20, own_thread_main, &c, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+	if (!t) {
+		fn(ctx);
+		return;
+	}
+	WaitForSingleObject(t, INFINITE);
+	CloseHandle(t);
+}
+#else
+static void on_own_thread(void (*fn)(void *), void *ctx)
+{
+	fn(ctx);
+}
+#endif
+
+/* ---------------------------------------------------------------------------
  * One call's scratch memory. Whatever must be copied to be translated is
  * copied here and forgotten when the next call begins. */
 
@@ -555,6 +597,19 @@ static VkPhysicalDevice choose_device(void)
 	return chosen;
 }
 
+struct create_instance_call {
+	PFN_vkCreateInstance fn;
+	const VkInstanceCreateInfo *info;
+	VkInstance *instance;
+	VkResult r;
+};
+
+static void create_instance_there(void *p)
+{
+	struct create_instance_call *c = p;
+	c->r = c->fn(c->info, NULL, c->instance);
+}
+
 static uint64_t vkb_special_vkCreateInstance(uint64_t op, struct vkb_vkCreateInstance_args *a)
 {
 	PFN_vkCreateInstance create = (PFN_vkCreateInstance)s_gipa(NULL, "vkCreateInstance");
@@ -569,7 +624,9 @@ static uint64_t vkb_special_vkCreateInstance(uint64_t op, struct vkb_vkCreateIns
 		if (!ALLOWED_INSTANCE(info.ppEnabledExtensionNames[i]))
 			return (uint64_t)(int64_t)VK_ERROR_EXTENSION_NOT_PRESENT;
 	VkInstance instance = VK_NULL_HANDLE;
-	const VkResult r = create(&info, NULL, &instance);
+	struct create_instance_call call = { create, &info, &instance, VK_ERROR_INITIALIZATION_FAILED };
+	on_own_thread(create_instance_there, &call);
+	const VkResult r = call.r;
 	if (r < 0)
 		return (uint64_t)(int64_t)r;
 	s_instance = instance;
@@ -617,6 +674,19 @@ static uint64_t vkb_special_vkEnumerateDeviceExtensionProperties(uint64_t op, st
 	return r;
 }
 
+struct create_device_call {
+	VkPhysicalDevice phys;
+	const VkDeviceCreateInfo *info;
+	VkDevice *device;
+	VkResult r;
+};
+
+static void create_device_there(void *p)
+{
+	struct create_device_call *c = p;
+	c->r = vkb_fn.vkCreateDevice(c->phys, c->info, NULL, c->device);
+}
+
 static uint64_t vkb_special_vkCreateDevice(uint64_t op, struct vkb_vkCreateDevice_args *a)
 {
 	const VkPhysicalDevice phys = (VkPhysicalDevice)(uintptr_t)vkb_h((uint64_t)(uintptr_t)a->physicalDevice, VKB_K_PhysicalDevice);
@@ -632,7 +702,9 @@ static uint64_t vkb_special_vkCreateDevice(uint64_t op, struct vkb_vkCreateDevic
 	if (vkb_bad)
 		return vkb_refuse(op, (uint64_t)(int64_t)VK_ERROR_INITIALIZATION_FAILED);
 	VkDevice device = VK_NULL_HANDLE;
-	const VkResult r = vkb_fn.vkCreateDevice(phys, &info, NULL, &device);
+	struct create_device_call call = { phys, &info, &device, VK_ERROR_INITIALIZATION_FAILED };
+	on_own_thread(create_device_there, &call);
+	const VkResult r = call.r;
 	if (r < 0)
 		return (uint64_t)(int64_t)r;
 	s_device = device;
