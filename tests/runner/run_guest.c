@@ -685,18 +685,33 @@ int main(int argc, char **argv) {
 	}
 	/* nor in its xmm0-15. Before the entry case this side fills xmm0-5 (scratch
 	 * in both host ABIs) with ones, so the check does not rest on whatever the
-	 * host's own code happened to leave there. */
+	 * host's own code happened to leave there. On aarch64 it fills v0-v31,
+	 * d8-d15 included (the compiler keeps this function's own around the
+	 * asm): the blob must clear those on entry too. */
 	{
 		typedef uint64_t (MB_GUEST_ABI *u64_fn)(void);
 		const u64_fn entry = (u64_fn)proc(h, "EntryXmm");
+#if defined(__aarch64__)
+		__asm__ volatile(".irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31\n\t"
+		                 "movi v\\n\\().2d, #0xffffffffffffffff\n\t"
+		                 ".endr"
+		                 ::: "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11",
+		                     "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22",
+		                     "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31");
+		const char *vregs = "v0-v31";
+#elif defined(__x86_64__)
 		__asm__ volatile("pcmpeqd %%xmm0, %%xmm0\n\tpcmpeqd %%xmm1, %%xmm1\n\tpcmpeqd %%xmm2, %%xmm2\n\t"
 		                 "pcmpeqd %%xmm3, %%xmm3\n\tpcmpeqd %%xmm4, %%xmm4\n\tpcmpeqd %%xmm5, %%xmm5"
 		                 ::: "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5");
+		const char *vregs = "xmm0-15";
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 		uint64_t at_entry = entry();
 		uint64_t after_syscall = ((u64_fn)proc(h, "SyscallXmm"))();
 		uint64_t after_extcall = ((u64_fn)proc(h, "ExtcallXmm"))();
-		printf("run_guest: xmm0-15 seen by the guest on entry=%llx, after a syscall=%llx, "
-		       "after a callback=%llx\n", (unsigned long long)at_entry,
+		printf("run_guest: %s seen by the guest on entry=%llx, after a syscall=%llx, "
+		       "after a callback=%llx\n", vregs, (unsigned long long)at_entry,
 		       (unsigned long long)after_syscall, (unsigned long long)after_extcall);
 		CHECK(at_entry == 0);
 		CHECK(after_syscall == 0);

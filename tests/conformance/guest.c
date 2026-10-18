@@ -419,6 +419,87 @@ __asm__(
  * used to leave its own values in them - a guest's varargs prologue spills
  * xmm0-7, and a JVM in the box carried host heap addresses into its states
  * that way (interop_bin.c). */
+#if defined(__aarch64__)
+/* aarch64: v0-v31, and AAPCS64 makes a callee keep d8-d15 (the low halves of
+ * v8-v15), so after a syscall and after a callback those halves are the
+ * guest's own ones and only the upper halves of v8-v15 are read; on entry all
+ * thirty-two are (run_guest fills every one before the call). The syscall and
+ * callback probes keep d8-d15 for their own caller. */
+#define WBX_FILL_V \
+	"\tmovi v0.2d, #0xffffffffffffffff\n\tmovi v1.2d, #0xffffffffffffffff\n\tmovi v2.2d, #0xffffffffffffffff\n\tmovi v3.2d, #0xffffffffffffffff\n" \
+	"\tmovi v4.2d, #0xffffffffffffffff\n\tmovi v5.2d, #0xffffffffffffffff\n\tmovi v6.2d, #0xffffffffffffffff\n\tmovi v7.2d, #0xffffffffffffffff\n" \
+	"\tmovi v8.2d, #0xffffffffffffffff\n\tmovi v9.2d, #0xffffffffffffffff\n\tmovi v10.2d, #0xffffffffffffffff\n\tmovi v11.2d, #0xffffffffffffffff\n" \
+	"\tmovi v12.2d, #0xffffffffffffffff\n\tmovi v13.2d, #0xffffffffffffffff\n\tmovi v14.2d, #0xffffffffffffffff\n\tmovi v15.2d, #0xffffffffffffffff\n" \
+	"\tmovi v16.2d, #0xffffffffffffffff\n\tmovi v17.2d, #0xffffffffffffffff\n\tmovi v18.2d, #0xffffffffffffffff\n\tmovi v19.2d, #0xffffffffffffffff\n" \
+	"\tmovi v20.2d, #0xffffffffffffffff\n\tmovi v21.2d, #0xffffffffffffffff\n\tmovi v22.2d, #0xffffffffffffffff\n\tmovi v23.2d, #0xffffffffffffffff\n" \
+	"\tmovi v24.2d, #0xffffffffffffffff\n\tmovi v25.2d, #0xffffffffffffffff\n\tmovi v26.2d, #0xffffffffffffffff\n\tmovi v27.2d, #0xffffffffffffffff\n" \
+	"\tmovi v28.2d, #0xffffffffffffffff\n\tmovi v29.2d, #0xffffffffffffffff\n\tmovi v30.2d, #0xffffffffffffffff\n\tmovi v31.2d, #0xffffffffffffffff\n"
+/* v0-v7 and v16-v31 OR'ed into v0, then both its halves into x0 */
+#define WBX_OR_V_SCRATCH_INTO_X0 \
+	"\torr v0.16b, v0.16b, v1.16b\n\torr v0.16b, v0.16b, v2.16b\n\torr v0.16b, v0.16b, v3.16b\n\torr v0.16b, v0.16b, v4.16b\n" \
+	"\torr v0.16b, v0.16b, v5.16b\n\torr v0.16b, v0.16b, v6.16b\n\torr v0.16b, v0.16b, v7.16b\n\torr v0.16b, v0.16b, v16.16b\n" \
+	"\torr v0.16b, v0.16b, v17.16b\n\torr v0.16b, v0.16b, v18.16b\n\torr v0.16b, v0.16b, v19.16b\n\torr v0.16b, v0.16b, v20.16b\n" \
+	"\torr v0.16b, v0.16b, v21.16b\n\torr v0.16b, v0.16b, v22.16b\n\torr v0.16b, v0.16b, v23.16b\n\torr v0.16b, v0.16b, v24.16b\n" \
+	"\torr v0.16b, v0.16b, v25.16b\n\torr v0.16b, v0.16b, v26.16b\n\torr v0.16b, v0.16b, v27.16b\n\torr v0.16b, v0.16b, v28.16b\n" \
+	"\torr v0.16b, v0.16b, v29.16b\n\torr v0.16b, v0.16b, v30.16b\n\torr v0.16b, v0.16b, v31.16b\n" \
+	"\tmov x0, v0.d[0]\n\tmov x1, v0.d[1]\n\torr x0, x0, x1\n"
+/* ...and the upper halves of v8-v15 */
+#define WBX_OR_V8_15_HIGH_INTO_X0 \
+	"\tmov x1, v8.d[1]\n\torr x0, x0, x1\n\tmov x1, v9.d[1]\n\torr x0, x0, x1\n" \
+	"\tmov x1, v10.d[1]\n\torr x0, x0, x1\n\tmov x1, v11.d[1]\n\torr x0, x0, x1\n" \
+	"\tmov x1, v12.d[1]\n\torr x0, x0, x1\n\tmov x1, v13.d[1]\n\torr x0, x0, x1\n" \
+	"\tmov x1, v14.d[1]\n\torr x0, x0, x1\n\tmov x1, v15.d[1]\n\torr x0, x0, x1\n"
+/* ...and the low halves of v8-v15 too: on entry */
+#define WBX_OR_V8_15_LOW_INTO_X0 \
+	"\tfmov x1, d8\n\torr x0, x0, x1\n\tfmov x1, d9\n\torr x0, x0, x1\n" \
+	"\tfmov x1, d10\n\torr x0, x0, x1\n\tfmov x1, d11\n\torr x0, x0, x1\n" \
+	"\tfmov x1, d12\n\torr x0, x0, x1\n\tfmov x1, d13\n\torr x0, x0, x1\n" \
+	"\tfmov x1, d14\n\torr x0, x0, x1\n\tfmov x1, d15\n\torr x0, x0, x1\n"
+#define WBX_SAVE_D8_15 \
+	"\tstp x29, x30, [sp, #-80]!\n" \
+	"\tstp d8, d9, [sp, #16]\n\tstp d10, d11, [sp, #32]\n\tstp d12, d13, [sp, #48]\n\tstp d14, d15, [sp, #64]\n"
+#define WBX_RESTORE_D8_15 \
+	"\tldp d8, d9, [sp, #16]\n\tldp d10, d11, [sp, #32]\n\tldp d12, d13, [sp, #48]\n\tldp d14, d15, [sp, #64]\n" \
+	"\tldp x29, x30, [sp], #80\n"
+__asm__(
+	".text\n"
+	".globl EntryXmm\n.type EntryXmm,%function\n"
+	"EntryXmm:\n"
+	WBX_OR_V_SCRATCH_INTO_X0
+	WBX_OR_V8_15_HIGH_INTO_X0
+	WBX_OR_V8_15_LOW_INTO_X0
+	"\tret\n"
+	".globl SyscallXmm\n.type SyscallXmm,%function\n"
+	"SyscallXmm:\n"
+	WBX_SAVE_D8_15
+	WBX_FILL_V
+	"\tmov x0, #0\n"
+	"\tmov x8, #12\n"
+	"\tmovz x16, #0x0080\n"
+	"\tmovk x16, #0x035f, lsl #32\n"
+	"\tblr x16\n"
+	WBX_OR_V_SCRATCH_INTO_X0
+	WBX_OR_V8_15_HIGH_INTO_X0
+	WBX_RESTORE_D8_15
+	"\tret\n"
+	".globl ExtcallXmm\n.type ExtcallXmm,%function\n"
+	"ExtcallXmm:\n"
+	WBX_SAVE_D8_15
+	"\tadrp x1, g_log_cb\n"
+	"\tldr x1, [x1, #:lo12:g_log_cb]\n"
+	"\tcbz x1, 1f\n"
+	WBX_FILL_V
+	"\tmov x0, #0\n"
+	"\tblr x1\n"
+	WBX_OR_V_SCRATCH_INTO_X0
+	WBX_OR_V8_15_HIGH_INTO_X0
+	WBX_RESTORE_D8_15
+	"\tret\n"
+	"1:\n"
+	"\tmov x0, #1\n"
+	WBX_RESTORE_D8_15
+	"\tret\n");
+#elif defined(__x86_64__)
 #define FILL_XMM \
 	"\tpcmpeqd %xmm0, %xmm0\n\tpcmpeqd %xmm1, %xmm1\n\tpcmpeqd %xmm2, %xmm2\n\tpcmpeqd %xmm3, %xmm3\n" \
 	"\tpcmpeqd %xmm4, %xmm4\n\tpcmpeqd %xmm5, %xmm5\n\tpcmpeqd %xmm6, %xmm6\n\tpcmpeqd %xmm7, %xmm7\n" \
@@ -463,6 +544,9 @@ __asm__(
 	"\tmov $1, %eax\n"
 	"\tpop %rbx\n"
 	"\tret\n");
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 
 /* Faults with rsp pointing into a guard page: a heap page is protected to
  * PROT_NONE, rsp is pointed into it, and ud2 faults. The death report must
