@@ -26,7 +26,16 @@
  *
  * Every way back into guest code zeroes the scratch registers but x0, as the
  * x86-64 blob's stubs do: a guest that spills one must not carry a host
- * address into its savestates. The frame pointer and link register are kept
+ * address into its savestates. The vector registers too, as the x86-64 blob
+ * clears xmm0-15 (interop_bin.c): a varargs prologue spills q0-q7 whenever a
+ * call passes a floating-point argument. AAPCS64 makes a callee keep d8-d15,
+ * the low halves of v8-v15, which x86-64's SysV has no counterpart for, so:
+ *   - on entering an export every v register reads zero; the host's d8-d15
+ *     wait on the host stack and come back when the export returns;
+ *   - after a syscall or a callback v0-v7, v16-v31 and the upper halves of
+ *     v8-v15 read zero, and d8-d15 are the guest's own (host C kept them).
+ * Only the low 128 bits are cleared: a guest built for the aarch64 baseline
+ * uses no SVE. The frame pointer and link register are kept
  * on the guest stack across a syscall, which is also the frame a new guest
  * thread starts from (threading.c: {x29 = 0, x30 = entry}).
  *
@@ -67,6 +76,42 @@
 	mov x16, xzr
 	mov x17, xzr
 	mov x18, xzr
+.endm
+
+/* every vector register a callee may leave changed: all but d8-d15 */
+.macro zero_vectors_scratch
+	movi v0.2d, #0
+	movi v1.2d, #0
+	movi v2.2d, #0
+	movi v3.2d, #0
+	movi v4.2d, #0
+	movi v5.2d, #0
+	movi v6.2d, #0
+	movi v7.2d, #0
+	movi v16.2d, #0
+	movi v17.2d, #0
+	movi v18.2d, #0
+	movi v19.2d, #0
+	movi v20.2d, #0
+	movi v21.2d, #0
+	movi v22.2d, #0
+	movi v23.2d, #0
+	movi v24.2d, #0
+	movi v25.2d, #0
+	movi v26.2d, #0
+	movi v27.2d, #0
+	movi v28.2d, #0
+	movi v29.2d, #0
+	movi v30.2d, #0
+	movi v31.2d, #0
+	mov v8.d[1], xzr
+	mov v9.d[1], xzr
+	mov v10.d[1], xzr
+	mov v11.d[1], xzr
+	mov v12.d[1], xzr
+	mov v13.d[1], xzr
+	mov v14.d[1], xzr
+	mov v15.d[1], xzr
 .endm
 
 	.section .rodata.mb_interop, "a"
@@ -119,6 +164,10 @@ call_guest_impl:
 	str x11, [x9, #CTX_GUEST_RSP_ALT]
 1:
 	stp x29, x30, [sp, #-16]!
+	stp d8, d9, [sp, #-16]!
+	stp d10, d11, [sp, #-16]!
+	stp d12, d13, [sp, #-16]!
+	stp d14, d15, [sp, #-16]!
 	slot_addr x11
 	str x9, [x11]
 	mov x11, sp
@@ -138,6 +187,7 @@ call_guest_impl:
 	mov x17, xzr
 	mov x18, xzr
 	mov x29, xzr
+	bl zero_vectors
 	blr x10
 	/* back from the guest: x0 is its answer */
 	slot_addr x16
@@ -156,6 +206,10 @@ call_guest_impl:
 	str x17, [x16, #CTX_GUEST_RSP]
 	str x15, [x16, #CTX_GUEST_RSP_ALT]
 2:
+	ldp d14, d15, [sp], #16
+	ldp d12, d13, [sp], #16
+	ldp d10, d11, [sp], #16
+	ldp d8, d9, [sp], #16
 	ldp x29, x30, [sp], #16
 	ret
 
@@ -188,6 +242,15 @@ extcall_common:
 /* the way back into guest code from the host, for both of the above */
 return_zeroed:
 	zero_scratch
+	zero_vectors_scratch
+	ret
+
+/* call_guest_impl's: every v register zeroed, d8-d15 included (it has saved
+ * the host's), out of line because 0x200-0x300 has no room for it */
+zero_vectors:
+	.irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+	movi v\n\().2d, #0
+	.endr
 	ret
 mb_interop_end:
 
