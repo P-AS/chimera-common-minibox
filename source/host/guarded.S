@@ -175,12 +175,26 @@ mb_guarded_call:
 	jz 2f
 	wrfsbase %rax
 2:
+	/* The callee-saved registers reach the guest holding nothing: they hold
+	 * the host's values here (pointers into its heap and stacks, different
+	 * every run), and a guest prologue or a cothread switch writes them into
+	 * memory a state carries, as xmm6-15 were (c0aad51; analysis of
+	 * 2026-10-18). The host's are in the record above. */
+	xorl %ebx, %ebx
+	xorl %ebp, %ebp
+	xorl %r12d, %r12d
+	xorl %r13d, %r13d
+	xorl %r14d, %r14d
+	xorl %r15d, %r15d
 	movabsq $CALL_GUEST_IMPL, %rax
 	callq *%rax
 
 	/* rax: what the guest returned, or 0 from a refusal or an escape.
-	 * rsp: the record, whichever way control arrived. */
+	 * rsp: the record, whichever way control arrived. The direction flag is
+	 * cleared first: a guest that escaped between a std and its cld, or
+	 * returned with it set, would make the host's memcpy run backwards. */
 .Llanding:
+	cld
 	movq FRAME_CTX(%rsp), %r10
 	movq FRAME_PREV_ESC(%rsp), %r11
 	movq %r11, CTX_ESC_RSP(%r10)

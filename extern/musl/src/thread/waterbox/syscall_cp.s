@@ -20,7 +20,7 @@ __cp_begin:
 	mov %rdx,%rdi
 	mov %rcx,%rsi
 	mov %r8,%rdx
-	mov %r9,%r10
+	mov %r9,%rcx
 	mov 8(%rsp),%r8
 	mov 16(%rsp),%r9
 	mov %r11,8(%rsp)

@@ -243,9 +243,11 @@ dead, as after a crash, until a state loads (2026-10-18).
 
 The guest issues a syscall as `call [0x35f00000080]` with the number in rax and
 SysV C argument order (rdi,rsi,rdx,rcx,r8,r9 - note arg4 is rcx, NOT r10 as in
-the kernel ABI; the guest treats rbx, r12-r15 and all vector registers as
-clobbered across the call). Return value in rax; errors are `-errno` with the
-error threshold at `-4096`. Nothing of the host comes back in the other
+the kernel ABI; musl's stub for cancellable calls, used once a core links
+pthread_cancel, put it in r10 until the kit of 2026-10-18; the guest treats
+rbx, r12-r15 and all vector registers as clobbered across the call). Return
+value in rax; errors are `-errno` with the error threshold at `-4096`.
+Nothing of the host comes back in the other
 registers: rcx, rdx, rsi, rdi, r8-r11 and xmm0-15 read zero after the call
 (the same at the other two ways into the guest, section 9). Not a new version:
 those registers held host values before, which no movie can depend on.
@@ -273,7 +275,10 @@ Implemented syscalls and their EXACT semantics:
   message and return old break (NO error). addr > old -> mmap_fixed [old,addr)
   RW, set break=addr. else return old.
 - **stat(4)/fstat(5)**: VFS stat (see 8).
-- **ioctl(16)**: returns 0 unconditionally.
+- **ioctl(16)**: returns 0. Nothing is a terminal and nothing is waiting, and
+  what a guest reads back is written (2026-10-18): TIOCGWINSZ a zero window
+  size (8 bytes), TCGETS zero termios (36 bytes), FIONREAD 0; EFAULT when that
+  memory is not the guest's to write. Any other request writes nothing.
 - **read(0)/write(1)/readv(19)/writev(20)**: VFS I/O; iov entries with
   iov_base==0 are skipped.
 - **open(2)/close(3)/lseek(8)/truncate(76)/ftruncate(77)**: VFS.
@@ -292,7 +297,9 @@ Implemented syscalls and their EXACT semantics:
 - **set_thread_area(205)** -> ENOSYS (musl handles in userspace).
 - **set_tid_address(218)**, **gettid(186)**, **sched_yield(24)**,
   **nanosleep(35)/clock_nanosleep(230)** (treated as yields),
-  **rt_sigprocmask(14)** -> 0, **getpid(39)/getppid(110)** -> 1.
+  **rt_sigprocmask(14)** -> 0 with the old mask written as empty (nothing is
+  delivered, so nothing is blocked; EFAULT for a mask the guest cannot use,
+  EINVAL for a size over 128; 2026-10-18), **getpid(39)/getppid(110)** -> 1.
 - Everything else: trap to the debugger (breakpoint) then return ENOSYS. This
   forbids getrandom, gettimeofday/time, sockets, fork/execve, openat, arch_prctl
   from the guest, poll/select, and all other host-observing calls.
@@ -330,7 +337,10 @@ save/load require no writable files mounted and the identical readonly file set.
 - On entering a guest export, and on returning from a host callback, r10 and
   xmm0-15 read zero (after a callback also rcx, rdx, rsi, rdi, r8, r9 and r11;
   rax is the result). A guest that spills a register it never set - a varargs
-  prologue spills xmm0-7 - must not find a host address in it.
+  prologue spills xmm0-7 - must not find a host address in it. On entering a
+  guest export the callee-saved rbx, rbp and r12-r15 read zero too
+  (2026-10-18): a guest prologue or a cothread switch saves them into memory
+  a state carries, and they held the host's pointers, different every run.
 - Floating-point control words (2026-10-18): the x87 control word and MXCSR
   are part of the machine. A guest starts with 0x037F (64-bit precision,
   round to nearest, exceptions masked) and 0x1F80, whatever thread calls in

@@ -234,9 +234,10 @@ int main(int argc, char **argv)
 	/* two calls in the run are wrong on purpose - a descriptor write with
 	 * nothing to read, and one to a set that does not exist - and they, and
 	 * only they, must have been refused */
-	/* the run resets its descriptor pool a thousand times and fills it again */
+	/* the run resets its descriptor pool a thousand times and fills it again,
+	 * and makes and destroys a semaphore a thousand times */
 	fprintf(stderr, "bridged: %lu handle slots used\n", chimera_vk_host_handle_slots());
-	EXPECT(chimera_vk_host_handle_slots() < 500, "the table of handles grew with every pool reset (%lu slots)",
+	EXPECT(chimera_vk_host_handle_slots() < 500, "the table of handles grew with every pool reset or destroyed object (%lu slots)",
 	       chimera_vk_host_handle_slots());
 
 	long last = -1;

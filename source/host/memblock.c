@@ -90,8 +90,20 @@ mb_prot mb_page_native_prot(const mb_page *p) {
 	 * page included. Hot means "written every frame, so a hold buys a fault
 	 * every frame", which is the right trade for an epoch and the wrong one
 	 * here: the bytes of a state have to stand still until they are copied,
-	 * and that is one fault, once, per page. */
-	if (p->plan_hold) return status_prot(p->status) == MB_PROT_RWX ? MB_PROT_RX : MB_PROT_R;
+	 * and that is one fault, once, per page.
+	 *
+	 * A hold takes away writing and nothing else. It used to make the page
+	 * readable whatever the guest had asked for since, so a page the guest
+	 * made PROT_NONE while a state was still being filled could be read
+	 * without the fault the guest was waiting for (RPCS3's texture cache
+	 * watches pages that way), and whether it faulted depended on how far the
+	 * copier had got (analysis of 2026-10-18). */
+	if (p->plan_hold) {
+		const mb_prot asked = status_prot(p->status);
+		if (asked == MB_PROT_RWX) return MB_PROT_RX;
+		if (asked == MB_PROT_RW || asked == MB_PROT_RWSTACK) return MB_PROT_R;
+		return asked;
+	}
 	/* A hot page is never held: it is written every frame, so the fault a
 	 * hold buys would come every frame too. It is compared instead (page_heat). */
 	if (p->hot) return status_prot(p->status);

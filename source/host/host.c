@@ -297,6 +297,10 @@ bool mb_host_death(mb_host *h, char *out, size_t cap) {
  * for, and the result column is where that shows. */
 static uintptr_t MB_SYSV dispatch(uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,
                           uintptr_t a5, uintptr_t a6, uintptr_t nr, void *hp) {
+	/* Host C counts on the direction flag being clear (memcpy, memset), and
+	 * a guest that called in with it set handed that over (analysis of
+	 * 2026-10-18). Before anything else, so nothing runs backwards. */
+	__asm__ volatile("cld" ::: "memory");
 #ifdef MB_HAVE_FSBASE
 	/* The guest trapped in here with %fs = its own thread pointer (a Rust guest
 	 * uses %fs-direct TLS), but everything below is host C and glibc - malloc
@@ -449,20 +453,26 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			} else res = mb_block_mremap(h->block, r, a3, h->layout.mmap_arena);
 			return res < 0 ? serr((int)-res) : sok(res);
 		}
+		/* mprotect, munmap and madvise round an unaligned length up to a page,
+		 * as the kernel does and as mmap here always has; they refused it
+		 * (analysis of 2026-10-18). A length that would wrap is EINVAL. */
 		case NR_mprotect: {
 			bool bad; mb_prot prot = arg_to_prot(a3, &bad); if (bad) return serr(EINVAL);
-			mb_range r = { a1, a2 };
+			if (a2 > UINTPTR_MAX - 0xFFF) return serr(EINVAL);
+			mb_range r = { a1, (a2 + 0xFFF) & ~(uintptr_t)0xFFF };
 			int res = mb_block_mprotect(h->block, r, prot);
 			return res ? serr(-res) : sok(0);
 		}
 		case NR_munmap: {
-			mb_range r = { a1, a2 };
+			if (a2 > UINTPTR_MAX - 0xFFF) return serr(EINVAL);
+			mb_range r = { a1, (a2 + 0xFFF) & ~(uintptr_t)0xFFF };
 			/* a thread freeing the stack it is standing on: hold it until it exits */
 			if (mb_threads_hold_stack_unmap(h->threads, r)) return sok(0);
 			int res = mb_block_munmap(h->block, r); return res ? serr(-res) : sok(0);
 		}
 		case NR_madvise:
-			if (a3 == MADV_DONTNEED) { mb_range r = { a1, a2 }; int res = mb_block_madvise_dontneed(h->block, r); return res ? serr(-res) : sok(0); }
+			if (a3 == MADV_DONTNEED) { if (a2 > UINTPTR_MAX - 0xFFF) return serr(EINVAL);
+				mb_range r = { a1, (a2 + 0xFFF) & ~(uintptr_t)0xFFF }; int res = mb_block_madvise_dontneed(h->block, r); return res ? serr(-res) : sok(0); }
 			return sok(0);
 		case NR_brk: {
 			mb_range arena = h->layout.sbrk; uintptr_t old = h->program_break, res;
@@ -477,7 +487,21 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 		                 mb_sword r = mb_fs_stat_name(h->fs, p, (void *)a2); return r < 0 ? serr((int)-r) : sok(0); }
 		case NR_fstat: { if (!guest_can(h, a2, 144, true)) return serr(EFAULT);
 		                 mb_sword r = mb_fs_stat_fd(h->fs, (int)a1, (void *)a2); return r < 0 ? serr((int)-r) : sok(0); }
-		case NR_ioctl: return sok(0);
+		case NR_ioctl: {
+			/* No devices, so nothing is a terminal; but a core asks, and each
+			 * answer it reads is written, so that it does not read whatever was
+			 * on its stack (analysis of 2026-10-18). The window size is zero by
+			 * zero, termios all zeros, and nothing is waiting to be read. Any
+			 * other request is answered "done", as it always was. */
+			const uintptr_t req = a2 & 0xFFFFFFFFu;
+			const uintptr_t out = req == 0x5413 ? 8 /* TIOCGWINSZ */ : req == 0x5401 ? 36 /* TCGETS */
+				: req == 0x541B ? 4 /* FIONREAD */ : 0;
+			if (out != 0) {
+				if (!guest_can(h, a3, out, true)) return serr(EFAULT);
+				memset((void *)a3, 0, out);
+			}
+			return sok(0);
+		}
 		/* No pipes in-guest (musl's posix_spawn, backing system(),
 		 * needs pipe2 and fails here; without an in-guest provider
 		 * this stays unreachable).
@@ -706,7 +730,18 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			}
 			return sok(0);
 		}
-		case NR_rt_sigprocmask: return sok(0);
+		case NR_rt_sigprocmask: {
+			/* Nothing is delivered, so nothing is blocked: the old mask is
+			 * written as empty, not left as what was on the stack. (a1 how,
+			 * a2 set, a3 oldset, a4 sigsetsize; the kernel's is 8 bytes.) */
+			if (a4 > 128) return serr(EINVAL);
+			if (a2 != 0 && !guest_can(h, a2, a4, false)) return serr(EFAULT);
+			if (a3 != 0) {
+				if (!guest_can(h, a3, a4, true)) return serr(EFAULT);
+				memset((void *)a3, 0, a4);
+			}
+			return sok(0);
+		}
 		case NR_tkill: case NR_tgkill: {
 			/* A signal to one of its own threads. The one a guest sends is to itself:
 			 * musl's abort() is tkill(self, SIGABRT), which is how a Rust panic, a

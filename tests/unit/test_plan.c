@@ -286,6 +286,28 @@ static void test_an_unmap_during_a_plan(void) {
 	}
 }
 
+/* A page the guest takes every right from while a state still owes it stays
+ * without them: the hold takes away writing, not what the guest asked for. It
+ * was readable until the copier got to it. */
+static void test_a_hold_keeps_the_guests_protection(void) {
+	mb_block *b = running(0x80000);
+	const size_t size = mb_block_state_size(b);
+	uint8_t *dest = (uint8_t *)calloc(1, size);
+	CHECK(dest != NULL);
+	CHECK(mb_block_state_plan(b, dest) != 0);
+	mb_range none = { b->addr.start + 0x20000, MB_PAGESIZE };
+	CHECK_EQ(mb_block_mprotect(b, none, MB_PROT_NONE), 0);
+	CHECK(!mb_page_readable(none.start));
+	mb_range ro = { b->addr.start + 0x21000, MB_PAGESIZE };
+	CHECK_EQ(mb_block_mprotect(b, ro, MB_PROT_R), 0);
+	CHECK(mb_page_readable(ro.start));
+	CHECK(mb_block_maps_consistent(b));
+	CHECK_EQ(mb_block_plan_finish(b), 0);
+	CHECK(!mb_page_readable(none.start));
+	free(dest);
+	mb_block_free(b);
+}
+
 /* The host writing into the machine while a state is being taken - the same
  * mirror, the same silence. */
 static void test_an_external_copy_during_a_plan(void) {
@@ -397,6 +419,7 @@ static void run_all(void) {
 	RUN(test_an_external_copy_during_a_plan);
 	RUN(test_a_load_during_a_plan);
 	RUN(test_a_writer_waits_out_a_copy);
+	RUN(test_a_hold_keeps_the_guests_protection);
 }
 
 TEST_MAIN()

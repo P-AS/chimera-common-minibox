@@ -395,6 +395,14 @@ static void vkt_run(vkt_lookup get, struct vkt_result *out, int through_bridge)
 		VKT_STEP(65, VKT(vkResetDescriptorPool)(dev, dpool, 0));
 		VKT_STEP(65, VKT(vkAllocateDescriptorSets)(dev, &dsai, &set));
 	}
+	/* and an object made and destroyed a thousand times: its slot too is
+	 * given out again (2026-10-18) */
+	for (int k = 0; k < 1000; k++) {
+		VkSemaphoreCreateInfo sci = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+		VkSemaphore made = VK_NULL_HANDLE;
+		VKT_STEP(65, VKT(vkCreateSemaphore)(dev, &sci, NULL, &made));
+		VKT(vkDestroySemaphore)(dev, made, NULL);
+	}
 
 	VkBuffer ubo = VK_NULL_HANDLE, vbo = VK_NULL_HANDLE;
 	VkDeviceMemory ubo_mem = VK_NULL_HANDLE, vbo_mem = VK_NULL_HANDLE;

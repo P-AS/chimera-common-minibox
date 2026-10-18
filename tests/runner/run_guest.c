@@ -844,6 +844,17 @@ int main(int argc, char **argv) {
 	{
 		typedef int (MB_GUEST_ABI *int_fn)(void);
 		CHECK(((int_fn)proc(h, "SigactionAccepted"))() == 1);
+		CHECK(((int_fn)proc(h, "AnswersAreWritten"))() == 1);
+		CHECK(((int_fn)proc(h, "CancellableCallKeepsItsArguments"))() == 1);
+		typedef uint64_t (MB_GUEST_ABI *u64_fn)(void);
+		CHECK(((u64_fn)proc(h, "CalleeSavedOnEntry"))() == 0);
+		CHECK(((int_fn)proc(h, "ReturnsBackwards"))() == 1);
+		CHECK(((int_fn)proc(h, "UnalignedLengthsRoundUp"))() == 1);
+		{
+			uint64_t flags;
+			__asm__ volatile("pushfq\n\tpopq %0" : "=r"(flags));
+			CHECK((flags & 0x400) == 0);   /* DF */
+		}
 		CHECK(((int_fn)proc(h, "PipeRefused"))() == 1);
 		CHECK(((int_fn)proc(h, "GetrusageZeroed"))() == 1);
 		CHECK(((int_fn)proc(h, "NullCloneRefused"))() == 1);

@@ -7,6 +7,7 @@
 /* for syscall(): musl declares it only under _GNU_SOURCE, and this file is
  * compiled -std=c11 */
 #define _GNU_SOURCE
+#include <sys/ioctl.h>
 #include <sys/sysinfo.h>
 #include <emulibc.h>
 #include <stdint.h>
@@ -107,6 +108,78 @@ ECL_EXPORT int SigactionAccepted(void) {
 	errno = 0;
 	if (syscall(SYS_rt_sigaction, SIGUSR1, 0, (void *)16, 8) != -1 || errno != EFAULT) return 0;
 	return 1;
+}
+
+/* What a core reads back from rt_sigprocmask and ioctl is written: an empty
+ * old mask, a zero window size, nothing waiting (2026-10-18). Both answered
+ * "done" and wrote nothing, so a core read what was on its stack. */
+ECL_EXPORT int AnswersAreWritten(void) {
+	sigset_t old;
+	memset(&old, 0xA5, sizeof old);
+	sigset_t block;
+	sigemptyset(&block);
+	sigaddset(&block, SIGUSR1);
+	if (syscall(SYS_rt_sigprocmask, SIG_BLOCK, &block, &old, 8) != 0) return 0;
+	const uint8_t *bytes = (const uint8_t *)&old;
+	for (int i = 0; i < 8; i++) if (bytes[i] != 0) return 0;
+	struct winsize ws;
+	memset(&ws, 0xA5, sizeof ws);
+	if (ioctl(1, TIOCGWINSZ, &ws) != 0 || ws.ws_row != 0 || ws.ws_col != 0) return 0;
+	int waiting = -1;
+	if (ioctl(0, FIONREAD, &waiting) != 0 || waiting != 0) return 0;
+	errno = 0;
+	if (syscall(SYS_rt_sigprocmask, SIG_BLOCK, &block, (void *)16, 8) != -1 || errno != EFAULT) return 0;
+	return 1;
+}
+
+/* The callee-saved registers a guest function finds on entry: all zero, not
+ * the host's (2026-10-18). Read before anything of the function can touch
+ * them. */
+ECL_EXPORT __attribute__((naked)) uint64_t CalleeSavedOnEntry(void) {
+	__asm__ volatile(
+		"movq %rbx, %rax\n\t"
+		"orq %rbp, %rax\n\t"
+		"orq %r12, %rax\n\t"
+		"orq %r13, %rax\n\t"
+		"orq %r14, %rax\n\t"
+		"orq %r15, %rax\n\t"
+		"ret");
+}
+
+/* A length that is not a whole number of pages is rounded up, as the kernel
+ * does: mmap always did, and mprotect, munmap and madvise refused it
+ * (2026-10-18). */
+ECL_EXPORT int UnalignedLengthsRoundUp(void) {
+	uint8_t *p = mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (p == MAP_FAILED) return 0;
+	p[4096] = 1;
+	if (mprotect(p, 4097, PROT_READ) != 0) return 0;
+	if (madvise(p, 10, MADV_DONTNEED) != 0) return 0;
+	if (munmap(p, 4097) != 0) return 0;         /* two pages */
+	if (munmap(p + 8192, 1) != 0) return 0;     /* and the third */
+	return 1;
+}
+
+/* Returns with the direction flag set, which no correct function does: the
+ * host must not run on with it (2026-10-18). */
+ECL_EXPORT __attribute__((naked)) int ReturnsBackwards(void) {
+	__asm__ volatile("std\n\tmovl $1, %eax\n\tret");
+}
+
+/* A cancellable call keeps its fourth argument. With pthread_cancel linked,
+ * musl makes such calls through __syscall_cp_asm, which put the fourth in r10,
+ * where a call into the host does not look, so pread's offset was lost
+ * (2026-10-18). */
+static volatile int g_never;
+ECL_EXPORT int CancellableCallKeepsItsArguments(void) {
+	if (g_never) pthread_cancel(pthread_self());   /* brings in the cancellable path */
+	int fd = open("seed", O_RDONLY);
+	if (fd < 0) return 0;
+	uint8_t all[4], two[2];
+	if (read(fd, all, 4) != 4) return 0;
+	if (pread(fd, two, 2, 1) != 2) return 0;
+	close(fd);
+	return two[0] == all[1] && two[1] == all[2];
 }
 
 /* The floating-point control words are the guest's own (mb_context,

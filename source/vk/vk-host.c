@@ -320,6 +320,14 @@ static void *vkb_h_array(const void *ids, uint64_t count, int kind)
 	return out;
 }
 
+static void vkb_give_back(uint32_t slot);
+
+/* A destroyed handle names nothing from now on, and its slot is given out
+ * again. Only a pool's children were before, so the table grew by every
+ * buffer, image and fence ever made until the next load, and after sixteen
+ * million a create answered success with a null handle (analysis of
+ * 2026-10-18). A child stays on its pool's list until the pool resets or
+ * goes, which gives its slot back then. */
 static void vkb_forget(uint64_t id, int kind)
 {
 	struct entry *e = vkb_entry(id, kind);
@@ -328,6 +336,10 @@ static void vkb_forget(uint64_t id, int kind)
 	free(e->memory);
 	e->memory = NULL;
 	e->host = 0;
+	if (e->parent == 0 && e->first_child == 0) {
+		e->gen++;
+		vkb_give_back(vkb_slot(id));
+	}
 }
 
 /* What a pool takes with it: its own list, newest first, and every slot on
@@ -348,18 +360,23 @@ static void vkb_forget_children(uint32_t parent)
 		e->host = 0;
 		e->next_sibling = 0;
 		e->gen++;
-		if (s_free_count == s_free_room) {
-			const uint32_t room = s_free_room ? s_free_room * 2 : 1024;
-			uint32_t *grown = realloc(s_free, (size_t)room * sizeof *grown);
-			if (grown) {
-				s_free = grown;
-				s_free_room = room;
-			}
-		}
-		if (s_free_count < s_free_room)
-			s_free[s_free_count++] = i;   /* (with no room, the slot is just not reused) */
+		vkb_give_back(i);
 		i = next;
 	}
+}
+
+static void vkb_give_back(uint32_t slot)
+{
+	if (s_free_count == s_free_room) {
+		const uint32_t room = s_free_room ? s_free_room * 2 : 1024;
+		uint32_t *grown = realloc(s_free, (size_t)room * sizeof *grown);
+		if (grown) {
+			s_free = grown;
+			s_free_room = room;
+		}
+	}
+	if (s_free_count < s_free_room)
+		s_free[s_free_count++] = slot;   /* (with no room, the slot is just not reused) */
 }
 
 unsigned long chimera_vk_host_handle_slots(void) { return s_slots_peak; }
