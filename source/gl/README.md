@@ -61,3 +61,15 @@ the rule, and fails on the one-buffer version.
 A core gets this when its wrapper file is generated again - at its next build
 for the cores that generate it while building, and when somebody regenerates
 and commits it for the ones that keep it in their repository.
+
+## A function the driver does not provide (2026-10-18)
+
+Every host case the generator writes asks first whether glad found the
+function: a driver that lacks one leaves glad's pointer null, and the core has
+a wrapper for every name, so a renderer that checks a function pointer rather
+than the GL version reached a call through null and the process ended. The
+case now answers 0, as a call the driver refused, and calls
+`CHIMERA_GL_UNSUPPLIED(op, name)` first. The generated file defines that as
+nothing unless the host defined it before including the file: Chimera's
+bridge says which function, once; a core repository's own test runner needs
+nothing new. The hand-written cases in Chimera's `gl_bridge.cpp` do the same.

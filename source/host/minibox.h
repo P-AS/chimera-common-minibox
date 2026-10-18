@@ -110,6 +110,12 @@ void wbx_set_always_evict_blocks(bool val);
  * file (UTF-8 path, appended, flushed per write) until called with NULL. */
 void wbx_set_output_file(const char *path, mb_return *ret);
 void wbx_get_page_len(mb_host *obj, mb_return *ret);
+/* Whether host code may read (write false) or write the guest's bytes
+ * [addr, addr+len): data 1 or 0 - inside its memory, every page allocated and
+ * with the access, or protected below it by a guest whose fault handler will
+ * be asked. For a frontend that follows a pointer the core handed it, as
+ * Chimera's GPU bridge does (2026-10-18). */
+void wbx_guest_range_ok(mb_host *obj, uintptr_t addr, uintptr_t len, bool write, mb_return *ret);
 void wbx_get_page_data(mb_host *obj, uintptr_t index, mb_return *ret);
 /* Whether the guest has died - aborted, halted, faulted, exited, or asked for
  * something the host does not provide - and why, as one line for a person.

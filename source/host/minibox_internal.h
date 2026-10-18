@@ -307,6 +307,9 @@ bool mb_block_range_is_free(mb_block *b, mb_range addr);
  * guest gave it - or less, when guest_asks says a fault there goes to the
  * guest's own handler (MACHINE-SPEC, "Guest fault forwarding"). len 0 is true. */
 bool mb_block_host_can(mb_block *b, uintptr_t addr, uintptr_t len, bool write, bool guest_asks);
+/* the same for a whole machine, its fault handler counted (host.c) */
+typedef struct mb_host mb_host;
+bool mb_host_guest_can(mb_host *h, uintptr_t addr, uintptr_t len, bool write);
 int  mb_block_mark_invisible(mb_block *b, mb_range addr);
 int  mb_block_copy_from_external(mb_block *b, const uint8_t *src, uintptr_t start, uintptr_t len);
 int  mb_block_seal(mb_block *b);

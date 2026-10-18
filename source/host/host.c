@@ -159,6 +159,13 @@ static bool guest_can(mb_host *h, uintptr_t addr, uintptr_t len, bool write)
 	return guest_owns(h, addr, len) && mb_block_host_can(h->block, addr, len, write, h->fault_raw != 0);
 }
 
+/* The same question for a host outside miniBox: Chimera's GPU bridge, before
+ * it reads a buffer the core hands GL or writes a readback into its memory. */
+bool mb_host_guest_can(mb_host *h, uintptr_t addr, uintptr_t len, bool write)
+{
+	return guest_can(h, addr, len, write);
+}
+
 /* A NUL-terminated string in guest memory, or NULL. The scan stops at the end
  * of the arena, so an unterminated string cannot walk the host off the end. */
 static const char *guest_str(mb_host *h, uintptr_t addr)

@@ -243,6 +243,9 @@ void wbx_set_output_file(const char *path, mb_return *ret) {
 }
 
 void wbx_get_page_len(mb_host *obj, mb_return *ret) { ok(ret, mb_host_page_len(obj)); }
+void wbx_guest_range_ok(mb_host *obj, uintptr_t addr, uintptr_t len, bool write, mb_return *ret) {
+	ok(ret, mb_host_guest_can(obj, addr, len, write) ? 1 : 0);
+}
 
 /* The sealed machine's identity, 32 bytes, copied into the caller's buffer.
  * A caller that CACHES states across sessions needs this: two boots of one core

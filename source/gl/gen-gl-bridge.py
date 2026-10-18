@@ -211,6 +211,7 @@ def main():
             host.append(f"""		case CHIMERA_GL_OP_{name}:
 		{{
 			{f'struct {struct} *chimera_p = (struct {struct} *)a;' if args else '(void)a;'}
+			if (glad_{name} == NULL) {{ CHIMERA_GL_UNSUPPLIED(CHIMERA_GL_OP_{name}, "{name}"); return 0; }}
 			{name}({call_args});
 			return 0;
 		}}""")
@@ -228,6 +229,7 @@ def main():
             host.append(f"""		case CHIMERA_GL_OP_{name}:
 		{{
 			{f'struct {struct} *chimera_p = (struct {struct} *)a;' if args else '(void)a;'}
+			if (glad_{name} == NULL) {{ CHIMERA_GL_UNSUPPLIED(CHIMERA_GL_OP_{name}, "{name}"); return 0; }}
 			return (uintptr_t){name}({call_args});
 		}}""")
 
@@ -309,8 +311,16 @@ uint64_t chimera_gl_context_id(void)
 """
                 + "\n".join(lookup) + "\n")
 
+    # A function the driver did not supply is a null glad pointer, and the guest
+    # has a wrapper for every name: the case answers 0, as a call the driver
+    # refused, instead of calling through null and ending the process
+    # (2026-10-18). A host that wants it said defines CHIMERA_GL_UNSUPPLIED
+    # before including this; the core repos' test runners need not.
+    unsupplied = ("#ifndef CHIMERA_GL_UNSUPPLIED\n"
+                  "#define CHIMERA_GL_UNSUPPLIED(op, name) ((void)0)\n"
+                  "#endif\n")
     with open(f"{outdir}/gl-bridge-host.inc", "w") as f:
-        f.write(banner + "\n".join(host) + "\n")
+        f.write(banner + unsupplied + "\n".join(host) + "\n")
 
     print(f"{len(entries)} entry points generated"
           + (f"; {len(missing)} not found in glad: {' '.join(missing)}" if missing else ""))
