@@ -166,6 +166,13 @@ bool mb_host_guest_can(mb_host *h, uintptr_t addr, uintptr_t len, bool write)
 	return guest_can(h, addr, len, write);
 }
 
+/* The bytes for reading only, through the mirror: see mb_block_read_view */
+const void *mb_host_read_view(mb_host *h, uintptr_t addr, uintptr_t len)
+{
+	if (!guest_owns(h, addr, len)) return NULL;
+	return mb_block_read_view(h->block, addr, len);
+}
+
 /* A NUL-terminated string in guest memory, or NULL. The scan stops at the end
  * of the arena, so an unterminated string cannot walk the host off the end. */
 static const char *guest_str(mb_host *h, uintptr_t addr)

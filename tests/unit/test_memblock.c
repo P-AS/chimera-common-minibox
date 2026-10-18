@@ -587,6 +587,57 @@ static void test_mmap_placement_is_the_page_walks(void) {
 	mb_block_free(b);
 }
 
+/* The read view (mb_block_read_view, for a frontend's memory tools): the
+ * guest's bytes through the mirror, a page the guest made no-access included
+ * - read through the guest's own view, that page faults. Outside the block,
+ * past its end and empty, there is none. */
+static void test_read_view(void) {
+	mb_block *b = fresh(0x10000);
+	mb_range two = { b->addr.start, 0x2000 };
+	CHECK_EQ(mb_block_mmap_fixed(b, two, MB_PROT_RW, true), 0);
+	gp(b, 0x10)[0] = 0x5A;
+	gp(b, 0x1ff0)[0] = 0xA5;
+	mb_range second = { b->addr.start + 0x1000, 0x1000 };
+	CHECK_EQ(mb_block_mprotect(b, second, MB_PROT_NONE), 0);
+	const uint8_t *v = mb_block_read_view(b, b->addr.start, 0x2000);
+	CHECK(v != NULL);
+	if (v != NULL) {
+		CHECK(v != (const uint8_t *)b->addr.start);
+		CHECK_EQ(v[0x10], 0x5A);
+		CHECK_EQ(v[0x1ff0], 0xA5);   /* the no-access page, read without a fault */
+	}
+	CHECK(mb_block_read_view(b, b->addr.start, 0) == NULL);
+	CHECK(mb_block_read_view(b, b->addr.start - 0x1000, 0x10) == NULL);
+	CHECK(mb_block_read_view(b, b->addr.start + 0xf000, 0x2000) == NULL);
+	mb_block_free(b);
+}
+
+#ifdef _WIN32
+/* A lazy block's page with no memory behind it gets some in the mirror alone,
+ * reads zero, and is still the guest's to commit: its first mapping commits
+ * it as before. A commit the OS refuses gives no view. */
+static void test_read_view_lazy(void) {
+	mb_block *b = fresh(LAZY_SIZE);
+	CHECK(b->handle.lazy);
+	mb_range four = { b->addr.start, 0x4000 };
+	CHECK_EQ(mb_block_mmap_fixed(b, four, MB_PROT_NONE, true), 0);   /* reserved, not committed */
+	CHECK(b->pages[0].uncommitted);
+	mb_pal_commit_refusals = 1;
+	CHECK(mb_block_read_view(b, b->addr.start, 0x4000) == NULL);
+	mb_pal_commit_refusals = 0;
+	const uint8_t *v = mb_block_read_view(b, b->addr.start, 0x4000);
+	CHECK(v != NULL);
+	if (v != NULL) CHECK_EQ(v[0x2345], 0);
+	CHECK(b->pages[0].uncommitted);
+	CHECK_EQ(mb_block_mprotect(b, four, MB_PROT_RW), 0);
+	CHECK(!b->pages[0].uncommitted);
+	gp(b, 0x2345)[0] = 0x77;
+	if (v != NULL) CHECK_EQ(v[0x2345], 0x77);
+	CHECK(mb_block_maps_consistent(b));
+	mb_block_free(b);
+}
+#endif
+
 static void run_all(void) {
 	test_free_releases_the_mirror();
 	RUN(test_dirty_offset);
@@ -608,6 +659,7 @@ static void run_all(void) {
 	RUN(test_copy_from_external);
 	RUN(test_page_info_encoding);
 	RUN(test_write_with_sp_in_a_declared_stack);
+	RUN(test_read_view);
 #ifdef _WIN32
 	/* Real Windows only. Wine reimplements Win32 and will not commit pages
 	 * inside a reserved section's view: the retry these two make at fault
@@ -621,6 +673,7 @@ static void run_all(void) {
 		RUN(test_refused_commit_is_retried_on_fault);
 		RUN(test_refused_again_is_out_of_memory);
 		RUN(test_refused_commit_stops_a_move);
+		RUN(test_read_view_lazy);
 	}
 #endif
 }

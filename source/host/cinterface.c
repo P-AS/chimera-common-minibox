@@ -246,6 +246,11 @@ void wbx_get_page_len(mb_host *obj, mb_return *ret) { ok(ret, mb_host_page_len(o
 void wbx_guest_range_ok(mb_host *obj, uintptr_t addr, uintptr_t len, bool write, mb_return *ret) {
 	ok(ret, mb_host_guest_can(obj, addr, len, write) ? 1 : 0);
 }
+void wbx_guest_read_view(mb_host *obj, uintptr_t addr, uintptr_t len, mb_return *ret) {
+	const void *view = mb_host_read_view(obj, addr, len);
+	if (view == NULL) { err(ret, "not the guest's memory, or no memory could be given to it"); return; }
+	ok(ret, (uintptr_t)view);
+}
 
 /* The sealed machine's identity, 32 bytes, copied into the caller's buffer.
  * A caller that CACHES states across sessions needs this: two boots of one core

@@ -170,6 +170,16 @@ A one-shot operation after core init, before any savestate. Steps, in order:
    block address range followed by, per page, a tag byte 1 (None), 2
    (ZeroFilled), or the 4096 snapshot bytes (Data). Mark sealed.
 
+   A None page is named by its tag, not its bytes, so two boots that leave
+   different bytes in the same pages seal to the same hash. Taking the bytes
+   was measured (2026-10-18) and not done: six cores booted twice, in two
+   processes, left the same bytes on Linux (up to 195 MB of such pages, up to
+   112 ms to hash them), but on Windows Ruffle's two boots differed in 33
+   pages. The differing words are host addresses: Windows handles a fault on
+   the faulting thread's own stack, which is the guest's, and guest code later
+   copies what that left there into its heap. Hashing the bytes would refuse
+   such a core's states in every new process on Windows, as issue #80 did.
+
 Savestate/load are illegal before seal.
 
 ## 6. Savestate format
@@ -233,8 +243,9 @@ Load reconstructs each page from the (old_dirty, new_dirty) pair:
 
 Verification: ELF hash mismatch is a hard error; readonly-file hash and
 name/order mismatches are hard errors; block address mismatch is a hard error;
-block hash mismatch is a warning only (the reference does not fail on it - a
-known soft spot). A load refused before any memory moved (the magics, the ELF
+block hash mismatch is a hard error too (the reference only warns, a known
+soft spot there): a state of another sealed baseline is refused before any
+memory moves. A load refused before any memory moved (the magics, the ELF
 hash, the block's hash and address) leaves the machine as it was; a load that
 fails after that has a mix of two machines, and poisons the instance: it is
 dead, as after a crash, until a state loads (2026-10-18).
@@ -426,6 +437,18 @@ thunk, so that its own system calls (unprotecting the page) work. Before
 2026-10-15 it was called directly in that case too, and its first system call
 ended the process (Chimera issue 280). Not observable to a guest that handles
 its faults: it is now called where it used to kill the host.
+
+A frontend that only READS guest memory - its memory tools, between frames,
+on a thread of its own - does not go through the guest's view at all
+(2026-10-18). Read there, a page the guest protected faults, the handler runs
+on the frontend's thread, and a handler that writes memory (RPCS3's texture
+cache writes the picture back) changes the machine: a movie could play
+differently with a memory search open. `wbx_guest_read_view` hands it a
+pointer to the same bytes through the block's mirror, which never faults; a
+page the guest gave back reads as zeros there. A page of a lazy block (Windows,
+over 4 GiB) with no memory behind it yet is given memory in the mirror alone
+and reads zero. Writes still go through the guest's view, where dirty
+tracking sees them.
 
 ## A broken guest ends the machine, not the host (2026-10-18)
 

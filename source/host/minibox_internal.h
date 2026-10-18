@@ -310,6 +310,11 @@ bool mb_block_host_can(mb_block *b, uintptr_t addr, uintptr_t len, bool write, b
 /* the same for a whole machine, its fault handler counted (host.c) */
 typedef struct mb_host mb_host;
 bool mb_host_guest_can(mb_host *h, uintptr_t addr, uintptr_t len, bool write);
+/* A pointer through which host code may READ the bytes [addr, addr+len) of the
+ * guest without a fault: the block's mirror. NULL when the range is not inside
+ * the block, or a lazy block's page has no memory and the OS gives it none. */
+const void *mb_block_read_view(mb_block *b, uintptr_t addr, uintptr_t len);
+const void *mb_host_read_view(mb_host *h, uintptr_t addr, uintptr_t len);
 int  mb_block_mark_invisible(mb_block *b, mb_range addr);
 int  mb_block_copy_from_external(mb_block *b, const uint8_t *src, uintptr_t start, uintptr_t len);
 int  mb_block_seal(mb_block *b);

@@ -1058,6 +1058,46 @@ bool mb_block_host_can(mb_block *b, uintptr_t addr, uintptr_t len, bool write, b
 	return true;
 }
 
+/* For host code that only reads the guest's bytes - a frontend's memory
+ * tools, between frames. Read through the guest's own view, a page the guest
+ * made no-access faults, and the fault is passed to the guest's handler
+ * (MACHINE-SPEC, "Guest fault forwarding"): RPCS3's texture cache watches
+ * pages that way, and its handler writes the picture back into memory, so a
+ * RAM search open or closed made a movie play differently (engine analysis,
+ * 2026-10-18). The mirror shows the same bytes and never faults, whatever the
+ * guest asked for. A page the guest gave back reads as zeros there, as it was
+ * zeroed (zero_run).
+ *
+ * A lazy block (Windows, over 4 GiB) backs a page only when the guest first
+ * maps it, and an unbacked page cannot be read through either view. Such
+ * pages get memory in the mirror alone, which reads zero, as the guest's view
+ * would once it had any; they stay marked uncommitted, so the guest's first
+ * use commits them as before (committing a committed mirror page again is
+ * allowed). Committed pages stay committed for the block's life, so the
+ * pointer stays good until the block is freed. */
+const void *mb_block_read_view(mb_block *b, uintptr_t addr, uintptr_t len) {
+	if (len == 0 || addr < b->addr.start || addr - b->addr.start >= b->addr.size
+		|| len > b->addr.size - (addr - b->addr.start)) return NULL;
+	if (b->handle.lazy) {
+		mb_block_track_lock(b);
+		const size_t first = (addr - b->addr.start) >> MB_PAGESHIFT;
+		const size_t last = (addr - b->addr.start + len - 1) >> MB_PAGESHIFT;
+		size_t i = first;
+		bool backed = true;
+		while (backed && i <= last) {
+			if (!b->pages[i].uncommitted) { i++; continue; }
+			size_t j = i + 1;
+			while (j <= last && b->pages[j].uncommitted) j++;
+			mb_range m = { mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)), (j - i) << MB_PAGESHIFT };
+			if (mb_pal_commit(m, MB_PROT_RW) != 0) backed = false;
+			i = j;
+		}
+		mb_block_track_unlock(b);
+		if (!backed) return NULL;
+	}
+	return (const void *)mirror_addr(b, addr);
+}
+
 bool mb_block_range_is_free(mb_block *b, mb_range addr) {
 	mb_block_track_lock(b);
 	size_t pcount, ps = validate(b, addr, &pcount);
@@ -1474,8 +1514,11 @@ static int seal_impl(mb_block *b) {
 	mb_sha256_final(&sh, b->hash);
 
 	/* MB_SEAL_DUMP=<file>: what the hash above was taken over, page by page -
-	 * address, status and snapshot kind, and the bytes of a DATA page - appended,
-	 * so two seals that disagree can be compared. A diagnostic; off unless set. */
+	 * address, status and snapshot kind, and the bytes of a DATA page and of a
+	 * live page that does not read back zero - appended, so two seals that
+	 * disagree can be compared, and two that agree compared byte for byte (the
+	 * hash names a live page by a tag, not by its bytes). A diagnostic; off
+	 * unless set. */
 	const char *seal_dump = getenv("MB_SEAL_DUMP");
 	if (seal_dump != NULL && *seal_dump) {
 		FILE *df = fopen(seal_dump, "ab");
@@ -1490,6 +1533,8 @@ static int seal_impl(mb_block *b) {
 				                    (uint64_t)(page_reads_back_zero(b, i) ? 1 : 0) };
 				fwrite(rec, sizeof(rec), 1, df);
 				if (b->pages[i].snap_kind == MB_SNAP_DATA) fwrite(b->pages[i].snap_data, MB_PAGESIZE, 1, df);
+				else if (b->pages[i].snap_kind == MB_SNAP_NONE && rec[3] == 0)
+					fwrite((const void *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)), MB_PAGESIZE, 1, df);
 			}
 			fclose(df);
 		}

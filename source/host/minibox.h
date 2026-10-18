@@ -116,6 +116,17 @@ void wbx_get_page_len(mb_host *obj, mb_return *ret);
  * be asked. For a frontend that follows a pointer the core handed it, as
  * Chimera's GPU bridge does (2026-10-18). */
 void wbx_guest_range_ok(mb_host *obj, uintptr_t addr, uintptr_t len, bool write, mb_return *ret);
+/* A pointer for READING the guest's bytes [addr, addr+len) without ever
+ * running guest code: ret->data, the same bytes through a second view of the
+ * guest's memory that never faults. Read through the guest's own view, a page
+ * the guest protected runs its fault handler, which may change the machine
+ * (RPCS3's texture cache writes the picture back), so a frontend's memory
+ * tools read through this (2026-10-18). A page the guest gave back reads as
+ * zeros. Good until the host is destroyed. Never write through it: no fault
+ * would tell dirty tracking, and states and the history would miss the write.
+ * An error when the range is not the guest's memory, or the OS gives it no
+ * memory (Windows, a block over 4 GiB, out of memory). */
+void wbx_guest_read_view(mb_host *obj, uintptr_t addr, uintptr_t len, mb_return *ret);
 void wbx_get_page_data(mb_host *obj, uintptr_t index, mb_return *ret);
 /* Whether the guest has died - aborted, halted, faulted, exited, or asked for
  * something the host does not provide - and why, as one line for a person.

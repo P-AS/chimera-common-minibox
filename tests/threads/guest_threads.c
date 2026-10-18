@@ -178,6 +178,27 @@ ECL_EXPORT uint64_t RunHostWriteFault(void) {
 	return bad;
 }
 
+/* For a frontend's memory tools, which read between frames from a thread
+ * that is not the guest's: a page the guest made no-access, filled with a
+ * pattern and watched by the handler. The host reads it through
+ * wbx_guest_read_view (the handler must not run) and then, as the control,
+ * through the guest's own view (it must). 0 when it could not be set up. */
+static volatile uint8_t *g_read_page;
+ECL_EXPORT uint64_t WatchForHostRead(void) {
+	g_read_page = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (g_read_page == MAP_FAILED) return 0;
+	for (int i = 0; i < 4096; i++) g_read_page[i] = (uint8_t)(i * 7 + 3);
+	if (mprotect((void *)g_read_page, 4096, PROT_NONE) != 0) return 0;
+	g_watched = (uintptr_t)g_read_page;
+	return (uint64_t)(uintptr_t)g_read_page;
+}
+/* how many times the handler has run on a watched page */
+ECL_EXPORT uint64_t HandlerRuns(void) { return g_handler_page[0]; }
+ECL_EXPORT uint64_t EndHostRead(void) {
+	g_watched = 0;
+	return munmap((void *)g_read_page, 4096) == 0;
+}
+
 ECL_EXPORT uint64_t RunGuestFault(void) {
 	/* volatile: the write must happen while the page is watched, not be
 	 * moved past the store that stops watching it */

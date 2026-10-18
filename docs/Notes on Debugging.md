@@ -289,9 +289,13 @@ other's states across two processes, the two seals differ somewhere - and the
 hash alone does not say where.
 
 `MB_SEAL_DUMP=<file>` appends, at every seal, what the hash was taken over: for
-each page its address, status and snapshot kind, and the page's bytes when it
-kept a DATA snapshot. Seal twice, in two processes, and compare the files page by
-page.
+each page its address, status and snapshot kind, whether it reads back zero,
+and the page's bytes when it kept a DATA snapshot or is a live page that does
+not read back zero. Seal twice, in two processes, and compare the files page by
+page. Two seals with the same hash can still differ in a live page's bytes, as
+the hash names those by a tag; the dump shows them (2026-10-18: Ruffle on
+Windows, 33 pages of host addresses left on its stacks by Windows' fault
+handling).
 
 That is how issue #80 was found. PPSSPP's states were refused in every new
 process on Windows and never on Linux. Of 341,677 pages the two dumps differed

@@ -76,6 +76,41 @@ int main(int argc, char **argv) {
 		const uint64_t fr = RunFaultRegisters();
 		printf("RunFaultRegisters -> %#llx (expect 0: the faulting code's registers and flags are back after the handler)\n", (unsigned long long)fr);
 		CHECK(fr == 0);
+		/* A frontend's tool reads a page the guest made no-access, from a
+		 * thread outside the guest. Through the read view the bytes are there
+		 * and the guest's handler does not run: before it, such a read ran
+		 * the handler and could change the machine (engine analysis,
+		 * 2026-10-18). Through the guest's own view it runs - the control. */
+		{
+			run_fn WatchForHostRead = (run_fn)proc(h, "WatchForHostRead");
+			run_fn HandlerRuns = (run_fn)proc(h, "HandlerRuns");
+			run_fn EndHostRead = (run_fn)proc(h, "EndHostRead");
+			const uint64_t page = WatchForHostRead();
+			CHECK(page != 0);
+			const uint64_t before = HandlerRuns();
+			wbx_guest_read_view(h, (uintptr_t)page, 4096, &r);
+			CHECK(!r.error_message[0] && r.data != 0);
+			int same = r.data != 0;
+			for (int i = 0; same && i < 4096; i++)
+				if (((const uint8_t *)r.data)[i] != (uint8_t)(i * 7 + 3)) same = 0;
+			CHECK(same);
+			const uint64_t afterView = HandlerRuns();
+			printf("read view -> the bytes %s, the guest's handler ran %llu times (expect 0)\n",
+				same ? "are there" : "DIFFER", (unsigned long long)(afterView - before));
+			CHECK(afterView == before);
+			const uint8_t direct = *(volatile const uint8_t *)(uintptr_t)(page + 1);
+			const uint64_t afterDirect = HandlerRuns();
+			printf("direct read -> %u, the guest's handler ran %llu times (expect 1: the control)\n",
+				direct, (unsigned long long)(afterDirect - afterView));
+			CHECK(direct == 10);
+			CHECK(afterDirect == afterView + 1);
+			CHECK(EndHostRead() == 1);
+			/* outside the guest's memory, and empty: refused */
+			wbx_guest_read_view(h, (uintptr_t)&fails, sizeof fails, &r);
+			CHECK(r.error_message[0] != 0);
+			wbx_guest_read_view(h, (uintptr_t)page, 0, &r);
+			CHECK(r.error_message[0] != 0);
+		}
 		/* a machine that died in one of these answered 0 as well */
 		char why[512];
 		wbx_get_death(h, why, sizeof why, &r);
