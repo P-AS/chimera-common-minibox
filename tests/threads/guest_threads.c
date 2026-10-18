@@ -374,3 +374,13 @@ ECL_EXPORT uint64_t RunGuestFaultDeclined(void) {
 	page[1] = 0x5a;
 	return 0xfd;
 }
+
+/* Never returns: a call through a null pointer from a guest that owns %fs.
+ * The fault is outside the guest's memory and arrives with the guest's thread
+ * pointer loaded; the handler must put the host's back before it runs any
+ * host C, and end the machine, not the host (2026-10-18). */
+ECL_EXPORT uint64_t CallNullWithOwnFs(void) {
+	void (*volatile f)(void) = 0;
+	f();
+	return 0xfd;
+}

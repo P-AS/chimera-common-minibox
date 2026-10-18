@@ -13,6 +13,10 @@
 #include <stdbool.h>
 #include <time.h>
 #include <stdio.h>
+#ifndef _WIN32
+#include <pthread.h>
+#include <signal.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 #ifndef _WIN32
@@ -171,6 +175,57 @@ static mb_host *make_v3_host(const char *path) {
  * per export group is unnecessary; one host runs the clock/sleep/wait/memory
  * checks in order (each is self-contained), then the save/load dance around
  * a parked timed waiter, then the v3 magic check. */
+#ifndef _WIN32
+/* A thread whose runtime gave it a small alternate signal stack (Mono and
+ * .NET give 16 KiB) gets one big enough for the fault handler's report when
+ * it activates a machine (2026-10-18). Returns the size it ends up with. */
+static void *small_altstack_thread(void *arg) {
+	mb_host *h = (mb_host *)arg;
+	static uint8_t small[16384];
+	stack_t ss = { .ss_sp = small, .ss_flags = 0, .ss_size = sizeof small };
+	sigaltstack(&ss, NULL);
+	mb_return r;
+	wbx_activate_host(h, &r);
+	stack_t now;
+	sigaltstack(NULL, &now);
+	wbx_deactivate_host(h, &r);
+	return (void *)(uintptr_t)now.ss_size;
+}
+#endif
+
+/* A guest that dies in its start-up code, and one that dies while it is
+ * sealed: the host says why and lives on (2026-10-18). */
+static int dies_starting_or_sealing(const char *starting, const char *sealing) {
+	mb_memory_layout_template layout = {
+		.sbrk_size = 16u<<20, .sealed_size = 16u<<20, .invis_size = 16u<<20,
+		.plain_size = 16u<<20, .mmap_size = 32u<<20,
+	};
+	mb_return r;
+	FILE *f = fopen(starting, "rb");
+	if (!f) { fprintf(stderr, "cannot open %s\n", starting); return 1; }
+	freader fr = { f };
+	wbx_create_host(&layout, "guest-dies-1.wbx", file_read, (uintptr_t)&fr, &r);
+	fclose(f);
+	printf("run_guest: a guest dying in its start-up code: %s\n", r.error_message);
+	CHECK(strstr(r.error_message, "died while starting") != NULL && strstr(r.error_message, "crashed") != NULL);
+	f = fopen(sealing, "rb");
+	if (!f) { fprintf(stderr, "cannot open %s\n", sealing); return 1; }
+	fr.f = f;
+	wbx_create_host(&layout, "guest-dies-2.wbx", file_read, (uintptr_t)&fr, &r);
+	fclose(f);
+	CHECK(!r.error_message[0] && r.data != 0);
+	mb_host *h = (mb_host *)r.data;
+	if (h) {
+		wbx_seal(h, &r);
+		printf("run_guest: a guest dying while it is sealed: %s\n", r.error_message);
+		CHECK(strstr(r.error_message, "died while sealing") != NULL && strstr(r.error_message, "crashed") != NULL);
+		wbx_destroy_host(h, &r);
+	}
+	if (fails == 0) printf("run_guest: all checks passed\n");
+	else printf("run_guest: %d checks FAILED\n", fails);
+	return fails ? 1 : 0;
+}
+
 static int v3_flow(const char *guest) {
 	mb_return r;
 	typedef int (MB_GUEST_ABI *int_fn)(void);
@@ -587,6 +642,9 @@ static void guest_deaths_are_survived(const char *path) {
 		{ "ExitNow", "exited (status 7)" },
 		{ "UnknownSyscall", "system call 4242" },
 		{ "Deadlock", "deadlock" },
+		{ "CallNull", "crashed" },
+		{ "CallWild", "crashed" },
+		{ "CallUnregisteredSlot", "never registered" },
 #ifndef _WIN32
 		/* Linux-only: faulting with rsp in a guard page needs the fault
 		 * handler on an alternate signal stack to report anything at all.
@@ -625,6 +683,27 @@ static void guest_deaths_are_survived(const char *path) {
 		CHECK(host_fs_base() == fs_before_deaths);   /* and the host's thread pointer, untouched */
 #endif
 	}
+#ifndef _WIN32
+	/* The OS refusing the protection change a tracked write needs (on Linux,
+	 * past vm.max_map_count) is the guest's death with that reason, not a trap
+	 * with no word (2026-10-18). Through the test hook: one refusal. */
+	{
+		extern int mb_pal_protect_refusals;
+		typedef uint32_t (MB_GUEST_ABI *u32_fn)(void);
+		mb_pal_protect_refusals = 1;
+		((u32_fn)proc(h, "WriteCleanPage"))();
+		mb_pal_protect_refusals = 0;
+		wbx_get_death(h, why, sizeof why, &r);
+		printf("run_guest: a protection change refused -> dead=%llu: %s\n", (unsigned long long)r.data, why);
+		CHECK(r.data == 1 && strstr(why, "refused a memory protection change") != NULL);
+		state.pos = 0;
+		wbx_deactivate_host(h, &r);
+		wbx_load_state(h, mem_read, (uintptr_t)&state, &r);
+		CHECK(!r.error_message[0]);
+		wbx_activate_host(h, &r);
+		CHECK(((u32_fn)proc(h, "WriteCleanPage"))() == 1);   /* and the write goes ahead now */
+	}
+#endif
 	wbx_deactivate_host(h, &r);
 	wbx_destroy_host(h, &r);
 	free(state.buf);
@@ -639,6 +718,7 @@ int main(int argc, char **argv) {
 	if (argc > 2 && strcmp(argv[1], "--handler-recursion-child") == 0) return handler_recursion_child(argv[2]);
 #endif
 	if (argc > 2 && strcmp(argv[1], "--v3") == 0) return v3_flow(argv[2]);
+	if (argc > 3 && strcmp(argv[1], "--dies") == 0) return dies_starting_or_sealing(argv[2], argv[3]);
 	if (argc > 2 && strcmp(argv[1], "--probe-off") == 0) {
 		/* Probe forced off before anything initializes: the FSGSBASE
 		 * instructions must be unreachable, so the whole standard flow
@@ -861,6 +941,17 @@ int main(int argc, char **argv) {
 		free(fs.buf);
 	}
 
+	/* system calls handed freed memory answer EFAULT; the machine lives on */
+	{
+		typedef uint32_t (MB_GUEST_ABI *u32_fn)(void);
+		const uint32_t bad = ((u32_fn)proc(h, "BadPointersRefused"))();
+		printf("run_guest: system calls handed freed memory: %#x (expect 0)\n", (unsigned)bad);
+		CHECK(bad == 0);
+		char why[512];
+		wbx_get_death(h, why, sizeof why, &r);
+		CHECK(r.data == 0);
+	}
+
 	/* Open files and the getrandom stream are in states and deltas
 	 * (2026-10-18). A descriptor closed after the save and opened again on
 	 * another file - a disc swap gets the same number - reads the first file
@@ -1006,6 +1097,16 @@ int main(int argc, char **argv) {
 	}
 
 	wbx_deactivate_host(h, &r);
+#ifndef _WIN32
+	{
+		pthread_t t;
+		void *size = NULL;
+		CHECK(pthread_create(&t, NULL, small_altstack_thread, h) == 0);
+		pthread_join(t, &size);
+		printf("run_guest: a thread with a 16 KiB signal stack has %zu KiB after activating\n", (size_t)(uintptr_t)size / 1024);
+		CHECK((uintptr_t)size >= 256 * 1024);
+	}
+#endif
 	wbx_destroy_host(h, &r);
 
 	/* ---- determinism across two independent hosts, same seed ---- */

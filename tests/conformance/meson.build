@@ -55,6 +55,25 @@ test('conformance-probe-off', run_guest,
   timeout: 180,
 )
 
+# Guests that die while starting and while being sealed: the host refuses the
+# machine with the reason and lives on.
+guest_dies_wbx = []
+foreach when : ['1', '2']
+  guest_dies_wbx += custom_target('guest-dies-' + when + '.wbx',
+    input: 'guest-dies.c',
+    output: 'guest-dies-' + when + '.wbx',
+    command: [
+      waterbox_musl_gcc, waterbox_guest_cflags, waterbox_guest_ldflags,
+      '-std=c11', '-DDIE_IN=' + when, '-o', '@OUTPUT@', '@INPUT@', waterbox_emulibc_obj, '-lgcc',
+    ],
+  )
+endforeach
+test('conformance-dies', run_guest,
+  args: ['--dies', guest_dies_wbx[0], guest_dies_wbx[1]],
+  suite: 'system',
+  timeout: 120,
+)
+
 # Spec v3 (virtual time): a guest declaring __wbx_machine_spec = 3.
 guest_v3_wbx = custom_target('guest-v3.wbx',
   input: 'guest-v3.c',

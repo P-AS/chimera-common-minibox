@@ -187,6 +187,27 @@ static void test_free_gives_memory_back(void) {
 	mb_block_free(b);
 }
 
+#ifdef _WIN32
+/* A lazy block (over 4 GiB) given no access over a range only partly
+ * committed: VirtualProtect refuses a range with an uncommitted page in it and
+ * changes none of it, which left the committed pages the guest gave up
+ * accessible. They lose their access now (2026-10-18). */
+static void test_none_over_partly_committed(void) {
+	mb_block *b = fresh((uintptr_t)5 << 30);
+	CHECK(b->handle.lazy);
+	mb_range all16 = { b->addr.start, 16 * 4096 };
+	CHECK_EQ(mb_block_mmap_fixed(b, all16, MB_PROT_NONE, true), 0);   /* reserved, not committed */
+	mb_range half = { b->addr.start, 8 * 4096 };
+	CHECK_EQ(mb_block_mprotect(b, half, MB_PROT_RW), 0);              /* commits these eight */
+	gp(b, 0x1000)[0] = 7;
+	CHECK_EQ(mb_block_mprotect(b, all16, MB_PROT_NONE), 0);
+	MEMORY_BASIC_INFORMATION mbi;
+	CHECK(VirtualQuery((void *)(b->addr.start + 0x1000), &mbi, sizeof mbi) == sizeof mbi);
+	CHECK_EQ(mbi.Protect, (DWORD)PAGE_NOACCESS);
+	mb_block_free(b);
+}
+#endif
+
 /* A fixed mmap over allocated pages: v2 (zero_overlap false) keeps their
  * bytes; v3 (true) hands them back zero-filled, Free pages in the range just
  * get mapped - MMgc-style decommit (PROT_NONE) then recommit (RW). */
@@ -593,6 +614,7 @@ static void run_all(void) {
 	 * time gets VirtualAlloc(MEM_COMMIT) error 1455 on the CI runner, so they
 	 * failed there from the day they were written while passing on Windows.
 	 * The windows-latest job runs them; under wine they are said, not run. */
+	if (!under_wine()) RUN(test_none_over_partly_committed);
 	if (under_wine()) {
 		fprintf(stderr, "- SKIP under wine: test_refused_commit_is_retried_on_fault, test_refused_again_is_out_of_memory (wine cannot commit in a reserved view; the native Windows job runs them)\n");
 	} else {

@@ -24,6 +24,7 @@
 #include <sys/resource.h>
 #include <sys/mman.h>
 #include <sys/random.h>
+#include <sys/uio.h>
 
 /* Savestated state (plain globals -> .bss / savestated memory). */
 static uint64_t g_acc;
@@ -127,6 +128,45 @@ ECL_EXPORT void FpuSet(uint32_t fcw, uint32_t mxcsr) {
 }
 ECL_EXPORT uint64_t FpuAfterSyscall(void) { (void)getpid(); return fpu_read(); }
 ECL_EXPORT uint64_t FpuAfterCallback(void) { if (g_log_cb) g_log_cb(0); return fpu_read(); }
+
+/* A page nothing writes before a state is taken: clean after a load, so the
+ * first write to it after one faults and is tracked. */
+static volatile uint32_t g_clean_page[1024] __attribute__((aligned(4096)));
+ECL_EXPORT uint32_t WriteCleanPage(void) { return ++g_clean_page[0]; }
+
+/* System calls handed a pointer into memory the guest gave back: each answers
+ * EFAULT, as on Linux, and the machine lives on. Before 2026-10-18 the host
+ * followed most of them and the process died. 0 when right; a bit per call. */
+ECL_EXPORT uint32_t BadPointersRefused(void) {
+	uint8_t *gone = mmap(0, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (gone == MAP_FAILED) return 0x80000000u;
+	munmap(gone, 8192);
+	const int fd = open("seed", O_RDONLY);
+	if (fd < 0) return 0x40000000u;
+	uint32_t bad = 0;
+	struct iovec iov = { gone, 4 };
+	errno = 0; if (syscall(SYS_read, fd, gone, 4) != -1 || errno != EFAULT) bad |= 1u << 0;
+	errno = 0; if (syscall(SYS_write, 1, gone, 4) != -1 || errno != EFAULT) bad |= 1u << 1;
+	errno = 0; if (syscall(SYS_clock_gettime, 1, gone) != -1 || errno != EFAULT) bad |= 1u << 2;
+	errno = 0; if (syscall(SYS_getrandom, gone, 8, 0) != -1 || errno != EFAULT) bad |= 1u << 3;
+	errno = 0; if (syscall(SYS_futex, gone, 128 /* FUTEX_WAIT_PRIVATE */, 0, 0, 0, 0) != -1 || errno != EFAULT) bad |= 1u << 4;
+	errno = 0; if (syscall(SYS_fstat, fd, gone) != -1 || errno != EFAULT) bad |= 1u << 5;
+	errno = 0; if (syscall(SYS_readv, fd, &iov, 1) != -1 || errno != EFAULT) bad |= 1u << 6;
+	errno = 0; if (syscall(SYS_readv, fd, gone, 1) != -1 || errno != EFAULT) bad |= 1u << 7;
+	errno = 0; if (syscall(SYS_sysinfo, gone) != -1 || errno != EFAULT) bad |= 1u << 8;
+	errno = 0; if (syscall(SYS_sched_getaffinity, 0, 8, gone) != -1 || errno != EFAULT) bad |= 1u << 9;
+	errno = 0; if (syscall(SYS_pread64, fd, gone, 4, 0) != -1 || errno != EFAULT) bad |= 1u << 10;
+	errno = 0; if (syscall(SYS_truncate, gone, 0) != -1 || errno != EFAULT) bad |= 1u << 11;
+	close(fd);
+	return bad;
+}
+
+/* Calls that go nowhere: through a null pointer, to an address nothing is
+ * mapped at, and to a callback slot the host never registered (slot 63). Each
+ * is the guest's death, not the host's (2026-10-18). */
+ECL_EXPORT void CallNull(void) { void (*volatile f)(void) = 0; f(); }
+ECL_EXPORT void CallWild(void) { void (*volatile f)(void) = (void (*)(void))(uintptr_t)0x123456789ull; f(); }
+ECL_EXPORT void CallUnregisteredSlot(void) { void (*volatile f)(void) = (void (*)(void))(uintptr_t)(0x35f00000300ull + 63 * 16); f(); }
 
 /* Open files and the entropy stream are part of a state (2026-10-18): a disc
  * read through a descriptor, which a disc swap closes and opens again */

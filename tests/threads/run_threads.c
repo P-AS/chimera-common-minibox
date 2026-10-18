@@ -46,6 +46,7 @@ int main(int argc, char **argv) {
 	run_fn RunFaultYield = (run_fn)proc(h, "RunFaultYield");
 	run_fn RunFaultRegisters = (run_fn)proc(h, "RunFaultRegisters");
 	run_fn RunGuestFaultDeclined = (run_fn)proc(h, "RunGuestFaultDeclined");
+	run_fn CallNullWithOwnFs = (run_fn)proc(h, "CallNullWithOwnFs");
 	wbx_deactivate_host(h, &r); wbx_seal(h, &r);
 	if (r.error_message[0]) { fprintf(stderr, "seal: %s\n", r.error_message); return 1; }
 	wbx_activate_host(h, &r);
@@ -118,6 +119,20 @@ int main(int argc, char **argv) {
 		wbx_deactivate_host(h, &r); wbx_load_state(h, mem_read, (uintptr_t)&st, &r); wbx_activate_host(h, &r);
 		CHECK(!r.error_message[0]);
 		CHECK(RunThreads() == after_save);   /* faults again, outside any handler */
+	}
+	/* A null call from a guest that owns %fs: its death, and the host's own
+	 * thread pointer is back afterwards. */
+	{
+		CallNullWithOwnFs();
+		char why[512];
+		wbx_get_death(h, why, sizeof why, &r);
+		printf("CallNullWithOwnFs -> dead=%llu: %s\n", (unsigned long long)r.data, why);
+		CHECK(r.data == 1);
+		CHECK(strstr(why, "crashed") != NULL);
+		st.pos = 0;
+		wbx_deactivate_host(h, &r); wbx_load_state(h, mem_read, (uintptr_t)&st, &r); wbx_activate_host(h, &r);
+		CHECK(!r.error_message[0]);
+		CHECK(RunThreads() == after_save);
 	}
 	/* A protected page the handler does not claim: the machine's death, as
 	 * with no handler at all, and the host lives on. */

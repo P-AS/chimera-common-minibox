@@ -147,14 +147,29 @@ static bool guest_owns(mb_host *h, uintptr_t addr, uintptr_t len)
 	return len <= mb_range_end(all) - addr;
 }
 
+/* Whether host code may read (write false) or write the guest's bytes over
+ * [addr, addr+len): guest_owns says the range is the guest's address space,
+ * and this also asks the pages - a freed or no-access page there faults in
+ * HOST code, which ended the process (2026-10-18). A page the guest protected
+ * itself is fine when it exports GuestFaultHandler: the host's fault is passed
+ * to it (chimera issue 280). Linux answers EFAULT, and so does every caller. */
+static bool guest_can(mb_host *h, uintptr_t addr, uintptr_t len, bool write)
+{
+	if (len == 0) return true;
+	return guest_owns(h, addr, len) && mb_block_host_can(h->block, addr, len, write, h->fault_raw != 0);
+}
+
 /* A NUL-terminated string in guest memory, or NULL. The scan stops at the end
  * of the arena, so an unterminated string cannot walk the host off the end. */
 static const char *guest_str(mb_host *h, uintptr_t addr)
 {
 	if (!guest_owns(h, addr, 1)) return NULL;
 	uintptr_t end = mb_range_end(mb_layout_all(&h->layout));
-	for (uintptr_t p = addr; p < end; p++)
+	for (uintptr_t p = addr; p < end; p++) {
+		/* each page asked before its first byte is read (guest_can) */
+		if ((p == addr || (p & MB_PAGEMASK) == 0) && !guest_can(h, p, 1, false)) return NULL;
 		if (*(const char *)p == 0) return (const char *)addr;
+	}
 	return NULL;
 }
 
@@ -451,17 +466,20 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			else res = old;
 			h->program_break = res; return sok((mb_sword)res);
 		}
-		case NR_stat:  { const char *p = guest_str(h, a1); if (!p || !guest_owns(h, a2, 1)) return serr(EFAULT);
+		case NR_stat:  { const char *p = guest_str(h, a1); if (!p || !guest_can(h, a2, 144, true)) return serr(EFAULT);
 		                 mb_sword r = mb_fs_stat_name(h->fs, p, (void *)a2); return r < 0 ? serr((int)-r) : sok(0); }
-		case NR_fstat: { mb_sword r = mb_fs_stat_fd(h->fs, (int)a1, (void *)a2); return r < 0 ? serr((int)-r) : sok(0); }
+		case NR_fstat: { if (!guest_can(h, a2, 144, true)) return serr(EFAULT);
+		                 mb_sword r = mb_fs_stat_fd(h->fs, (int)a1, (void *)a2); return r < 0 ? serr((int)-r) : sok(0); }
 		case NR_ioctl: return sok(0);
 		/* No pipes in-guest (musl's posix_spawn, backing system(),
 		 * needs pipe2 and fails here; without an in-guest provider
 		 * this stays unreachable).
 		 * A caller that needs one must cope with ENOSYS. */
 		case NR_pipe: case NR_pipe2: return serr(ENOSYS);
-		case NR_read:  { mb_sword r = mb_fs_read(h->fs, (int)a1, (uint8_t *)a2, a3); return r < 0 ? serr((int)-r) : sok(r); }
+		case NR_read:  { if (!guest_can(h, a2, mb_fs_read_avail(h->fs, (int)a1, a3), true)) return serr(EFAULT);
+		                 mb_sword r = mb_fs_read(h->fs, (int)a1, (uint8_t *)a2, a3); return r < 0 ? serr((int)-r) : sok(r); }
 		case NR_write: {
+			if (!guest_can(h, a2, a3, false)) return serr(EFAULT);
 			const uint64_t before = mb_fs_sysout_total(h->fs);
 			mb_sword r = mb_fs_write(h->fs, (int)a1, (const uint8_t *)a2, a3);
 			note_output(h, before);
@@ -470,10 +488,14 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 		case NR_readv: case NR_writev: {
 			/* iovec: {void* base; size_t len} */
 			struct iov { uintptr_t base; uintptr_t len; } *iov = (struct iov *)a2;
+			if (a3 > 1024) return serr(EINVAL);                       /* IOV_MAX */
+			if (!guest_can(h, a2, a3 * sizeof *iov, false)) return serr(EFAULT);
 			mb_sword total = 0;
 			const uint64_t before = mb_fs_sysout_total(h->fs);
 			for (uintptr_t i = 0; i < a3; i++) {
 				if (!iov[i].base) continue;
+				const uintptr_t want = nr == NR_readv ? mb_fs_read_avail(h->fs, (int)a1, iov[i].len) : iov[i].len;
+				if (!guest_can(h, iov[i].base, want, nr == NR_readv)) { note_output(h, before); return total ? sok(total) : serr(EFAULT); }
 				mb_sword r = (nr == NR_readv)
 					? mb_fs_read(h->fs, (int)a1, (uint8_t *)iov[i].base, iov[i].len)
 					: mb_fs_write(h->fs, (int)a1, (const uint8_t *)iov[i].base, iov[i].len);
@@ -488,6 +510,7 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 		case NR_sysinfo: {
 			/* fixed, plausible, deterministic: 1GB total, half free, no swap.
 			 * (struct sysinfo is 112 bytes of longs; fill what matters.) */
+			if (!guest_can(h, a1, 112, true)) return serr(EFAULT);
 			uint64_t *si = (uint64_t *)a1;
 			memset(si, 0, 112);
 			si[0] = 0;                    /* uptime */
@@ -506,7 +529,7 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			 * (a1 is who=RUSAGE_SELF/CHILDREN, a2 is struct rusage*.)
 			 * A pointer the guest does not own is EFAULT, as on Linux -
 			 * not a host fault. */
-			if (!guest_owns(h, a2, 144)) return serr(EFAULT);
+			if (!guest_can(h, a2, 144, true)) return serr(EFAULT);
 			memset((void *)a2, 0, 144);
 			return sok(0);
 		}
@@ -521,6 +544,10 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			if (pos < 0) return serr((int)-pos);
 			mb_sword r = mb_fs_seek(h->fs, (int)a1, (mb_sword)a4, 0 /* SEEK_SET */);
 			if (r < 0) return serr((int)-r);
+			if (!guest_can(h, a2, mb_fs_read_avail(h->fs, (int)a1, a3), true)) {
+				mb_fs_seek(h->fs, (int)a1, pos, 0);
+				return serr(EFAULT);
+			}
 			mb_sword n = mb_fs_read(h->fs, (int)a1, (void *)a2, a3);
 			mb_fs_seek(h->fs, (int)a1, pos, 0);
 			return n < 0 ? serr((int)-n) : sok(n);
@@ -549,7 +576,7 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			 * which is EBADF and a logged error on any other system, died of
 			 * it (chimera issue #185). A buffer the guest does not own is
 			 * EFAULT, not a host fault. */
-			if (a3 != 0 && !guest_owns(h, a2, a3)) return serr(EFAULT);
+			if (!guest_can(h, a2, a3, false)) return serr(EFAULT);
 			mb_sword n = mb_fs_pwrite(h->fs, (int)a1, (const uint8_t *)a2, a3, (mb_sword)a4);
 			return n < 0 ? serr((int)-n) : sok(n);
 		}
@@ -563,7 +590,7 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 		}
 		case NR_newfstatat: {
 			if ((int)a1 != -100) return serr(EBADF);
-			const char *p = guest_str(h, a2); if (!p || !guest_owns(h, a3, 1)) return serr(EFAULT);
+			const char *p = guest_str(h, a2); if (!p || !guest_can(h, a3, 144, true)) return serr(EFAULT);
 			mb_sword r = mb_fs_stat_name(h->fs, p, (void *)a3);
 			return r < 0 ? serr((int)-r) : sok(0);
 		}
@@ -598,9 +625,11 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 		case NR_close: { mb_sword r = mb_fs_close(h->fs, (int)a1); return r < 0 ? serr((int)-r) : sok(0); }
 		case NR_dup:   { mb_sword r = mb_fs_dup(h->fs, (int)a1); return r < 0 ? serr((int)-r) : sok(r); }
 		case NR_lseek: { mb_sword r = mb_fs_seek(h->fs, (int)a1, (mb_sword)a2, (int)a3); return r < 0 ? serr((int)-r) : sok(r); }
-		case NR_truncate:  { mb_sword r = mb_fs_truncate_name(h->fs, (const char *)a1, (mb_sword)a2); return r < 0 ? serr((int)-r) : sok(0); }
+		case NR_truncate:  { const char *p = guest_str(h, a1); if (!p) return serr(EFAULT);
+		                     mb_sword r = mb_fs_truncate_name(h->fs, p, (mb_sword)a2); return r < 0 ? serr((int)-r) : sok(0); }
 		case NR_ftruncate: { mb_sword r = mb_fs_truncate_fd(h->fs, (int)a1, (mb_sword)a2); return r < 0 ? serr((int)-r) : sok(0); }
 		case NR_clock_gettime: {
+			if (!guest_can(h, a2, 16, true)) return serr(EFAULT);
 			int64_t *ts = (int64_t *)a2;  /* {tv_sec, tv_nsec} */
 			/* v3: the clock starts at the v2 constant and every read ticks
 			 * 1 us, then yields (a spinner on the clock hands the others a
@@ -618,9 +647,9 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			 * fill the buffer from a fixed-seed splitmix64. std seeds every
 			 * HashMap's RandomState through this call, so a guest that uses a
 			 * hash map (every Rust guest does) needs it, and needs it the same
-			 * every run. The stream is per-host and resets with the host, like
-			 * clock_gettime's constant time; it is not part of the machine
-			 * state because a seed drawn once at startup never re-reads. */
+			 * every run. The stream is per-host, starts the same with every
+			 * host, and is saved in states (OpenFileTable1, 2026-10-18). */
+			if (!guest_can(h, a1, a2, true)) return serr(EFAULT);
 			uint8_t *buf = (uint8_t *)a1;
 			uint64_t n = a2;
 			for (uint64_t i = 0; i < n; i += 8) {
@@ -663,9 +692,9 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			 * guest that saves and restores the old action must not read
 			 * whatever was on its stack. The kernel's struct is 32 bytes:
 			 * handler, flags, restorer, mask. */
-			if (a2 != 0 && !guest_owns(h, a2, 32)) return serr(EFAULT);
+			if (a2 != 0 && !guest_can(h, a2, 32, false)) return serr(EFAULT);
 			if (a3 != 0) {
-				if (!guest_owns(h, a3, 32)) return serr(EFAULT);
+				if (!guest_can(h, a3, 32, true)) return serr(EFAULT);
 				memset((void *)a3, 0, 32);
 			}
 			return sok(0);
@@ -688,7 +717,9 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 		case NR_exit_group:
 			mb_host_guest_death(&h->context, "the core exited (status %lld)", (long long)(intptr_t)a1);
 		case NR_set_thread_area: return serr(ENOSYS);   /* musl handles in userspace */
-		case NR_set_tid_address: return sok(mb_threads_set_tid_address(h->threads, a1));
+		/* The address is written (with 0) when the thread exits; one the host
+		 * may not write is not kept, as Linux ignores a write there that fails. */
+		case NR_set_tid_address: return sok(mb_threads_set_tid_address(h->threads, guest_can(h, a1, 4, true) ? a1 : 0));
 		case NR_gettid: return sok(mb_threads_get_tid(h->threads));
 		case NR_getpid: case NR_getppid: return sok(1);
 		/* One fixed identity. Mesa asks (its option parsing takes the
@@ -705,7 +736,7 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			 * bad pointer EFAULT, as on Linux.) */
 			if (mb_threads_spec(h->threads) != 3) return mb_threads_yield(h->threads, &h->context);
 			const int64_t *req = (const int64_t *)a1;
-			if (!guest_owns(h, a1, 16)) return serr(EFAULT);
+			if (!guest_can(h, a1, 16, false)) return serr(EFAULT);
 			if (req[0] < 0 || req[1] < 0 || req[1] >= 1000000000ll) return serr(EINVAL);
 			mb_threads_advance(h->threads, (uint64_t)req[0] * 1000000000ull + (uint64_t)req[1]);
 			return mb_threads_yield(h->threads, &h->context);
@@ -716,7 +747,7 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			 * nothing. rem is zeroed (nothing interrupts a sleep here). */
 			if (mb_threads_spec(h->threads) != 3) return mb_threads_yield(h->threads, &h->context);
 			const int64_t *req = (const int64_t *)a3;
-			if (!guest_owns(h, a3, 16)) return serr(EFAULT);
+			if (!guest_can(h, a3, 16, false)) return serr(EFAULT);
 			if (req[0] < 0 || req[1] < 0 || req[1] >= 1000000000ll) return serr(EINVAL);
 			uint64_t target = (uint64_t)req[0] * 1000000000ull + (uint64_t)req[1];
 			if ((a2 & 1) != 0) {
@@ -726,13 +757,18 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 				if (rel > now) mb_threads_advance(h->threads, rel - now);
 			} else mb_threads_advance(h->threads, target);
 			if (a4) {
-				if (!guest_owns(h, a4, 16)) return serr(EFAULT);
+				if (!guest_can(h, a4, 16, true)) return serr(EFAULT);
 				*(int64_t *)a4 = 0; *((int64_t *)a4 + 1) = 0;
 			}
 			return mb_threads_yield(h->threads, &h->context);
 		}
 		case NR_wbx_clone: {
-			/* args: (tls/thread_area, child_rsp, child_rip, child_tid, parent_tid*) */
+			/* args: (tls/thread_area, child_rsp, child_rip, child_tid, parent_tid*):
+			 * the musl pthread struct is read (14 words), the child's first frame
+			 * and the parent's tid written */
+			if (a1 == 0) return serr(EINVAL);   /* a foreign convention: mb_threads_spawn says why */
+			if (!guest_can(h, a1, 14 * 8, false)) return serr(EFAULT);
+			if (!guest_can(h, a2 - 16, 16, true) || !guest_can(h, a5, 4, true)) return serr(EFAULT);
 			mb_sword r = mb_threads_spawn(h->threads, h->block, a1, a2, a3, a4, (uint32_t *)a5);
 			return r < 0 ? serr((int)-r) : sok(r);
 		}
@@ -755,6 +791,8 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			 * libc-level shadow cannot answer it. Returns the kernel's cpumask
 			 * size in bytes, like Linux. */
 			if (a3 == 0 || a2 < 8) return serr(EINVAL);
+			if (a2 > 4096) a2 = 4096;   /* the answer is 8 bytes; no kernel mask is bigger */
+			if (!guest_can(h, a3, a2, true)) return serr(EFAULT);
 			memset((void *)a3, 0, a2);
 			*(uint8_t *)a3 = 1;
 			return sok(8);
@@ -775,9 +813,13 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			/* v3 timed waits: WAIT's timeout is relative, WAIT_BITSET's
 			 * absolute (a guest timespec; NULL waits forever as in v2).
 			 * Invalid values are EINVAL, a bad pointer EFAULT, as on Linux. */
+			/* the futex word itself is read by the waits and written by the PI
+			 * pair; the wakes and requeue only use its address */
+			if ((op == FUTEX_WAIT || op == FUTEX_WAIT_BITSET) && !guest_can(h, a1, 4, false)) return serr(EFAULT);
+			if ((op == FUTEX_LOCK_PI || op == FUTEX_UNLOCK_PI) && !guest_can(h, a1, 4, true)) return serr(EFAULT);
 			if (v3 && (op == FUTEX_WAIT || op == FUTEX_WAIT_BITSET) && a4 != 0) {
 				const int64_t *to = (const int64_t *)a4;
-				if (!guest_owns(h, a4, 16)) return serr(EFAULT);
+				if (!guest_can(h, a4, 16, false)) return serr(EFAULT);
 				if (to[0] < 0 || to[1] < 0 || to[1] >= 1000000000ll) return serr(EINVAL);
 				uint64_t t = (uint64_t)to[0] * 1000000000ull + (uint64_t)to[1];
 				uint64_t dl;
@@ -835,9 +877,33 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 
 /* ---- lifecycle ---- */
 
-static void run_proc_if_present(mb_host *h, const char *name) {
+/* A 0-argument entry (_start, co_clean, ecl_seal) through the same guarded
+ * call an export takes, so that a guest that dies in its start-up code or
+ * its seal ends the machine and not the host (2026-10-18; mb_call_guest_simple
+ * had no escape record, and such a death trapped). True when the guest is
+ * still alive afterwards. */
+static bool call_guest_guarded(mb_host *h, uintptr_t entry) {
+	const uintptr_t thunk = mb_thunks_get(h->thunks, entry, &h->context);
+	if (thunk == 0) mb_call_guest_simple(entry, &h->context);   /* a full pool: as before */
+	/* Called as a plain function on both systems: the thunk takes no argument,
+	 * and mb_guarded_call keeps every register a win64 caller expects kept
+	 * (rdi, rsi and xmm6-15 too). Declared sysv on Windows, the call made
+	 * MinGW's GCC 13 fail (an internal compiler error in choose_baseaddr). */
+	else ((uintptr_t (*)(void))thunk)();
+	return !h->context.dead;
+}
+
+static bool run_proc_if_present(mb_host *h, const char *name) {
 	uintptr_t p = mb_elf_proc_addr(h->elf, name);
-	if (p) mb_call_guest_simple(p, &h->context);
+	return p ? call_guest_guarded(h, p) : true;
+}
+
+/* What a callback slot the host never registered answers: the guest's death,
+ * said as such. It used to be address 0, and the call faulted outside the
+ * guest, which the host could not tell from its own crash (2026-10-18). */
+static uintptr_t MB_SYSV unregistered_callback(void) {
+	mb_host_guest_death(mb_guest_ctx, "the core called a host callback that was never registered");
+	return 0;
 }
 
 /* mb_host_new's way out, from any point: everything it built, given back in
@@ -847,6 +913,8 @@ static void run_proc_if_present(mb_host *h, const char *name) {
  * fault into freed memory (the case chimera#127 fixed in mb_host_destroy). */
 static mb_host *host_new_unwind(mb_host *h) {
 	mb_tripguard_forget_layout(&h->layout);
+	/* a guest that died while starting was the one the handlers judged by */
+	if (mb_guest_ctx == &h->context) mb_guest_ctx = NULL;
 	if (h->block) { mb_block_deactivate(h->block); mb_block_free(h->block); }
 	mb_fs_free(h->fs);
 	mb_elf_free(h->elf); mb_thunks_free(h->thunks); mb_threads_free(h->threads);
@@ -949,7 +1017,14 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 	  }
 	  if (spec == 3) { fprintf(stderr, "miniBox: guest declares machine spec v3 (virtual time)\n"); fflush(stderr); } }
 
-	mb_call_guest_simple(mb_elf_entry(h->elf), &h->context);  /* _start */
+	/* every callback slot answers, registered or not */
+	{ const uintptr_t none = mb_thunks_get_extcall(h->thunks, (uintptr_t)&unregistered_callback, &h->context);
+	  for (size_t i = 0; none != 0 && i < MB_CALLBACK_SLOTS; i++)
+		h->context.extcall_slots[i] = (mb_external_callback)none; }
+	if (!call_guest_guarded(h, mb_elf_entry(h->elf))) {   /* _start */
+		snprintf(errbuf, errlen, "the core died while starting: %s", h->death);
+		return host_new_unwind(h);
+	}
 	mb_block_deactivate(h->block); h->active = false;
 	return h;
 }
@@ -1105,8 +1180,11 @@ int mb_host_seal(mb_host *h, char *errbuf, size_t errlen) {
 	if (h->sealed) { snprintf(errbuf, errlen, "Already sealed!"); return -1; }
 	bool was_active = h->active;
 	mb_host_activate(h);
-	run_proc_if_present(h, "co_clean");
-	run_proc_if_present(h, "ecl_seal");
+	if (!run_proc_if_present(h, "co_clean") || !run_proc_if_present(h, "ecl_seal")) {
+		snprintf(errbuf, errlen, "the core died while sealing: %s", h->death);
+		if (!was_active) mb_host_deactivate(h);
+		return -1;
+	}
 	mb_elf_seal(h->elf, h->block);
 	if (mb_block_seal(h->block) != 0) { snprintf(errbuf, errlen, "seal failed"); return -1; }
 	if (!was_active) mb_host_deactivate(h);

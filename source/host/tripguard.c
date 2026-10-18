@@ -15,6 +15,8 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include <sys/syscall.h>
 #endif
 
 /* The block LIST changes only when a machine is created or destroyed, on the
@@ -45,11 +47,32 @@ static bool code_in_guest(uintptr_t rip) {
 	return in_guest_tramp(rip);
 }
 
+/* The context slot of this thread's gs block: the context of the guest the
+ * thread is running, and 0 while it runs the host (the interop blob sets it on
+ * the way in and clears it on every way out, a system call or a callback
+ * included). A Linux thread that never ran a guest has no gs base, and is not
+ * read. Safe in a signal handler: one system call and one load. */
+static uintptr_t gs_context_slot(void) {
+#ifdef _WIN32
+	return (uintptr_t)__readgsqword(0x18);   /* the TEB's SubSystemTib */
+#else
+	uintptr_t base = 0;
+	if (syscall(SYS_arch_prctl, 0x1004 /* ARCH_GET_GS */, &base) != 0 || base == 0) return 0;
+	return *(volatile const uintptr_t *)(base + 0x18);
+#endif
+}
+
 /* A fault the guest's own code took, with a machine to charge it to: that is a
- * guest dying, which the host survives (mb_host_guest_death). Anything else - a
- * fault in host code, or with no machine running - is not, and stays fatal. */
+ * guest dying, which the host survives (mb_host_guest_death). The guest's own
+ * code is either in its memory, or anywhere at all while the thread is inside
+ * a guest call: a call through a null or wild function pointer, or to a
+ * callback the host never registered, faults at an address outside every
+ * block (2026-10-18; it used to be judged the host's, and fatal). Anything
+ * else - a fault in host code, or with no machine running - is not, and stays
+ * fatal. */
 static bool guest_can_die_here(uintptr_t rip) {
-	return mb_guest_ctx != NULL && mb_guest_ctx->host_ptr != 0 && code_in_guest(rip);
+	return mb_guest_ctx != NULL && mb_guest_ctx->host_ptr != 0
+		&& (code_in_guest(rip) || gs_context_slot() == (uintptr_t)mb_guest_ctx);
 }
 
 /* Where an address IS, in the words the layout uses.
@@ -371,6 +394,10 @@ static bool ask_guest(uintptr_t addr, bool write, bool from_host_code) {
  * with every other thread that faults on this block and with the block
  * operations the guest's syscalls run. Two faults on two pages of one bitmap
  * word used to lose one of the two bits (test_tripguard). */
+/* set by trip when the OS refused the protection change a write needed: the
+ * guest's death then says so instead of "crashed" (one thread runs a guest) */
+static volatile bool g_protect_refused;
+
 static bool trip(uintptr_t addr) {
 	mb_block *b = owner_of(addr);
 	if (!b) return false;
@@ -413,7 +440,21 @@ static bool trip(uintptr_t addr) {
 		mb_block_plan_capture(b, pi);
 		mb_block_note_dirty(b, pi, true);
 		mb_range r = { page_start, MB_PAGESIZE };
-		if (mb_pal_protect(r, mb_page_native_prot(p)) != 0) { __builtin_trap(); abort(); }
+		if (mb_pal_protect(r, mb_page_native_prot(p)) != 0) {
+			/* The OS refused to make the page writable. On Linux that is
+			 * nearly always the limit on memory maps (vm.max_map_count, 65530
+			 * by default: every page with a protection of its own costs two),
+			 * and it used to be a trap with no word at all. Now it is said,
+			 * and the write is an unhandled fault: the guest's death, with
+			 * this as the reason (2026-10-18). The page stays as it was. */
+			mb_block_track_unlock(b);
+			fault_phase_set(phase);
+			g_protect_refused = true;
+			mb_diag("miniBox: the system refused to make the page at %p writable"
+			        " (on Linux, usually the limit on memory maps, vm.max_map_count);"
+			        " the core's write to it cannot go ahead\n", (void *)page_start);
+			return false;
+		}
 		/* It is writable from here, so the next epoch has to hold it again.
 		 * Only a bit: this is a signal handler. */
 		mb_block_note_unheld(b, pi);
@@ -464,6 +505,11 @@ static void say_code_and_regs(const unsigned char *ip, uintptr_t rsp, uintptr_t 
 	if (VirtualQuery(ip, &mbi, sizeof mbi) != sizeof mbi || mbi.State != MEM_COMMIT
 	    || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0
 	    || (uintptr_t)ip + 16 > (uintptr_t)mbi.BaseAddress + mbi.RegionSize) {
+		mb_diag(" code: (rip is not readable memory)\n");
+		return;
+	}
+#else
+	if (!mb_page_readable((uintptr_t)ip) || !mb_page_readable((uintptr_t)ip + 15)) {
 		mb_diag(" code: (rip is not readable memory)\n");
 		return;
 	}
@@ -620,8 +666,18 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
 	const bool guest_rip = mb_fs_swap && mb_guest_ctx
 	                       && rip_in_guest((uintptr_t)((ucontext_t *)ucontext)
 	                                       ->uc_mcontext.gregs[REG_RIP]);
-	const uintptr_t fs_at_fault = guest_rip ? mb_rdfsbase() : 0;
-	if (guest_rip && mb_guest_ctx->host_fs) mb_wrfsbase(mb_guest_ctx->host_fs);
+	/* ...or by the pointer itself, as handler_foreign asks it: code outside
+	 * the guest's memory that runs on the guest's %fs - the interop blob's
+	 * first push onto a held stack page, a guest's call to a null or wild
+	 * address - must not have host C run on it either (2026-10-18). The
+	 * guest's pointer is its thread area or the early stand-in, and never the
+	 * host's own. */
+	const uintptr_t tp_now = mb_fs_swap && mb_guest_ctx ? mb_rdfsbase() : 0;
+	const bool guest_tp = !guest_rip && mb_fs_swap && mb_guest_ctx && mb_guest_ctx->fs_swap
+	                      && mb_guest_ctx->host_fs && tp_now != mb_guest_ctx->host_fs
+	                      && (tp_now == mb_guest_ctx->thread_area || (mb_early_tp && tp_now == mb_early_tp));
+	const uintptr_t fs_at_fault = guest_rip ? tp_now : 0;
+	if ((guest_rip || guest_tp) && mb_guest_ctx->host_fs) mb_wrfsbase(mb_guest_ctx->host_fs);
 	const uintptr_t fault = (uintptr_t)info->si_addr;
 	const uintptr_t rip = (uintptr_t)((ucontext_t *)ucontext)->uc_mcontext.gregs[REG_RIP];
 	/* A %fs access with the base already lost is the repair, not a fault to
@@ -679,6 +735,7 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
 	 * that does not. Only for guests that own %fs: the rest keep the host's,
 	 * and rewriting it here would trade it for the thread pointer. */
 	if (guest_rip && mb_guest_ctx->fs_swap) mb_restore_guest_fs(fs_at_fault);
+	else if (guest_tp) mb_wrfsbase(tp_now);
 #else
 	handler_inner(sig, info, ucontext);
 	if ((uintptr_t)((ucontext_t *)ucontext)->uc_mcontext.gregs[REG_RIP] == (uintptr_t)&mb_guarded_escape)
@@ -914,10 +971,16 @@ static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 		if (guest_can_die_here(rip)) {
 			/* a hlt in user mode arrives as this fault: it is musl's a_crash(),
 			 * which its allocator runs on finding the heap corrupt */
-			const bool halted = *(const unsigned char *)rip == 0xf4;
+			const bool halted = rip_bytes_readable(rip) && *(const unsigned char *)rip == 0xf4;
+			const bool refused = g_protect_refused;
+			g_protect_refused = false;
 			const bool escapable = halted
 				? mb_host_guest_death_in_handler(mb_guest_ctx,
 					"the core stopped itself after finding its own memory corrupt (a halt at %p)", (void *)rip)
+				: refused
+				? mb_host_guest_death_in_handler(mb_guest_ctx,
+					"the system refused a memory protection change the core's write to %p needed"
+					" (on Linux, usually vm.max_map_count; at %p)", (void *)fault, (void *)rip)
 				: mb_host_guest_death_in_handler(mb_guest_ctx,
 					"the core crashed: it %s address %p (at %p)", write ? "wrote to" : "read or ran", (void *)fault, (void *)rip);
 			if (escapable) {
@@ -947,13 +1010,23 @@ static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
  * ordinary tracked pages, so this case is real. One altstack per host thread
  * that runs guest code; installed for the current thread here, and
  * mb_tripguard_ensure_altstack() lets other entry points opt in. */
+/* The fault handler's own work - a page snapshot, a report naming the code
+ * bytes, the registers and the guest's stack - wants more than a runtime's
+ * small one: Mono and .NET install 16 KiB, and a report that overruns it ends
+ * the process without a word. One smaller than this is replaced (the
+ * runtime's memory is its own, and left alone; 2026-10-18). */
+#define MB_ALTSTACK_LEAST (256 * 1024)
+
 void mb_tripguard_ensure_altstack(void) {
 	stack_t ss_old;
-	if (sigaltstack(NULL, &ss_old) == 0 && !(ss_old.ss_flags & SS_DISABLE) && ss_old.ss_sp)
-		return;  /* this thread already has one */
+	memset(&ss_old, 0, sizeof ss_old);
+	if (sigaltstack(NULL, &ss_old) == 0 && !(ss_old.ss_flags & SS_DISABLE) && ss_old.ss_sp
+	    && ss_old.ss_size >= MB_ALTSTACK_LEAST)
+		return;  /* this thread already has one big enough */
+	if (ss_old.ss_flags & SS_ONSTACK) return;   /* never swapped out from under a handler */
 	stack_t ss;
 	memset(&ss, 0, sizeof(ss));
-	ss.ss_size = 1024 * 1024;  /* a guest fault handler may run real code here */
+	ss.ss_size = 1024 * 1024;  /* the handler's report runs here, fprintf and all */
 	ss.ss_sp = malloc(ss.ss_size);
 	ss.ss_flags = 0;
 	if (!ss.ss_sp || sigaltstack(&ss, NULL) != 0) { perror("miniBox sigaltstack"); abort(); }

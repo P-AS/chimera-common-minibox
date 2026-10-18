@@ -655,6 +655,25 @@ void mb_block_free(mb_block *b) {
 
 /* ---- protection refresh (coalesced) ---- */
 
+/* A protection change the OS refused: recorded anyway - there is no stricter
+ * answer to fall back on - but said, with the OS's reason. On Linux it is
+ * vm.max_map_count, which page-level tracking splits a guest's mapping
+ * against. Said up to eight times a block, not once: the first used to be a
+ * harmless one at start-up (a Windows range with an uncommitted page in it,
+ * no longer asked for) and then a real one went unsaid (2026-10-18). */
+static void say_protect_refused(mb_block *b, mb_range r) {
+#ifdef _WIN32
+	const unsigned long why = (unsigned long)GetLastError();
+#else
+	const unsigned long why = (unsigned long)errno;
+#endif
+	if (b->said_protect_refused >= 8) return;
+	b->said_protect_refused++;
+	mb_diag("miniBox: the OS refused a protection change (%zu pages at %p, error %lu)%s; writes there may not be tracked\n",
+		(size_t)(r.size >> MB_PAGESHIFT), (void *)r.start, why,
+		b->said_protect_refused == 8 ? " - not said again for this block" : "");
+}
+
 static void refresh_range(mb_block *b, size_t pstart, size_t pcount) {
 	if (!b->swapped_in) return;
 	size_t i = pstart;
@@ -679,14 +698,25 @@ static void refresh_range(mb_block *b, size_t pstart, size_t pcount) {
 			i = j;
 			continue;
 		}
-		if (mb_pal_protect(r, prot) != 0 && !b->said_protect_refused) {
-			/* recorded anyway - there is no stricter answer to fall back on -
-			 * but said: on Linux this is vm.max_map_count, which page-level
-			 * tracking splits a guest's mapping against */
-			b->said_protect_refused = true;
-			mb_diag("miniBox: the OS refused a protection change (%zu pages at %p); writes there may not be tracked\n",
-				j - i, (void *)r.start);
+		if (b->handle.lazy && prot == MB_PROT_NONE) {
+			/* A run of a lazy block given no access: only its committed pages
+			 * can be told so - VirtualProtect refuses a range with an
+			 * uncommitted page in it and changes NONE of it, which left the
+			 * pages the guest gave up accessible (2026-10-18). The uncommitted
+			 * ones have no access already. */
+			for (size_t k = i; k < j; ) {
+				if (b->pages[k].uncommitted) { note_prot(b, k, MB_PROT_NONE); k++; continue; }
+				size_t e = k + 1;
+				while (e < j && !b->pages[e].uncommitted) e++;
+				mb_range sub = { b->addr.start + (k << MB_PAGESHIFT), (e - k) << MB_PAGESHIFT };
+				if (mb_pal_protect(sub, prot) != 0) say_protect_refused(b, sub);
+				for (size_t m = k; m < e; m++) note_prot(b, m, prot);
+				k = e;
+			}
+			i = j;
+			continue;
 		}
+		if (mb_pal_protect(r, prot) != 0) say_protect_refused(b, r);
 		for (size_t k = i; k < j; k++) note_prot(b, k, prot);
 		i = j;
 	}
@@ -1000,6 +1030,22 @@ int mb_block_mmap_fixed(mb_block *b, mb_range addr, mb_prot prot, bool no_replac
 /* Whether a whole range is Free (and inside the block): the v3 mmap hint
  * check. Unaligned or out-of-block hints are not free - the caller then
  * places best-fit instead. */
+bool mb_block_host_can(mb_block *b, uintptr_t addr, uintptr_t len, bool write, bool guest_asks) {
+	if (len == 0) return true;
+	if (addr < b->addr.start || addr - b->addr.start >= b->addr.size
+		|| len > b->addr.size - (addr - b->addr.start)) return false;
+	const size_t first = (addr - b->addr.start) >> MB_PAGESHIFT;
+	const size_t last = (addr - b->addr.start + len - 1) >> MB_PAGESHIFT;
+	for (size_t i = first; i <= last; i++) {
+		const uint8_t s = b->pages[i].status;
+		if (s == MB_ST_FREE) return false;
+		const bool can = write ? (s == MB_ST_RW || s == MB_ST_RWX || s == MB_ST_RWSTACK)
+		                       : (s == MB_ST_R || s == MB_ST_RW || s == MB_ST_RX || s == MB_ST_RWX || s == MB_ST_RWSTACK);
+		if (!can && !guest_asks) return false;
+	}
+	return true;
+}
+
 bool mb_block_range_is_free(mb_block *b, mb_range addr) {
 	mb_block_track_lock(b);
 	size_t pcount, ps = validate(b, addr, &pcount);

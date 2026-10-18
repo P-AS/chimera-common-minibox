@@ -3,6 +3,7 @@
 #ifndef _WIN32
 #define _GNU_SOURCE
 #include "minibox_internal.h"
+#include <errno.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -62,7 +63,12 @@ int mb_pal_map_anon(mb_range in, mb_prot prot, mb_range *out) {
 
 void mb_pal_unmap_anon(mb_range addr) { munmap((void *)addr.start, addr.size); }
 
+/* Tests: how many protection changes to refuse, as the kernel refuses one past
+ * vm.max_map_count (every page with a protection of its own costs maps). */
+int mb_pal_protect_refusals = 0;
+
 int mb_pal_protect(mb_range addr, mb_prot prot) {
+	if (mb_pal_protect_refusals > 0) { mb_pal_protect_refusals--; errno = ENOMEM; return -1; }
 	return mprotect((void *)addr.start, addr.size, prot_to_native(prot));
 }
 

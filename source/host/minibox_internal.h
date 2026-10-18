@@ -207,7 +207,7 @@ typedef struct mb_block {
 	 * the machine is a mix of two (mb_host_load_state poisons it) */
 	bool load_touched;
 	bool swapped_in;
-	bool said_protect_refused;   /* refresh_range told the log once */
+	uint8_t said_protect_refused;   /* times refresh_range told the log (at most 8) */
 	bool active;
 	uint8_t hash[32];
 	mb_handle handle;
@@ -302,6 +302,11 @@ int  mb_block_madvise_dontneed(mb_block *b, mb_range addr);
 mb_sword mb_block_mremap(mb_block *b, mb_range addr, uintptr_t new_size, mb_range arena);
 mb_sword mb_block_mremap_maymove(mb_block *b, mb_range addr, uintptr_t new_size, mb_range arena, bool maymove);
 bool mb_block_range_is_free(mb_block *b, mb_range addr);
+/* Whether host code may read (write false) or write the bytes [addr, addr+len)
+ * of the guest: inside the block, every page allocated, and with the access the
+ * guest gave it - or less, when guest_asks says a fault there goes to the
+ * guest's own handler (MACHINE-SPEC, "Guest fault forwarding"). len 0 is true. */
+bool mb_block_host_can(mb_block *b, uintptr_t addr, uintptr_t len, bool write, bool guest_asks);
 int  mb_block_mark_invisible(mb_block *b, mb_range addr);
 int  mb_block_copy_from_external(mb_block *b, const uint8_t *src, uintptr_t start, uintptr_t len);
 int  mb_block_seal(mb_block *b);
@@ -316,6 +321,7 @@ const uint8_t *mb_block_hash(const mb_block *b);  /* 32 bytes; valid once sealed
 bool mb_block_commit_on_fault(mb_block *b, uintptr_t addr, bool write, bool *oom);
 #ifdef _WIN32
 extern int mb_pal_commit_refusals;   /* tests: commits to refuse (pal_win.c) */
+extern int mb_pal_protect_refusals;  /* tests: protection changes to refuse (pal_linux.c) */
 #endif
 
 int mb_block_save_state(mb_block *b, mb_write_cb w, uintptr_t ud);
@@ -623,6 +629,7 @@ mb_sword mb_fs_truncate_name(mb_fs *fs, const char *name, mb_sword size);
 mb_sword mb_fs_truncate_fd(mb_fs *fs, int fd, mb_sword size);
 mb_sword mb_fs_sync_fd(mb_fs *fs, int fd);
 size_t   mb_fs_sysout_tail(const mb_fs *fs, char *out, size_t cap);
+size_t   mb_fs_read_avail(mb_fs *fs, int fd, size_t n);   /* bytes a read of n will write */
 /* the open descriptors, for states and deltas (fs.c, 2026-10-18) */
 int      mb_fs_save_handles(const mb_fs *fs, mb_write_cb w, uintptr_t ud);
 int      mb_fs_load_handles(mb_fs *fs, mb_read_cb r, uintptr_t ud);

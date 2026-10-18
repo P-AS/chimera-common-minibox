@@ -417,6 +417,32 @@ thunk, so that its own system calls (unprotecting the page) work. Before
 ended the process (Chimera issue 280). Not observable to a guest that handles
 its faults: it is now called where it used to kill the host.
 
+## A broken guest ends the machine, not the host (2026-10-18)
+
+None of this changes what a working guest sees; it changes what a broken one
+can do to the process that hosts it.
+
+- The guest's start-up code (_start, its static constructors) and its seal
+  (co_clean, ecl_seal) run under the same guarded call as an export. A guest
+  that dies there is refused with the reason (wbx_create_host and wbx_seal
+  answer an error) instead of trapping.
+- A fault whose instruction is outside the guest's memory while the thread is
+  inside a guest call (the gs block's context slot is set) is the guest's: a
+  call through a null or wild function pointer is the guest's death.
+- A callback slot the host never registered answers with the guest's death,
+  "a host callback that was never registered", instead of jumping to 0.
+- Every system call that reads or writes guest memory first asks whether the
+  host may: inside the guest's memory, every page allocated and with the
+  access needed, or protected below it by a guest that exports
+  GuestFaultHandler. Otherwise it answers EFAULT, as Linux does. A read is
+  checked for the bytes it will actually write.
+- The OS refusing a protection change a tracked write needs (on Linux,
+  vm.max_map_count) is the guest's death with that reason.
+- A load that fails after it replaced memory poisons the machine (section 6).
+- Not done: on Windows a guest stack that overflows into its guard page still
+  ends the process. Windows builds the exception record on that same stack,
+  and its dispatcher and the handler need more room than a guard page has.
+
 ## Answered instead of fatal (spec v2.2, additive)
 
 These calls used to stop the machine (section 7's "everything else" rule),

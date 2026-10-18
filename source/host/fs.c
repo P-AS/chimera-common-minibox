@@ -344,6 +344,18 @@ int mb_fs_load_handles(mb_fs *fs, mb_read_cb r, uintptr_t ud) {
 	return 0;
 }
 
+/* How many bytes a read of n on fd will write into the guest's buffer: what is
+ * left of the file, or nothing. The buffer is checked for that much, as Linux
+ * faults only on the bytes it actually copies. */
+size_t mb_fs_read_avail(mb_fs *fs, int fd, size_t n) {
+	open_handle *h = handle_by_fd(fs, fd);
+	if (!h) return 0;
+	const mounted_file *f = &fs->files[h->file];
+	if (f->kind != F_REGULAR && f->kind != F_HOST) return 0;
+	const size_t left = h->pos < f->len ? f->len - h->pos : 0;
+	return n < left ? n : left;
+}
+
 mb_sword mb_fs_read(mb_fs *fs, int fd, uint8_t *buf, size_t n) {
 	open_handle *h = handle_by_fd(fs, fd);
 	if (!h) return -ENOENT;
