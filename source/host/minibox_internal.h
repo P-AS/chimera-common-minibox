@@ -617,6 +617,8 @@ bool      mb_elf_check(const uint8_t *image, size_t image_len, char *why, size_t
 /* ---- fs.c ---- */
 typedef struct mb_fs mb_fs;
 mb_fs *mb_fs_new(void);
+/* guest kit revision 2's answers (see struct mb_fs) */
+void mb_fs_set_linux_answers(mb_fs *fs, bool on);
 void   mb_fs_free(mb_fs *fs);
 int    mb_fs_mount(mb_fs *fs, const char *name, const uint8_t *data, size_t len, bool writable);
 /* read-only, read on demand from the host's disk; nothing is copied */

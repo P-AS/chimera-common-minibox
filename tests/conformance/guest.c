@@ -262,6 +262,35 @@ ECL_EXPORT int SysinfoAnswer(void) {
 	return -1;
 }
 
+/* The file answers, as the kit this guest was built with is answered: 2 for
+ * Linux's (kit revision 2: EBADF for a descriptor that is not open, ESPIPE
+ * for seeking a stream, a seek past the end allowed and end of file there),
+ * 0 for the old ones, anything else for a mix. */
+ECL_EXPORT int FileAnswers(void) {
+	int now = 0, old = 0;
+	char b[8];
+	struct stat st;
+	errno = 0; long r = syscall(SYS_read, 99, b, 1);
+	if (r == -1 && errno == EBADF) now |= 1; else if (r == -1 && errno == ENOENT) old |= 1;
+	errno = 0; r = syscall(SYS_lseek, 99, 0, SEEK_SET);
+	if (r == -1 && errno == EBADF) now |= 2; else if (r == -1 && errno == EINVAL) old |= 2;
+	errno = 0; r = syscall(SYS_lseek, 1, 0, SEEK_SET);
+	if (r == -1 && errno == ESPIPE) now |= 4; else if (r == -1 && errno == EINVAL) old |= 4;
+	errno = 0; r = syscall(SYS_fstat, 99, &st);
+	if (r == -1 && errno == EBADF) now |= 8; else if (r == -1 && errno == ENOENT) old |= 8;
+	const int fd = open("seed", O_RDONLY);
+	if (fd < 0) return -1;
+	errno = 0; r = syscall(SYS_lseek, fd, 100, SEEK_SET);
+	if (r == 100) { now |= 16; if (syscall(SYS_read, fd, b, 4) == 0) now |= 32; }
+	else if (r == -1 && errno == EINVAL) old |= 16 | 32;
+	errno = 0; r = syscall(SYS_pread64, fd, b, 4, 100);
+	if (r == 0) now |= 64; else if (r == -1 && errno == EINVAL) old |= 64;
+	close(fd);
+	if (now == 127) return 2;
+	if (old == 127) return 0;
+	return -1 - now * 256 - old;
+}
+
 /* no pipes in-guest: ENOSYS the caller must cope with */
 ECL_EXPORT int PipeRefused(void) {
 	int fds[2];

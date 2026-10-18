@@ -226,7 +226,7 @@ static int dies_starting_or_sealing(const char *starting, const char *sealing) {
 	return fails ? 1 : 0;
 }
 
-static int v3_flow(const char *guest) {
+static int v3_flow(const char *guest, bool kit0) {
 	mb_return r;
 	typedef int (MB_GUEST_ABI *int_fn)(void);
 	typedef uint64_t (MB_GUEST_ABI *u64_fn)(void);
@@ -269,6 +269,15 @@ static int v3_flow(const char *guest) {
 	wbx_activate_host(h, &r);
 	uint64_t o2 = ((u64_fn)proc(h, "ExpireStep"))();
 	CHECK(o2 == o1);                /* the wake happens at the same virtual time */
+	/* Guest kit revision 2: a lone yield costs a tick, an expired wait gives
+	 * way, and a sleep of the largest time there is saturates the clock
+	 * instead of running it backwards. A guest built with no revision keeps
+	 * the old answers. The sleep is last: the clock is spent after it. */
+	STAGE("v3 kit revision 2: lone yields, expired waits, a huge sleep");
+	const int want = kit0 ? 0 : 1;
+	CHECK(((int_fn)proc(h, "V3LoneYield"))() == want);
+	CHECK(((int_fn)proc(h, "V3ExpiredWaitYields"))() == want);
+	CHECK(((int_fn)proc(h, "V3HugeSleep"))() == want);
 	free(state.buf);
 	wbx_deactivate_host(h, &r);
 	wbx_destroy_host(h, &r);
@@ -717,7 +726,8 @@ int main(int argc, char **argv) {
 #else
 	if (argc > 2 && strcmp(argv[1], "--handler-recursion-child") == 0) return handler_recursion_child(argv[2]);
 #endif
-	if (argc > 2 && strcmp(argv[1], "--v3") == 0) return v3_flow(argv[2]);
+	if (argc > 2 && strcmp(argv[1], "--v3") == 0) return v3_flow(argv[2], false);
+	if (argc > 2 && strcmp(argv[1], "--v3-kit0") == 0) return v3_flow(argv[2], true);
 	if (argc > 3 && strcmp(argv[1], "--dies") == 0) return dies_starting_or_sealing(argv[2], argv[3]);
 	if (argc > 2 && strcmp(argv[1], "--probe-off") == 0) {
 		/* Probe forced off before anything initializes: the FSGSBASE
@@ -863,6 +873,10 @@ int main(int argc, char **argv) {
 		/* sysinfo by the guest kit's revision: this guest is built with the
 		 * current kit unless the runner was told it was not */
 		CHECK(((int_fn)proc(h, "SysinfoAnswer"))() == (kit0 ? 0 : 1));
+		/* and the file answers: Linux's from kit revision 2 */
+		const int files = ((int_fn)proc(h, "FileAnswers"))();
+		if (files != (kit0 ? 0 : 2)) printf("run_guest: FileAnswers -> %d\n", files);
+		CHECK(files == (kit0 ? 0 : 2));
 	}
 	/* spec v2 invariants a v3 host must preserve: this guest declares
 	 * nothing, so the clock is constant, timeouts never expire on their

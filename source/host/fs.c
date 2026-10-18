@@ -87,7 +87,16 @@ struct mb_fs {
 	uint64_t sysout_total;   /* every byte ever written to stdout and stderr */
 	size_t tail_at;      /* where the next byte goes */
 	bool tail_wrapped;   /* the ring is full: the oldest byte is at tail_at */
+	/* Answer as Linux does (guest kit revision 2, MACHINE-SPEC "Guest kit
+	 * revisions"): EBADF for a descriptor that is not open, ESPIPE for
+	 * seeking a stream, and a seek past the end allowed, where a read gives
+	 * end of file. A core built before keeps the answers it was built
+	 * against, so its movies replay. */
+	bool linux_answers;
 };
+
+void mb_fs_set_linux_answers(mb_fs *fs, bool on) { fs->linux_answers = on; }
+static int not_open(const mb_fs *fs, int before) { return fs->linux_answers ? -EBADF : before; }
 
 /* 64-bit seek and tell, spelled for each host.
  *
@@ -336,8 +345,10 @@ int mb_fs_load_handles(mb_fs *fs, mb_read_cb r, uintptr_t ud) {
 		last = fd;
 		hs[k].fd = fd;
 		hs[k].file = (size_t)(f - fs->files);
-		/* a writable file may be shorter than when the state was taken */
-		hs[k].pos = pos < f->len ? (size_t)pos : f->len;
+		/* a writable file may be shorter than when the state was taken; a
+		 * position past the end is kept, as the guest's own, once a seek may
+		 * put one there (linux_answers), and a read there is end of file */
+		hs[k].pos = pos < f->len || fs->linux_answers ? (size_t)pos : f->len;
 	}
 	free(fs->hs);
 	fs->hs = hs; fs->hn = n; fs->hcap = n ? n : 1;
@@ -358,11 +369,12 @@ size_t mb_fs_read_avail(mb_fs *fs, int fd, size_t n) {
 
 mb_sword mb_fs_read(mb_fs *fs, int fd, uint8_t *buf, size_t n) {
 	open_handle *h = handle_by_fd(fs, fd);
-	if (!h) return -ENOENT;
+	if (!h) return not_open(fs, -ENOENT);
 	mounted_file *f = &fs->files[h->file];
 	if (f->kind == F_EMPTY) return 0;
 	if (f->kind == F_SYSOUT) return -EBADF;
-	size_t avail = f->len - h->pos, take = n < avail ? n : avail;
+	/* past the end (a seek may go there): end of file */
+	size_t avail = h->pos < f->len ? f->len - h->pos : 0, take = n < avail ? n : avail;
 	if (f->kind == F_HOST) {
 		/* The handle's position is the guest's; the host file's own position is
 		 * shared between every handle on it, so it is set from ours each time
@@ -489,7 +501,7 @@ int mb_set_output_file(const char *path) {
 
 mb_sword mb_fs_write(mb_fs *fs, int fd, const uint8_t *buf, size_t n) {
 	open_handle *h = handle_by_fd(fs, fd);
-	if (!h) return -ENOENT;
+	if (!h) return not_open(fs, -ENOENT);
 	mounted_file *f = &fs->files[h->file];
 	if (f->kind == F_SYSOUT) {
 		fwrite(buf, 1, n, f->sysout);   /* host errors swallowed */
@@ -499,7 +511,14 @@ mb_sword mb_fs_write(mb_fs *fs, int fd, const uint8_t *buf, size_t n) {
 	}
 	if (f->kind == F_EMPTY || !f->writable) return -EBADF;
 	size_t newpos = h->pos + n;
-	if (newpos > f->cap) { f->cap = newpos; f->data = realloc(f->data, f->cap); }
+	if (newpos < h->pos) return -EFBIG;
+	if (newpos > f->cap) {
+		uint8_t *grown = realloc(f->data, newpos);
+		if (!grown) return -ENOSPC;
+		f->data = grown; f->cap = newpos;
+	}
+	/* written past the end after a seek there: the gap reads as zeros */
+	if (h->pos > f->len) memset(f->data + f->len, 0, h->pos - f->len);
 	memcpy(f->data + h->pos, buf, n);
 	h->pos = newpos;
 	if (newpos > f->len) f->len = newpos;
@@ -534,9 +553,9 @@ mb_sword mb_fs_pwrite(mb_fs *fs, int fd, const uint8_t *buf, size_t n, mb_sword 
 
 mb_sword mb_fs_seek(mb_fs *fs, int fd, mb_sword offset, int whence) {
 	open_handle *h = handle_by_fd(fs, fd);
-	if (!h) return -EINVAL;
+	if (!h) return not_open(fs, -EINVAL);
 	mounted_file *f = &fs->files[h->file];
-	if (f->kind != F_REGULAR && f->kind != F_HOST) return -EINVAL;
+	if (f->kind != F_REGULAR && f->kind != F_HOST) return fs->linux_answers ? -ESPIPE : -EINVAL;
 	mb_sword newpos;
 	switch (whence) {
 		case SEEK_SET: newpos = offset; break;
@@ -544,7 +563,7 @@ mb_sword mb_fs_seek(mb_fs *fs, int fd, mb_sword offset, int whence) {
 		case SEEK_END: newpos = (mb_sword)f->len + offset; break;
 		default: return -EINVAL;
 	}
-	if (newpos < 0 || newpos > (mb_sword)f->len) return -EINVAL;
+	if (newpos < 0 || (!fs->linux_answers && newpos > (mb_sword)f->len)) return -EINVAL;
 	h->pos = (size_t)newpos;
 	return newpos;
 }
@@ -579,7 +598,7 @@ mb_sword mb_fs_stat_name(mb_fs *fs, const char *name, void *ks) {
  * without filling in a stat that nobody wants. */
 bool mb_fs_exists(mb_fs *fs, const char *name) { return by_name(fs, name) != NULL; }
 mb_sword mb_fs_stat_fd(mb_fs *fs, int fd, void *ks) {
-	open_handle *h = handle_by_fd(fs, fd); if (!h) return -ENOENT; return stat_file(&fs->files[h->file], (kstat *)ks);
+	open_handle *h = handle_by_fd(fs, fd); if (!h) return not_open(fs, -ENOENT); return stat_file(&fs->files[h->file], (kstat *)ks);
 }
 /* fsync/fdatasync/syncfs: there is nothing to flush - a mounted file lives in
  * host memory, and what reaches a host file is written when it is unmounted -
@@ -604,5 +623,5 @@ mb_sword mb_fs_truncate_name(mb_fs *fs, const char *name, mb_sword size) {
 	return 0;
 }
 mb_sword mb_fs_truncate_fd(mb_fs *fs, int fd, mb_sword size) {
-	open_handle *h = handle_by_fd(fs, fd); if (!h) return -ENOENT; return mb_fs_truncate_name(fs, fs->files[h->file].name, size);
+	open_handle *h = handle_by_fd(fs, fd); if (!h) return not_open(fs, -ENOENT); return mb_fs_truncate_name(fs, fs->files[h->file].name, size);
 }

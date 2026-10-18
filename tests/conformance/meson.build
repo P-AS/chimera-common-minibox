@@ -88,3 +88,19 @@ test('conformance-v3', run_guest,
   suite: 'system',
   timeout: 180,
 )
+
+# The same v3 guest built with a guest kit of no revision: the virtual-time
+# answers of revision 2 must not reach it (MACHINE-SPEC, "Guest kit revisions").
+guest_v3_kit0_wbx = custom_target('guest-v3-kit0.wbx',
+  input: 'guest-v3.c',
+  output: 'guest-v3-kit0.wbx',
+  command: [
+    waterbox_musl_gcc, waterbox_guest_cflags, waterbox_guest_ldflags,
+    '-std=c11', '-o', '@OUTPUT@', '@INPUT@', emulibc_kit0, '-lgcc',
+  ],
+)
+test('conformance-v3-kit0', run_guest,
+  args: ['--v3-kit0', guest_v3_kit0_wbx],
+  suite: 'system',
+  timeout: 180,
+)

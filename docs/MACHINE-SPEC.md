@@ -359,7 +359,9 @@ writable file is EACCES. fd allocation is lowest-unused; open checks only
 O_ACCMODE. The open descriptors and their positions are in states (section
 6, OpenFileTable1); a writable file's bytes are not, and stay as they are
 across a load, so a core keeps data it writes in its own memory instead
-(Chimera mounts every file read-only). Fabricated stat: st_dev=1, st_ino=1, st_nlink=0, st_blksize=4096,
+(Chimera mounts every file read-only). The answers for a descriptor that
+is not open, for seeking a stream and for a seek past the end depend on the
+guest kit's revision ("Guest kit revisions", revision 2). Fabricated stat: st_dev=1, st_ino=1, st_nlink=0, st_blksize=4096,
 S_IFREG if seekable else S_IFIFO, constant timestamps (1262304000000 s,
 500000000 ns).
 
@@ -583,6 +585,15 @@ instruction stream.
 - **Already-expired wait**: parking is skipped; the call costs one tick and
   returns ETIMEDOUT. (A zero-timeout spin therefore advances the clock
   instead of livelocking it: time passes while you spin, 1 us per call.)
+  From guest kit revision 2 it then yields, as a clock read does.
+- **sched_yield(24)**: from guest kit revision 2, a yield by the only
+  runnable thread while another waits with a timeout costs one tick, so a
+  thread that spins on yields alone still lets that timeout come.
+- **Huge times**: from guest kit revision 2, a timespec or a deadline too
+  large for the clock saturates at the clock's largest value (the v2
+  constant plus the clock must fit in 64 bits), as Linux saturates at
+  KTIME_MAX. Before, the nanoseconds wrapped round, and a sleep of the
+  largest time there is ran the clock backwards.
 - **mmap**: a bare hint (addr != 0, neither MAP_FIXED nor
   MAP_FIXED_NOREPLACE) is honoured when those pages are Free, and the call is
   placed best-fit otherwise. (v2 maps every bare hint fixed at the address.)
@@ -623,6 +634,13 @@ pointing outside the guest's memory refuses the load.
 
 - **Revision 1**: sysinfo's mem_unit is written at offset 104, where it
   belongs (section 7). Revision 0 keeps the write at offset 100.
+- **Revision 2** (2026-10-18): the file answers are Linux's. A descriptor
+  that is not open is EBADF for read, write, readv, writev, lseek, fstat
+  and ftruncate (before: ENOENT, or EINVAL for lseek); seeking a stream is
+  ESPIPE (before: EINVAL); a seek past a file's end is allowed, a read or
+  pread there is end of file (0), and a write there fills the gap with zeros
+  (before: EINVAL). Under v3, the virtual-time rules marked revision 2 in
+  "Virtual time" apply.
 
 The revision is independent of the machine-spec version: v2 and v3 cores alike
 get the corrected answers once rebuilt. A rebuilt core is a new package, with

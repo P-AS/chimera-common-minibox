@@ -44,6 +44,7 @@ struct mb_threads {
 	 * gthread bytes, and v2 guests keep that format byte for byte. */
 	uint64_t *deadlines; uint64_t *seqs; size_t ndead, capdead;
 	uint64_t park_seq;       /* tie-breaker: park order */
+	uint32_t kit_revision;   /* the guest kit the core was built with */
 };
 
 /* ---- thread array (sorted by tid) ---- */
@@ -146,6 +147,27 @@ void mb_threads_free(mb_threads *t) {
 /* machine-spec version the guest declared; the host sets it at load from
  * __wbx_machine_spec (2 when the guest says nothing) */
 void mb_threads_set_spec(mb_threads *t, int spec) { t->spec = spec; }
+void mb_threads_set_kit_revision(mb_threads *t, uint32_t revision) { t->kit_revision = revision; }
+uint32_t mb_threads_kit_revision(const mb_threads *t) { return t->kit_revision; }
+
+/* The v3 clock's ceiling: the clock reads as the v2 constant plus the clock,
+ * so the sum must fit. Linux saturates a huge timeout the same way
+ * (KTIME_MAX); before revision 2 it wrapped, and a sleep of the largest time
+ * there is ran the clock backwards (analysis of 2026-10-18). */
+#define MB_V3_CLOCK_MAX (UINT64_MAX - MB_V3_BASE_NS)
+
+uint64_t mb_threads_ns_of(const mb_threads *t, int64_t sec, int64_t nsec)
+{
+	const uint64_t s = (uint64_t)sec, n = (uint64_t)nsec;
+	if (t->kit_revision >= 2 && s > (MB_V3_CLOCK_MAX - n) / 1000000000ull) return MB_V3_CLOCK_MAX;
+	return s * 1000000000ull + n;
+}
+
+uint64_t mb_threads_ns_add(const mb_threads *t, uint64_t a, uint64_t b)
+{
+	if (t->kit_revision >= 2 && (a > MB_V3_CLOCK_MAX || b > MB_V3_CLOCK_MAX - a)) return MB_V3_CLOCK_MAX;
+	return a + b;
+}
 int mb_threads_spec(const mb_threads *t) { return t->spec; }
 
 /* ---- scheduling ---- */
@@ -326,7 +348,7 @@ static void expire_due(mb_threads *t) {
 	}
 }
 /* advance the clock and expire what is due (v3; the caller yields) */
-void mb_threads_advance(mb_threads *t, uint64_t ns) { t->vclock_ns += ns; expire_due(t); }
+void mb_threads_advance(mb_threads *t, uint64_t ns) { t->vclock_ns = mb_threads_ns_add(t, t->vclock_ns, ns); expire_due(t); }
 
 /* v3 timed wait (WAIT: deadline already made absolute by the caller). v2, or
  * no deadline, parks forever exactly as mb_threads_futex_wait does. */
@@ -335,8 +357,14 @@ uintptr_t mb_threads_futex_wait_timeout(mb_threads *t, mb_context *c, uintptr_t 
 	if (cur != compare) return serr(EAGAIN);
 	if (t->spec != 3 || !has_deadline) return park_me(t, c, sok(0), addr);
 	/* already expired: skip the park, cost one tick, ETIMEDOUT. A
-	 * zero-timeout spin advances the clock instead of livelocking it. */
-	if (deadline <= t->vclock_ns) { mb_threads_advance(t, MB_V3_TICK_NS); return serr(ETIMEDOUT); }
+	 * zero-timeout spin advances the clock instead of livelocking it. From
+	 * revision 2 it also gives way, as a clock read does: a thread spinning
+	 * on an expired wait otherwise kept a woken one from running. */
+	if (deadline <= t->vclock_ns) {
+		mb_threads_advance(t, MB_V3_TICK_NS);
+		if (t->kit_revision >= 2) return swap_to_next(t, c, serr(ETIMEDOUT));
+		return serr(ETIMEDOUT);
+	}
 	queue_push(get_or_make_queue(t, addr), t->active_tid);
 	gthread *self = find_thread(t, t->active_tid);
 	self->state = T_WAITING;
@@ -394,6 +422,24 @@ uint32_t mb_threads_active_tid(mb_threads *t) { return t ? t->active_tid : 0; }
 bool mb_threads_has_thread(mb_threads *t, uint32_t tid) { return find_thread(t, tid) != NULL; }
 void mb_threads_reset_active(mb_threads *t) { t->active_tid = 1; }
 uintptr_t mb_threads_yield(mb_threads *t, mb_context *c) { return swap_to_next(t, c, sok(0)); }
+
+/* sched_yield. In v3 time moves only when a thread reads the clock, sleeps or
+ * waits, so a thread that only yields, alone with others parked on a
+ * timeout, spun with the clock standing still and their timeouts never
+ * due. From revision 2 such a yield costs a tick, as a clock read does. */
+uintptr_t mb_threads_sched_yield(mb_threads *t, mb_context *c)
+{
+	if (t->spec == 3 && t->kit_revision >= 2) {
+		bool others = false, timed = false;
+		for (size_t i = 0; i < t->nthreads; i++) {
+			if (t->threads[i].tid == t->active_tid) continue;
+			if (t->threads[i].state == T_RUNNABLE) others = true;
+			else if (t->threads[i].state == T_WAITING && t->deadlines[i] != 0) timed = true;
+		}
+		if (!others && timed) mb_threads_advance(t, MB_V3_TICK_NS);
+	}
+	return swap_to_next(t, c, sok(0));
+}
 
 /* ---- savestate (self-consistent; encoding is implementation-defined per SPEC) ---- */
 static int wr(mb_write_cb w, uintptr_t ud, const void *d, size_t n) { return w(ud, d, n) < 0 ? -1 : 0; }

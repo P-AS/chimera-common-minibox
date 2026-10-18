@@ -778,7 +778,7 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 		 * privileged and no path is taken for one user and not another. */
 		case NR_getuid: case NR_geteuid: return sok(1000);
 		case NR_getgid: case NR_getegid: return sok(1000);
-		case NR_sched_yield: return mb_threads_yield(h->threads, &h->context);
+		case NR_sched_yield: return mb_threads_sched_yield(h->threads, &h->context);
 		case NR_nanosleep: {
 			/* v3: the clock advances by exactly the requested duration, then
 			 * one yield. (Negative or out-of-range requests are EINVAL, and a
@@ -787,7 +787,7 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			const int64_t *req = (const int64_t *)a1;
 			if (!guest_can(h, a1, 16, false)) return serr(EFAULT);
 			if (req[0] < 0 || req[1] < 0 || req[1] >= 1000000000ll) return serr(EINVAL);
-			mb_threads_advance(h->threads, (uint64_t)req[0] * 1000000000ull + (uint64_t)req[1]);
+			mb_threads_advance(h->threads, mb_threads_ns_of(h->threads, req[0], req[1]));
 			return mb_threads_yield(h->threads, &h->context);
 		}
 		case NR_clock_nanosleep: {
@@ -798,7 +798,7 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			const int64_t *req = (const int64_t *)a3;
 			if (!guest_can(h, a3, 16, false)) return serr(EFAULT);
 			if (req[0] < 0 || req[1] < 0 || req[1] >= 1000000000ll) return serr(EINVAL);
-			uint64_t target = (uint64_t)req[0] * 1000000000ull + (uint64_t)req[1];
+			uint64_t target = mb_threads_ns_of(h->threads, req[0], req[1]);
 			if ((a2 & 1) != 0) {
 				/* absolute, on the clock's own scale: convert past the base */
 				uint64_t rel = (target > MB_V3_BASE_NS) ? target - MB_V3_BASE_NS : 0;
@@ -870,9 +870,9 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 				const int64_t *to = (const int64_t *)a4;
 				if (!guest_can(h, a4, 16, false)) return serr(EFAULT);
 				if (to[0] < 0 || to[1] < 0 || to[1] >= 1000000000ll) return serr(EINVAL);
-				uint64_t t = (uint64_t)to[0] * 1000000000ull + (uint64_t)to[1];
+				uint64_t t = mb_threads_ns_of(h->threads, to[0], to[1]);
 				uint64_t dl;
-				if (op == FUTEX_WAIT) dl = mb_threads_clock_ns(h->threads) + t;
+				if (op == FUTEX_WAIT) dl = mb_threads_ns_add(h->threads, mb_threads_clock_ns(h->threads), t);
 				else dl = (t > MB_V3_BASE_NS) ? t - MB_V3_BASE_NS : 0;   /* absolute, past the base; at-or-before the base is already due */
 				return mb_threads_futex_wait_timeout(h->threads, &h->context, a1, (uint32_t)a3, true, dl);
 			}
@@ -1064,6 +1064,8 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 		if (!guest_owns(h, kit_addr, 4)) { snprintf(errbuf, errlen, "guest's __wbx_kit_revision points outside its memory"); return host_new_unwind(h); }
 		memcpy(&h->kit_revision, (const void *)kit_addr, 4);
 	  }
+	  mb_threads_set_kit_revision(h->threads, h->kit_revision);
+	  mb_fs_set_linux_answers(h->fs, h->kit_revision >= 2);
 	  if (spec == 3) { fprintf(stderr, "miniBox: guest declares machine spec v3 (virtual time)\n"); fflush(stderr); } }
 
 	/* every callback slot answers, registered or not */

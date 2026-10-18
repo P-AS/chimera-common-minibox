@@ -27,7 +27,7 @@ ECL_INVISIBLE ECL_EXPORT struct __WbxSysLayout __wbxsysinfo;
  * anything. (Built with WBX_KIT_REVISION=0 only by miniBox's own test of the
  * old answer.) */
 #ifndef WBX_KIT_REVISION
-#define WBX_KIT_REVISION 1
+#define WBX_KIT_REVISION 2
 #endif
 #if WBX_KIT_REVISION > 0
 ECL_EXPORT const unsigned int __wbx_kit_revision = WBX_KIT_REVISION;

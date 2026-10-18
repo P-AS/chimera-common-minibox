@@ -41,6 +41,60 @@ ECL_EXPORT int V3ClockTicks(void) {
 
 /* nanosleep advances by exactly the request (+ the check reads' ticks);
  * clock_nanosleep relative, absolute future and absolute past */
+/* ---- guest kit revision 2 ----
+ * Each answers 1 when the revision-2 rule held and 0 when the old one did. */
+
+/* A thread that only yields, alone with one parked on a 50 us timeout and
+ * never reading the clock: from revision 2 each yield costs a tick, so the
+ * waiter is due after 50 of them; before, the clock stood still. */
+static int lone_fut;
+static volatile int lone_woke;
+static void *lone_waiter(void *arg) {
+	(void)arg;
+	struct timespec to = { 0, 50000 };
+	syscall(SYS_futex, &lone_fut, 0 /*WAIT*/, 0, &to, NULL, 0);
+	lone_woke = 1;
+	return 0;
+}
+ECL_EXPORT int V3LoneYield(void) {
+	pthread_t t;
+	lone_woke = 0;
+	if (pthread_create(&t, 0, lone_waiter, 0) != 0) return -1;
+	syscall(SYS_sched_yield);   /* it runs, and parks */
+	for (int i = 0; i < 1000 && !lone_woke; i++) syscall(SYS_sched_yield);
+	const int woke = lone_woke;
+	while (!lone_woke) vnow();  /* a clock read ticks under either rule */
+	pthread_join(t, 0);
+	return woke;
+}
+
+/* A wait whose timeout has already passed, spun on while another thread is
+ * runnable: from revision 2 it gives way, as a clock read does, so the other
+ * runs; before, it never did. */
+static volatile int spin_ran;
+static void *spin_setter(void *arg) { (void)arg; spin_ran = 1; return 0; }
+ECL_EXPORT int V3ExpiredWaitYields(void) {
+	static int word = 0;
+	pthread_t t;
+	spin_ran = 0;
+	if (pthread_create(&t, 0, spin_setter, 0) != 0) return -1;
+	const struct timespec zero = { 0, 0 };
+	for (int i = 0; i < 100 && !spin_ran; i++) syscall(SYS_futex, &word, 0 /*WAIT*/, 0, &zero, NULL, 0);
+	const int ran = spin_ran;
+	pthread_join(t, 0);
+	return ran;
+}
+
+/* A sleep of the largest time there is: from revision 2 the clock saturates;
+ * before, the nanoseconds wrapped and it went back a second. */
+ECL_EXPORT int V3HugeSleep(void) {
+	const uint64_t a = vnow();
+	const struct timespec req = { INT64_MAX, 0 };
+	syscall(SYS_nanosleep, &req, NULL);
+	const uint64_t b = vnow();
+	return b >= a;
+}
+
 ECL_EXPORT int V3NanosleepExact(void) {
 	struct timespec req, rem;
 	uint64_t a = vnow();

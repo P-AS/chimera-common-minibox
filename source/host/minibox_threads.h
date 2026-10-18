@@ -12,6 +12,17 @@ void        mb_threads_free(mb_threads *t);
  * sets it at load from __wbx_machine_spec */
 void mb_threads_set_spec(mb_threads *t, int spec);
 int  mb_threads_spec(const mb_threads *t);
+/* the guest kit's revision (MACHINE-SPEC, "Guest kit revisions"): from 2 the
+ * v3 clock saturates instead of wrapping, and a lone yield or an expired wait
+ * lets time move */
+void     mb_threads_set_kit_revision(mb_threads *t, uint32_t revision);
+uint32_t mb_threads_kit_revision(const mb_threads *t);
+/* v3, revision 2: a timespec as nanoseconds, the largest there is when it
+ * would not fit; a sum of two of them the same way */
+uint64_t mb_threads_ns_of(const mb_threads *t, int64_t sec, int64_t nsec);
+uint64_t mb_threads_ns_add(const mb_threads *t, uint64_t a, uint64_t b);
+/* sched_yield: v3 and revision 2, the only runnable thread costs a tick */
+uintptr_t mb_threads_sched_yield(mb_threads *t, mb_context *c);
 
 /* NR_WBX_CLONE(thread_area, child_rsp, child_rip, child_tid, parent_tid) */
 mb_sword      mb_threads_spawn(mb_threads *t, mb_block *b, uintptr_t thread_area,
