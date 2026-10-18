@@ -209,6 +209,9 @@ MemoryBlock: magic "ActivatedMemoryBlock"; the seal hash; the block AddressRange
             page status (1 byte each) and page dirty (1 byte each); then, for
             each non-invisible dirty page in order, its 4096 bytes (read through
             the mirror)
+GuestFpuState1: magic "GuestFpuState1"; u16 x87 control word; u32 MXCSR
+            (section 9). A state written before 2026-10-18 has no such
+            record; it loads with 0x037F and 0x1F80.
 GuestThreadSet: magic "GuestThreadSet"; thread states; magic "GuestThreadSet"
             (single-thread implementations: active_tid must be 1)
 magic  "ˇsoHxoqɹǝʇɐMpǝʇɐʌᴉʇɔ∀"  (SAVE_END_MAGIC, upside-down "ActivatedWaterboxHost")
@@ -316,6 +319,21 @@ save/load require no writable files mounted and the identical readonly file set.
   xmm0-15 read zero (after a callback also rcx, rdx, rsi, rdi, r8, r9 and r11;
   rax is the result). A guest that spills a register it never set - a varargs
   prologue spills xmm0-7 - must not find a host address in it.
+- Floating-point control words (2026-10-18): the x87 control word and MXCSR
+  are part of the machine. A guest starts with 0x037F (64-bit precision,
+  round to nearest, exceptions masked) and 0x1F80, whatever thread calls in
+  (Windows starts its threads at 0x027F, 53-bit precision; Linux at 0x037F;
+  a MinGW program such as chimera-run.exe sets 0x037F itself). The guest's
+  are loaded on every way into guest code (an export, _start and the other
+  0-arg entries, the return from a syscall or a host callback) and kept on
+  every way out; what the guest sets stays with the guest, and is saved in
+  states (section 6). Syscalls and host callbacks run with the words the host
+  had when the call came in. Guest threads share one set, as before.
+  This applies to every core, old and new. Every test script, chimera-run on
+  both systems and the interface on Linux already ran guests at
+  0x037F/0x1F80; what changed is the interface on Windows, which ran them at
+  0x027F (and, after a guest changed its MXCSR, the host thread kept the
+  guest's).
 - TLS: the guest's pthread_self reads [gs:0x18] slot 0 (Context.thread_area).
   The host installs a gs base (Windows: TEB SubSystemTib field; Linux:
   arch_prctl ARCH_SET_GS to a 4-word thread-local block, only if gs is

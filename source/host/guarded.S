@@ -35,6 +35,10 @@
 #define CTX_DEAD          0x241
 #define CTX_ESC_RSP       0x248
 #define CTX_CALLS         0x250
+#define CTX_GUEST_MXCSR   0x258
+#define CTX_HOST_MXCSR    0x25c
+#define CTX_GUEST_FCW     0x260
+#define CTX_HOST_FCW      0x262
 
 #define CALL_GUEST_IMPL   0x35f00000200
 
@@ -46,6 +50,8 @@
 #define FRAME_HOST_RSP_ALT  32
 #define FRAME_GUEST_RSP_ALT 40
 #define FRAME_XMM           48   /* xmm6..xmm15, ten of them */
+#define FRAME_PREV_FCW      208  /* the context's host control words before */
+#define FRAME_PREV_MXCSR    212  /* this call: a nested call puts them back */
 #define FRAME_SIZE          216  /* 8 pushes before it: rsp % 16 == 0 at the call */
 
 #ifdef _WIN32
@@ -131,6 +137,17 @@ mb_guarded_call:
 	movq %rax, FRAME_GUEST_RSP_ALT(%rsp)
 	movq %rsp, CTX_ESC_RSP(%r10)
 	incq CTX_CALLS(%r10)
+	/* the floating-point control words: the host's parked in the context
+	 * (the outer call's kept in the record), the guest's loaded. Before the
+	 * dead check, so the landing is the same for every way of arriving. */
+	movw CTX_HOST_FCW(%r10), %ax
+	movw %ax, FRAME_PREV_FCW(%rsp)
+	movl CTX_HOST_MXCSR(%r10), %eax
+	movl %eax, FRAME_PREV_MXCSR(%rsp)
+	fnstcw CTX_HOST_FCW(%r10)
+	stmxcsr CTX_HOST_MXCSR(%r10)
+	fldcw CTX_GUEST_FCW(%r10)
+	ldmxcsr CTX_GUEST_MXCSR(%r10)
 
 	/* the host's %fs, where the syscall dispatcher and the way out both read
 	 * it - parked whenever the probe says the instructions exist, not only
@@ -167,6 +184,16 @@ mb_guarded_call:
 	movq FRAME_CTX(%rsp), %r10
 	movq FRAME_PREV_ESC(%rsp), %r11
 	movq %r11, CTX_ESC_RSP(%r10)
+	/* the guest's control words kept, the host's back, and the outer call's
+	 * host words back in the context */
+	fnstcw CTX_GUEST_FCW(%r10)
+	stmxcsr CTX_GUEST_MXCSR(%r10)
+	fldcw CTX_HOST_FCW(%r10)
+	ldmxcsr CTX_HOST_MXCSR(%r10)
+	movw FRAME_PREV_FCW(%rsp), %r11w
+	movw %r11w, CTX_HOST_FCW(%r10)
+	movl FRAME_PREV_MXCSR(%rsp), %r11d
+	movl %r11d, CTX_HOST_MXCSR(%r10)
 	/* the host's %fs back, whenever entry parked it: what entry parked is
 	 * the truth, whether the guest ever swapped or a repair installed its
 	 * pointer. */

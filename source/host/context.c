@@ -35,6 +35,10 @@ _Static_assert(offsetof(mb_context, fs_swap) == 0x240, "guarded.S CTX_FS_SWAP");
 _Static_assert(offsetof(mb_context, dead) == 0x241, "guarded.S CTX_DEAD");
 _Static_assert(offsetof(mb_context, esc_rsp) == 0x248, "guarded.S CTX_ESC_RSP");
 _Static_assert(offsetof(mb_context, calls) == 0x250, "guarded.S CTX_CALLS");
+_Static_assert(offsetof(mb_context, guest_mxcsr) == 0x258, "guarded.S CTX_GUEST_MXCSR");
+_Static_assert(offsetof(mb_context, host_mxcsr) == 0x25c, "guarded.S CTX_HOST_MXCSR");
+_Static_assert(offsetof(mb_context, guest_fcw) == 0x260, "guarded.S CTX_GUEST_FCW");
+_Static_assert(offsetof(mb_context, host_fcw) == 0x262, "guarded.S CTX_HOST_FCW");
 _Static_assert(MB_ORG + 0x200 == 0x35f00000200ull, "guarded.S CALL_GUEST_IMPL");
 
 /* interop.bin lives in the sibling reference tree; embedded at build time. */
@@ -114,6 +118,9 @@ void mb_context_init(mb_context *c, uintptr_t guest_rsp, uintptr_t guest_rsp_alt
 	c->guest_rsp = guest_rsp;
 	c->guest_rsp_alt = guest_rsp_alt;
 	c->dispatch_syscall = dispatch;
+	c->guest_fcw = MB_GUEST_FCW_START;
+	c->guest_mxcsr = MB_GUEST_MXCSR_START;
+	mb_fpu_get(&c->host_fcw, &c->host_mxcsr);
 #ifdef MB_HAVE_FSBASE
 	/* Replaced by the guest's own the moment musl installs it. */
 	c->thread_area = mb_early_thread_pointer();
@@ -165,8 +172,31 @@ bool mb_fsbase_ok(void) {
 #endif
 #endif
 
+static uintptr_t call_guest_simple_fs(uintptr_t entry, mb_context *c);
+
+/* The guest's floating-point control words in, the host's back after: the
+ * same as guarded.S does for an exported call (see mb_context). */
 uintptr_t mb_call_guest_simple(uintptr_t entry, mb_context *c) {
-	call_guest_simple_fn f = (call_guest_simple_fn)CALL_GUEST_SIMPLE_ADDR;
+	const uint16_t prev_fcw = c->host_fcw;
+	const uint32_t prev_mxcsr = c->host_mxcsr;
+	mb_fpu_get(&c->host_fcw, &c->host_mxcsr);
+	mb_fpu_set(&c->guest_fcw, &c->guest_mxcsr);
+	const uintptr_t r = call_guest_simple_fs(entry, c);
+	mb_fpu_get(&c->guest_fcw, &c->guest_mxcsr);
+	mb_fpu_set(&c->host_fcw, &c->host_mxcsr);
+	c->host_fcw = prev_fcw;
+	c->host_mxcsr = prev_mxcsr;
+	return r;
+}
+
+static uintptr_t call_guest_simple_fs(uintptr_t entry, mb_context *c) {
+	/* The blob's address goes through an empty asm so the compiler cannot
+	 * see it as a constant: GCC's inliner, handed a constant that is not a
+	 * function, turns the call into "unreachable" and drops it - with -O3
+	 * the guest's _start was never called (2026-10-18). */
+	uintptr_t blob = CALL_GUEST_SIMPLE_ADDR;
+	__asm__("" : "+r"(blob));
+	call_guest_simple_fn f = (call_guest_simple_fn)blob;
 	/* the context the fault handlers judge a fault against is the one running
 	 * now - for every guest, as the entry thunks set it */
 	mb_guest_ctx = c;
@@ -308,8 +338,6 @@ uintptr_t mb_thunks_get(mb_thunks *t, uintptr_t guest_entry, mb_context *c) {
  * the guest's block instead of its own - unobserved to date, and the window
  * closes at the next boundary.) */
 uintptr_t mb_thunks_get_extcall(mb_thunks *t, uintptr_t cb, mb_context *c) {
-#ifdef MB_HAVE_FSBASE
-	if (!c->fs_swap) return cb;
 	for (size_t i = 0; i < t->ext_count; i++)
 		if (t->ext_entries[i] == cb) return t->ext_ptrs[i];
 	/* Entry thunks grow from the bottom of the page and these from the top,
@@ -325,31 +353,50 @@ uintptr_t mb_thunks_get_extcall(mb_thunks *t, uintptr_t cb, mb_context *c) {
 	}
 	uintptr_t addr = t->mem.start + t->mem.size - (t->ext_count + 1) * THUNK_SIZE;
 	uint8_t *p = (uint8_t *)addr;
-	/* The guest's %fs is read back from the context on the way out rather than
-	 * saved from the register on the way in: the context is the live answer,
-	 * and a host that lost the base while the callback ran (Windows drops it
-	 * across a fault, and a GL callback takes plenty) would otherwise have the
-	 * loss faithfully restored. Stack: entry rsp%16==8, push -> 0, call -> the
-	 * callee sees 8. r10 is caller-saved, hence the push rather than a reload. */
+	/* Every guest's callbacks are wrapped for the floating-point control
+	 * words (see mb_context): the guest's are kept in the context and the
+	 * host's loaded for the callback, then the guest's loaded again - a host
+	 * callback (a GL driver among them) does not compute with the guest's
+	 * rounding, and the guest does not get the callback's.
+	 * A swapping guest's %fs is put back to the host's around the call too.
+	 * The guest's %fs is read back from the context on the way out rather
+	 * than saved from the register on the way in: the context is the live
+	 * answer, and a host that lost the base while the callback ran (Windows
+	 * drops it across a fault, and a GL callback takes plenty) would
+	 * otherwise have the loss faithfully restored. Stack: entry rsp%16==8,
+	 * push -> 0, call -> the callee sees 8. r10 is caller-saved, hence the
+	 * push rather than a reload. */
+	const uint32_t guest_fcw = (uint32_t)offsetof(mb_context, guest_fcw);
+	const uint32_t guest_mxcsr = (uint32_t)offsetof(mb_context, guest_mxcsr);
+	const uint32_t host_fcw = (uint32_t)offsetof(mb_context, host_fcw);
+	const uint32_t host_mxcsr = (uint32_t)offsetof(mb_context, host_mxcsr);
+	const bool swap_fs = mb_fs_swap && c->fs_swap;
 	emit8(&p, 0x49); emit8(&p, 0xba); emit64(&p, (uintptr_t)c);        /* mov r10, ctx */
 	emit8(&p, 0x41); emit8(&p, 0x52);                                  /* push r10 */
-	emit8(&p, 0x49); emit8(&p, 0x8b); emit8(&p, 0x82);
-	emit32(&p, (uint32_t)offsetof(mb_context, host_fs));               /* mov rax, [r10+host_fs] */
-	emit8(&p, 0xf3); emit8(&p, 0x48); emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0xd0); /* wrfsbase rax */
+	emit8(&p, 0x41); emit8(&p, 0xd9); emit8(&p, 0xba); emit32(&p, guest_fcw);   /* fnstcw [r10+guest_fcw] */
+	emit8(&p, 0x41); emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0x9a); emit32(&p, guest_mxcsr); /* stmxcsr [r10+guest_mxcsr] */
+	emit8(&p, 0x41); emit8(&p, 0xd9); emit8(&p, 0xaa); emit32(&p, host_fcw);    /* fldcw [r10+host_fcw] */
+	emit8(&p, 0x41); emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0x92); emit32(&p, host_mxcsr);  /* ldmxcsr [r10+host_mxcsr] */
+	if (swap_fs) {
+		emit8(&p, 0x49); emit8(&p, 0x8b); emit8(&p, 0x82);
+		emit32(&p, (uint32_t)offsetof(mb_context, host_fs));           /* mov rax, [r10+host_fs] */
+		emit8(&p, 0xf3); emit8(&p, 0x48); emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0xd0); /* wrfsbase rax */
+	}
 	emit8(&p, 0x48); emit8(&p, 0xb8); emit64(&p, cb);                  /* mov rax, cb */
 	emit8(&p, 0xff); emit8(&p, 0xd0);                                  /* call rax */
 	emit8(&p, 0x49); emit8(&p, 0x89); emit8(&p, 0xc3);                 /* mov r11, rax */
 	emit8(&p, 0x41); emit8(&p, 0x5a);                                  /* pop r10 */
-	emit8(&p, 0x49); emit8(&p, 0x8b); emit8(&p, 0x02);                 /* mov rax, [r10] (thread_area, live) */
-	emit8(&p, 0xf3); emit8(&p, 0x48); emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0xd0); /* wrfsbase rax */
+	emit8(&p, 0x41); emit8(&p, 0xd9); emit8(&p, 0xaa); emit32(&p, guest_fcw);   /* fldcw [r10+guest_fcw] */
+	emit8(&p, 0x41); emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0x92); emit32(&p, guest_mxcsr); /* ldmxcsr [r10+guest_mxcsr] */
+	if (swap_fs) {
+		emit8(&p, 0x49); emit8(&p, 0x8b); emit8(&p, 0x02);             /* mov rax, [r10] (thread_area, live) */
+		emit8(&p, 0xf3); emit8(&p, 0x48); emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0xd0); /* wrfsbase rax */
+	}
 	emit8(&p, 0x4c); emit8(&p, 0x89); emit8(&p, 0xd8);                 /* mov rax, r11 */
 	emit8(&p, 0xc3);                                                   /* ret */
+	if ((size_t)(p - (uint8_t *)addr) > THUNK_SIZE) abort();           /* the size was checked above for THUNK_SIZE */
 	t->ext_entries[t->ext_count] = cb;
 	t->ext_ptrs[t->ext_count] = addr;
 	t->ext_count++;
 	return addr;
-#else
-	(void)t; (void)c;
-	return cb;
-#endif
 }

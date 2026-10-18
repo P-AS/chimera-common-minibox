@@ -444,7 +444,30 @@ typedef struct {
 	 * belongs to, so a death quotes what the dying call said and not what an
 	 * earlier one did. */
 	uint64_t calls;
+	/* The floating-point control words: the x87 control word and MXCSR. The
+	 * guest's are part of the machine, 0x037F and 0x1F80 from the start
+	 * (what musl and the x86-64 ABI assume), loaded on every way into guest
+	 * code and taken back on every way out, so the host thread that calls in
+	 * (Windows starts its threads at 53-bit x87 precision, Linux at
+	 * 64-bit) changes nothing in the guest, and what the guest sets stays in
+	 * the guest. The host's are what the host had when the current call
+	 * came in: syscalls and host callbacks run with them (user-decided,
+	 * 2026-10-18). Read by guarded.S and the callback wrappers. */
+	uint32_t guest_mxcsr, host_mxcsr;
+	uint16_t guest_fcw, host_fcw;
 } mb_context;
+
+#define MB_GUEST_FCW_START   0x037F
+#define MB_GUEST_MXCSR_START 0x1F80
+
+/* the live control words, read and set; inline asm only, so they may run
+ * before anything else in a boundary function */
+static inline void mb_fpu_get(uint16_t *fcw, uint32_t *mxcsr) {
+	__asm__ volatile("fnstcw %0\n\tstmxcsr %1" : "=m"(*fcw), "=m"(*mxcsr));
+}
+static inline void mb_fpu_set(const uint16_t *fcw, const uint32_t *mxcsr) {
+	__asm__ volatile("fldcw %0\n\tldmxcsr %1" : : "m"(*fcw), "m"(*mxcsr));
+}
 
 /* guarded.S: the one way into the guest for an exported call, and the two ways
  * out of it for a guest that dies - from host C, or from a fault handler that

@@ -292,6 +292,11 @@ static uintptr_t MB_SYSV dispatch(uintptr_t a1, uintptr_t a2, uintptr_t a3, uint
 	const uintptr_t ta_on_entry = hfs->context.thread_area;
 	if (swap_fs) mb_wrfsbase(hfs->context.host_fs);
 #endif
+	/* the guest's floating-point control words kept, the host's for the body
+	 * (see mb_context): inline asm, nothing called before it */
+	mb_context *fpu_ctx = &((mb_host *)hp)->context;
+	mb_fpu_get(&fpu_ctx->guest_fcw, &fpu_ctx->guest_mxcsr);
+	mb_fpu_set(&fpu_ctx->host_fcw, &fpu_ctx->host_mxcsr);
 	uintptr_t res;
 	if (!trace_syscalls()) {
 		res = dispatch_inner(a1, a2, a3, a4, a5, a6, nr, hp);
@@ -321,6 +326,9 @@ static uintptr_t MB_SYSV dispatch(uintptr_t a1, uintptr_t a2, uintptr_t a3, uint
 	}
 	if (swap_fs) mb_wrfsbase(hfs->context.thread_area);
 #endif
+	/* the guest's back: whichever guest thread runs on from here, they share
+	 * one set, as every other register this boundary does not swap */
+	mb_fpu_set(&fpu_ctx->guest_fcw, &fpu_ctx->guest_mxcsr);
 	return res;
 }
 

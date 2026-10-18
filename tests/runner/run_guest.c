@@ -75,9 +75,18 @@ static int fails = 0;
  * context pointer and fault. Any callback handed to wbx_get_callback_addr needs
  * this. */
 static uint64_t g_last_log = 0;
+/* the floating-point control words the callback ran with (see the FPU checks) */
+static uint16_t g_cb_fcw;
+static uint32_t g_cb_mxcsr;
 static uintptr_t MB_GUEST_ABI log_cb(uintptr_t v, uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6) {
-	(void)a2;(void)a3;(void)a4;(void)a5;(void)a6; g_last_log = (uint32_t)v; return 0;
+	(void)a2;(void)a3;(void)a4;(void)a5;(void)a6; g_last_log = (uint32_t)v;
+	__asm__ volatile("fnstcw %0\n\tstmxcsr %1" : "=m"(g_cb_fcw), "=m"(g_cb_mxcsr));
+	return 0;
 }
+
+static void host_fpu_get(uint16_t *cw, uint32_t *mx) { __asm__ volatile("fnstcw %0\n\tstmxcsr %1" : "=m"(*cw), "=m"(*mx)); }
+static void host_fpu_set(uint16_t cw, uint32_t mx) { __asm__ volatile("fldcw %0\n\tldmxcsr %1" : : "m"(cw), "m"(mx)); }
+#define FPU_FLAGS 0x3Fu   /* MXCSR's sticky exception flags: not compared */
 
 /* The guest is sysv64 whatever the host is; MB_GUEST_ABI (minibox.h) makes that
  * explicit, which matters on a win64 host and expands to nothing on Linux. */
@@ -102,7 +111,17 @@ static mb_host *make_host(const char *path, uint32_t seed) {
 	};
 	freader fr = { f };
 	mb_return r;
+	/* made from a host at Windows' default control words (see the FPU
+	 * checks in main): the guest's start-up code still runs with
+	 * 0x37F/0x1F80, and the host has its own back afterwards */
+	uint16_t create_cw; uint32_t create_mx;
+	host_fpu_get(&create_cw, &create_mx);
+	host_fpu_set(0x027F, 0x7F80);
 	wbx_create_host(&layout, "guest.wbx", file_read, (uintptr_t)&fr, &r);
+	uint16_t created_cw; uint32_t created_mx;
+	host_fpu_get(&created_cw, &created_mx);
+	host_fpu_set(create_cw, create_mx);
+	CHECK(created_cw == 0x027F && (created_mx & ~FPU_FLAGS) == 0x7F80);
 	fclose(f);
 	if (r.error_message[0]) { fprintf(stderr, "create_host: %s\n", r.error_message); exit(1); }
 	mb_host *h = (mb_host *)r.data;
@@ -691,6 +710,46 @@ int main(int argc, char **argv) {
 		CHECK(after_syscall == 0);
 		CHECK(after_extcall == 0);
 	}
+	/* The floating-point control words are the guest's own (mb_context,
+	 * 2026-10-18). This host runs at Windows' default 53-bit x87 precision (0x27F)
+	 * with round-toward-zero SSE rounding, and the guest still starts from
+	 * 0x37F/0x1F80; what the guest sets (round down, both units) stays with
+	 * it across calls, a syscall and a callback; the host gets its own back
+	 * after every call, and has them inside the callback. */
+	{
+		typedef uint64_t (MB_GUEST_ABI *u64_fn)(void);
+		typedef void (MB_GUEST_ABI *fpuset_fn)(uint32_t, uint32_t);
+		uint16_t keep_cw, cw; uint32_t keep_mx, mx;
+		host_fpu_get(&keep_cw, &keep_mx);
+		const uint16_t host_cw = 0x027F; const uint32_t host_mx = 0x7F80;
+		const uint16_t guest_cw = 0x077F; const uint32_t guest_mx = 0x3F80;   /* round down */
+		host_fpu_set(host_cw, host_mx);
+		uint64_t seen = ((u64_fn)proc(h, "FpuSeen"))();
+		host_fpu_get(&cw, &mx);
+		printf("run_guest: control words the guest starts with %llx/%llx (host %x/%x)\n",
+		       (unsigned long long)(seen >> 32), (unsigned long long)(uint32_t)seen, (unsigned)host_cw, (unsigned)host_mx);
+		CHECK((seen >> 32) == 0x037F && ((uint32_t)seen & ~FPU_FLAGS) == 0x1F80);
+		CHECK(cw == host_cw && (mx & ~FPU_FLAGS) == host_mx);
+		seen = ((u64_fn)proc(h, "FpuAtStart"))();
+		printf("run_guest: the guest's start-up code ran with %llx/%llx\n",
+		       (unsigned long long)(seen >> 32), (unsigned long long)(uint32_t)seen);
+		CHECK((seen >> 32) == 0x037F && ((uint32_t)seen & ~FPU_FLAGS) == 0x1F80);
+		((fpuset_fn)proc(h, "FpuSet"))(guest_cw, guest_mx);
+		host_fpu_get(&cw, &mx);
+		CHECK(cw == host_cw && (mx & ~FPU_FLAGS) == host_mx);      /* the guest's stay in */
+		seen = ((u64_fn)proc(h, "FpuSeen"))();
+		CHECK((seen >> 32) == guest_cw && ((uint32_t)seen & ~FPU_FLAGS) == guest_mx);
+		seen = ((u64_fn)proc(h, "FpuAfterSyscall"))();
+		CHECK((seen >> 32) == guest_cw && ((uint32_t)seen & ~FPU_FLAGS) == guest_mx);
+		g_cb_fcw = 0; g_cb_mxcsr = 0;
+		seen = ((u64_fn)proc(h, "FpuAfterCallback"))();
+		printf("run_guest: a host callback ran with %x/%x, the guest after it %llx/%llx\n",
+		       (unsigned)g_cb_fcw, (unsigned)g_cb_mxcsr, (unsigned long long)(seen >> 32), (unsigned long long)(uint32_t)seen);
+		CHECK(g_cb_fcw == host_cw && (g_cb_mxcsr & ~FPU_FLAGS) == host_mx);
+		CHECK((seen >> 32) == guest_cw && ((uint32_t)seen & ~FPU_FLAGS) == guest_mx);
+		((fpuset_fn)proc(h, "FpuSet"))(0x037F, 0x1F80);
+		host_fpu_set(keep_cw, keep_mx);
+	}
 	/* calls that used to stop the machine (spec v2.2): each must answer
 	 * and leave the machine alive. */
 	{
@@ -755,6 +814,43 @@ int main(int argc, char **argv) {
 	wbx_activate_host(h, &r);
 	CHECK(GetAcc() == acc_at_save);
 	CHECK(Step(0x33333333) == s3);   /* deterministic replay from the restored point */
+
+	/* the guest's control words are in a state, and a state from before they
+	 * were (no GuestFpuState1 record) loads with the values every guest
+	 * starts from */
+	{
+		typedef uint64_t (MB_GUEST_ABI *u64_fn)(void);
+		typedef void (MB_GUEST_ABI *fpuset_fn)(uint32_t, uint32_t);
+		((fpuset_fn)proc(h, "FpuSet"))(0x077F, 0x3F80);
+		membuf fs = {0};
+		wbx_deactivate_host(h, &r);
+		wbx_save_state(h, mem_write, (uintptr_t)&fs, &r);
+		CHECK(!r.error_message[0]);
+		CHECK(state_contains(&fs, "GuestFpuState1"));
+		wbx_activate_host(h, &r);
+		((fpuset_fn)proc(h, "FpuSet"))(0x037F, 0x1F80);
+		fs.pos = 0;
+		wbx_deactivate_host(h, &r);
+		wbx_load_state(h, mem_read, (uintptr_t)&fs, &r);
+		CHECK(!r.error_message[0]);
+		wbx_activate_host(h, &r);
+		uint64_t seen = ((u64_fn)proc(h, "FpuSeen"))();
+		CHECK((seen >> 32) == 0x077F && ((uint32_t)seen & ~FPU_FLAGS) == 0x3F80);
+		/* the same state with the record cut out, as an older build wrote it */
+		size_t at = 0;
+		while (at + 14 <= fs.len && memcmp(fs.buf + at, "GuestFpuState1", 14) != 0) at++;
+		CHECK(at + 20 <= fs.len);
+		memmove(fs.buf + at, fs.buf + at + 20, fs.len - at - 20);
+		fs.len -= 20;
+		fs.pos = 0;
+		wbx_deactivate_host(h, &r);
+		wbx_load_state(h, mem_read, (uintptr_t)&fs, &r);
+		CHECK(!r.error_message[0]);
+		wbx_activate_host(h, &r);
+		seen = ((u64_fn)proc(h, "FpuSeen"))();
+		CHECK((seen >> 32) == 0x037F && ((uint32_t)seen & ~FPU_FLAGS) == 0x1F80);
+		free(fs.buf);
+	}
 
 	wbx_deactivate_host(h, &r);
 	wbx_destroy_host(h, &r);

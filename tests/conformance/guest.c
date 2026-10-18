@@ -107,6 +107,26 @@ ECL_EXPORT int SigactionAccepted(void) {
 	return 1;
 }
 
+/* The floating-point control words are the guest's own (mb_context,
+ * 2026-10-18): what it sees on entry, and that what it sets survives an
+ * exported call, a syscall and a host callback. Read as (fcw << 32) | mxcsr. */
+static uint64_t fpu_read(void) {
+	uint16_t cw; uint32_t mx;
+	__asm__ volatile("fnstcw %0\n\tstmxcsr %1" : "=m"(cw), "=m"(mx));
+	return ((uint64_t)cw << 32) | mx;
+}
+ECL_EXPORT uint64_t FpuSeen(void) { return fpu_read(); }
+/* what the guest's start-up code (its constructors) ran with */
+static uint64_t g_fpu_at_start;
+__attribute__((constructor)) static void fpu_at_start(void) { g_fpu_at_start = fpu_read(); }
+ECL_EXPORT uint64_t FpuAtStart(void) { return g_fpu_at_start; }
+ECL_EXPORT void FpuSet(uint32_t fcw, uint32_t mxcsr) {
+	const uint16_t cw = (uint16_t)fcw;
+	__asm__ volatile("fldcw %0\n\tldmxcsr %1" : : "m"(cw), "m"(mxcsr));
+}
+ECL_EXPORT uint64_t FpuAfterSyscall(void) { (void)getpid(); return fpu_read(); }
+ECL_EXPORT uint64_t FpuAfterCallback(void) { if (g_log_cb) g_log_cb(0); return fpu_read(); }
+
 /* sysinfo, as the kit this guest was built with is answered: 1 for the
  * answer with mem_unit where it belongs (kit revision 1 or later), 0 for the
  * old one (unit written into freehigh's top half), -1 for neither */
