@@ -437,6 +437,15 @@ static void vkt_run(vkt_lookup get, struct vkt_result *out, int through_bridge)
 		VkWriteDescriptorSet nowhere = write;
 		nowhere.dstSet = (VkDescriptorSet)(uintptr_t)0x7fff00000010ull;
 		VKT(vkUpdateDescriptorSets)(dev, 1, &nowhere, 0, NULL);
+		/* And an image view the bridge never made, in a write whose type
+		 * reads it: passed on as nothing, the driver would follow it. */
+		VkDescriptorImageInfo no_view = { VK_NULL_HANDLE, (VkImageView)(uintptr_t)0x7fff00000030ull,
+			VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+		VkWriteDescriptorSet viewless = write;
+		viewless.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+		viewless.pImageInfo = &no_view;
+		viewless.pBufferInfo = NULL;
+		VKT(vkUpdateDescriptorSets)(dev, 1, &viewless, 0, NULL);
 	}
 
 	VkPipelineShaderStageCreateInfo stages[2] = {
@@ -470,6 +479,15 @@ static void vkt_run(vkt_lookup get, struct vkt_result *out, int through_bridge)
 		.renderPass = pass, .subpass = 0 };
 	VkPipeline pipeline = VK_NULL_HANDLE;
 	VKT_STEP(69, VKT(vkCreateGraphicsPipelines)(dev, VK_NULL_HANDLE, 1, &gpci, NULL, &pipeline));
+	if (through_bridge) {
+		/* A pipeline whose layout the bridge never made: refused, and the
+		 * pipeline left null. Passed on as nothing, the driver would follow it. */
+		VkGraphicsPipelineCreateInfo layoutless = gpci;
+		layoutless.layout = (VkPipelineLayout)(uintptr_t)0x7fff00000040ull;
+		VkPipeline none = VK_NULL_HANDLE;
+		VKT(vkCreateGraphicsPipelines)(dev, VK_NULL_HANDLE, 1, &layoutless, NULL, &none);
+		if (none != VK_NULL_HANDLE) { out->failed_at = 169; return; }
+	}
 
 	VkCommandBuffer draw = VK_NULL_HANDLE;
 	VKT_STEP(70, VKT(vkAllocateCommandBuffers)(dev, &cbai, &draw));

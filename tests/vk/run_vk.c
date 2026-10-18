@@ -231,9 +231,10 @@ int main(int argc, char **argv)
 	else
 		fprintf(stderr, "NOT TESTED: this device has no VK_KHR_synchronization2, so no command was called by an extension's name\n");
 
-	/* two calls in the run are wrong on purpose - a descriptor write with
-	 * nothing to read, and one to a set that does not exist - and they, and
-	 * only they, must have been refused */
+	/* four calls in the run are wrong on purpose - a descriptor write with
+	 * nothing to read, one to a set that does not exist, one with an image
+	 * view the bridge never made, and a pipeline with a layout it never made
+	 * - and they, and only they, must have been refused */
 	/* the run resets its descriptor pool a thousand times and fills it again,
 	 * and makes and destroys a semaphore a thousand times */
 	fprintf(stderr, "bridged: %lu handle slots used\n", chimera_vk_host_handle_slots());
@@ -241,7 +242,7 @@ int main(int argc, char **argv)
 	       chimera_vk_host_handle_slots());
 
 	long last = -1;
-	EXPECT(chimera_vk_host_refused(&last) == 2, "%lu calls were refused where two were meant to be (last opcode %ld)",
+	EXPECT(chimera_vk_host_refused(&last) == 4, "%lu calls were refused where four were meant to be (last opcode %ld)",
 	       chimera_vk_host_refused(NULL), last);
 
 	/* ---- a handle from before a load ---- */

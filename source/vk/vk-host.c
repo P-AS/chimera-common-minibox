@@ -415,6 +415,11 @@ static int vkb_desc_uses_view(VkDescriptorType t)
 
 static const void *vkb_chain(const void *first);
 
+/* the type of the descriptor write being translated: a descriptor's image
+ * view counts for every type but a sampler (HANDLE_FOLLOWED_WHEN in the
+ * generator) */
+static VkDescriptorType vkb_cur_desc_type = VK_DESCRIPTOR_TYPE_SAMPLER;
+
 #include "vk-bridge-host.inc"
 
 /* ---------------------------------------------------------------------------

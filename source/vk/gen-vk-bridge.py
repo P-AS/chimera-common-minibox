@@ -99,6 +99,29 @@ MEMBER_VALID_WHEN = {
     ("VkSubpassDescription2", "pResolveAttachments"): None,
 }
 
+# A HANDLE member marked "noautovalidity" is read softly: an id that names
+# nothing is passed as nothing, because where the member does not count it may
+# hold anything. Where the driver does follow it, that let a handle the bridge
+# never made, or one from before a load, through as a null object, and the
+# driver followed it and the host process died with it (analysis of
+# 2026-10-18). Each such member is listed with the condition under which the
+# driver follows it; then an id that names nothing refuses the call, as
+# everywhere else. The rules read the structure (d) and, for a descriptor's
+# image, the type of the write it is in (vkb_cur_desc_type, set by
+# TRANSLATOR_PROLOGUE).
+HANDLE_FOLLOWED_WHEN = {
+    ("VkGraphicsPipelineCreateInfo", "layout"): "!(d->flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR)",
+    # ignored only with VkBindImageMemorySwapchainInfoKHR, and no swapchain is offered
+    ("VkBindImageMemoryInfo", "memory"): "1",
+    ("VkDescriptorImageInfo", "imageView"): "vkb_cur_desc_type != VK_DESCRIPTOR_TYPE_SAMPLER",
+}
+
+# A line of C a translator runs before its members, for a rule of a structure
+# translated inside it.
+TRANSLATOR_PROLOGUE = {
+    "VkWriteDescriptorSet": "\tvkb_cur_desc_type = d->descriptorType;",
+}
+
 # What a structure must have for a driver to be handed it at all, where the
 # registry cannot say so: a line of C run after the structure is translated,
 # which sets vkb_bad to refuse the call. A descriptor write with a count and
@@ -318,6 +341,8 @@ def gen_translator(reg, name, out):
     fields = reg.structs[name]
     out.append("VKB_UNUSED static void vkb_x_%s(%s *d)\n{" % (name, name))
     body = []
+    if name in TRANSLATOR_PROLOGUE:
+        body.append(TRANSLATOR_PROLOGUE[name])
     for f in fields:
         if f.name == "pNext":
             if any(reg.needs(e) for e in reg.extensions_of(name)):
@@ -332,6 +357,11 @@ def gen_translator(reg, name, out):
                 if f.array:
                     body.append("\tfor (uint32_t i = 0; i < %s; i++) d->%s[i] = (%s)%s((uint64_t)d->%s[i], %s);"
                                 % (f.array, f.name, f.type, look, f.name, kind(reg, t)))
+                elif (name, f.name) in HANDLE_FOLLOWED_WHEN:
+                    if not f.noauto:
+                        raise SystemExit("%s.%s has a HANDLE_FOLLOWED_WHEN rule and is always followed" % (name, f.name))
+                    body.append("\td->%s = (%s)((%s) ? vkb_h0((uint64_t)d->%s, %s) : vkb_h_soft((uint64_t)d->%s, %s));"
+                                % (f.name, f.type, HANDLE_FOLLOWED_WHEN[(name, f.name)], f.name, kind(reg, t), f.name, kind(reg, t)))
                 else:
                     body.append("\td->%s = (%s)%s((uint64_t)d->%s, %s);"
                                 % (f.name, f.type, look, f.name, kind(reg, t)))
