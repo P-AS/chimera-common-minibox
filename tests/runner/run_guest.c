@@ -19,6 +19,9 @@
 #endif
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #ifndef _WIN32
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -297,6 +300,102 @@ static void seal_and_activate(mb_host *h) {
  * process dies, buffered stdout is lost, and the last thing seen is whatever the
  * GUEST printed (its writes go through the host's stderr). That reads as "it
  * stopped right after guest init" no matter where it really stopped. */
+
+/* A guest that never comes back from a call is stopped from another thread
+ * (wbx_stop_guest, 2026-10-19), as a frontend's watchdog does: one spinning in
+ * its own code (stopped by a signal on Linux, by being suspended and sent out
+ * on Windows) and one spinning on system calls (stopped at the next one; on
+ * Linux the stop's signal is blocked for it, or the signal would end it
+ * between two calls and the check at a system call would go untested).
+ * Each call comes back, the machine is dead, and the reason is the one given.
+ * A stop asked for after a call ended by itself is cancelled and ends nothing.
+ * The count of working system calls moves for getppid and not for a yield. */
+struct stopper { mb_host *h; volatile int done; int asked; };
+static void sleep_ms(int ms) {
+#ifdef _WIN32
+	Sleep((DWORD)ms);
+#else
+	struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
+	nanosleep(&ts, NULL);
+#endif
+}
+#ifdef _WIN32
+static DWORD WINAPI stopper_fn(LPVOID arg)
+#else
+static void *stopper_fn(void *arg)
+#endif
+{
+	struct stopper *s = (struct stopper *)arg;
+	sleep_ms(200);
+	while (!s->done) {
+		mb_return r;
+		wbx_stop_guest(s->h, "stopped by the test after 200 ms", &r);
+		s->asked++;
+		sleep_ms(50);
+	}
+	return 0;
+}
+
+static int stop_flow(const char *guest) {
+	typedef int (MB_GUEST_ABI *int_fn)(void);
+	typedef void (MB_GUEST_ABI *n_fn)(int);
+	const char *const spins[2] = { "SpinForever", "SpinOnSyscalls" };
+	for (int k = 0; k < 2; k++) {
+		mb_host *h = make_host(guest, 0xABCD);
+		mb_return r;
+		wbx_activate_host(h, &r);
+		CHECK(((init_fn)proc(h, "Init"))() == 1);
+		if (k == 0) {
+			wbx_guest_activity(h, &r);
+			const uint64_t before = (uint64_t)r.data;
+			((n_fn)proc(h, "Yield"))(1000);
+			wbx_guest_activity(h, &r);
+			const uint64_t yielded = (uint64_t)r.data;
+			((n_fn)proc(h, "Work"))(1000);
+			wbx_guest_activity(h, &r);
+			printf("run_guest: working calls counted: %llu before, %llu after 1000 yields, %llu after 1000 getppid\n",
+			       (unsigned long long)before, (unsigned long long)yielded, (unsigned long long)r.data);
+			CHECK(yielded == before && (uint64_t)r.data == before + 1000);
+		}
+		/* a stop asked for before any call, then cancelled, ends nothing */
+		wbx_stop_from_here(h, &r);
+		wbx_stop_cancel(h, &r);
+		CHECK(((init_fn)proc(h, "Init"))() == 1);
+		struct stopper s = { h, 0, 0 };
+#ifdef _WIN32
+		HANDLE t = CreateThread(NULL, 0, stopper_fn, &s, 0, NULL);
+#else
+		pthread_t t;
+		pthread_create(&t, NULL, stopper_fn, &s);
+#endif
+#ifndef _WIN32
+		sigset_t stop_sig, was;
+		sigemptyset(&stop_sig);
+		sigaddset(&stop_sig, MB_STOP_SIGNAL);
+		if (k == 1) pthread_sigmask(SIG_BLOCK, &stop_sig, &was);
+#endif
+		const int got = ((int_fn)proc(h, spins[k]))();
+#ifndef _WIN32
+		if (k == 1) pthread_sigmask(SIG_SETMASK, &was, NULL);
+#endif
+		s.done = 1;
+#ifdef _WIN32
+		WaitForSingleObject(t, INFINITE);
+		CloseHandle(t);
+#else
+		pthread_join(t, NULL);
+#endif
+		char why[512];
+		wbx_get_death(h, why, sizeof why, &r);
+		printf("run_guest: %s came back with %d, dead=%d, after %d asks: %s\n", spins[k], got, (int)r.data, s.asked, why);
+		CHECK(got == 0 && r.data == 1 && strstr(why, "stopped by the test after 200 ms") != NULL);
+		wbx_deactivate_host(h, &r);
+		wbx_destroy_host(h, &r);
+	}
+	if (fails == 0) printf("run_guest: all checks passed\n");
+	else printf("run_guest: %d checks FAILED\n", fails);
+	return fails ? 1 : 0;
+}
 
 /* The child half of the abort check: make a host, let the guest abort. The call
  * comes back - the machine is dead, the process is not - and the child says so
@@ -720,6 +819,7 @@ static void guest_deaths_are_survived(const char *path) {
 
 int main(int argc, char **argv) {
 	if (argc > 2 && strcmp(argv[1], "--abort-child") == 0) return abort_child(argv[2]);
+	if (argc > 2 && strcmp(argv[1], "--stop") == 0) return stop_flow(argv[2]);
 #ifndef _WIN32
 	if (argc > 2 && strcmp(argv[1], "--host-fault-child") == 0) return host_fault_child(argv[2]);
 	if (argc > 2 && strcmp(argv[1], "--fs-repair-child") == 0) return fs_repair_child(argv[2]);

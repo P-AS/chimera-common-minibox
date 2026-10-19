@@ -478,6 +478,17 @@ ECL_EXPORT uint32_t Step(uint32_t input) {
 ECL_EXPORT uint64_t GetAcc(void) { return g_acc; }
 ECL_EXPORT uint32_t GetStep(void) { return g_step; }
 
+/* Two guests that never come back from a call, for the stop the host asks
+ * for from another thread (wbx_stop_guest, 2026-10-19): one loops in its own
+ * code and makes no system call, one loops on system calls. And n calls of
+ * each kind for the host's count of working calls (wbx_guest_activity): a
+ * yield is not work, a getppid is. */
+static volatile uint64_t g_spun;
+ECL_EXPORT int SpinForever(void) { for (;;) g_spun++; }
+ECL_EXPORT int SpinOnSyscalls(void) { for (;;) syscall(SYS_sched_yield); }
+ECL_EXPORT void Yield(int n) { for (int i = 0; i < n; i++) syscall(SYS_sched_yield); }
+ECL_EXPORT void Work(int n) { for (int i = 0; i < n; i++) syscall(SYS_getppid); }
+
 /* Dies the way a panicking or out-of-memory guest dies: says something on its
  * stderr, then abort() - which musl turns into tkill(self, SIGABRT). The host
  * must put both into its diagnostic log, since a GUI process has no stderr to

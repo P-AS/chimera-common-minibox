@@ -97,6 +97,14 @@ void wbx_get_proc_addr(mb_host *obj, const char *name, mb_return *ret) { ok(ret,
 void wbx_get_death(mb_host *obj, char *out, uintptr_t cap, mb_return *ret) {
 	ok(ret, mb_host_death(obj, out, cap) ? 1 : 0);
 }
+void mb_host_stop_from_here(mb_host *h);
+int  mb_host_stop(mb_host *h, const char *why);
+void mb_host_stop_cancel(mb_host *h);
+void wbx_stop_from_here(mb_host *obj, mb_return *ret) { mb_host_stop_from_here(obj); ok(ret, 0); }
+void wbx_stop_guest(mb_host *obj, const char *why, mb_return *ret) { ok(ret, (uintptr_t)mb_host_stop(obj, why)); }
+void wbx_stop_cancel(mb_host *obj, mb_return *ret) { mb_host_stop_cancel(obj); ok(ret, 0); }
+uint64_t mb_host_activity(mb_host *h);
+void wbx_guest_activity(mb_host *obj, mb_return *ret) { ok(ret, (uintptr_t)mb_host_activity(obj)); }
 void wbx_get_proc_addr_raw(mb_host *obj, const char *name, mb_return *ret) { ok(ret, mb_host_proc_addr_raw(obj, name)); }
 void wbx_get_callin_addr(mb_host *obj, uintptr_t ptr, mb_return *ret) { ok(ret, mb_host_callin_addr(obj, ptr)); }
 

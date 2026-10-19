@@ -18,6 +18,13 @@ test('conformance-guest', run_guest,
   timeout: 120,
 )
 
+# a guest that never comes back, stopped from another thread (2026-10-19)
+test('conformance-stop', run_guest,
+  args: ['--stop', guest_wbx],
+  suite: 'system',
+  timeout: 60,
+)
+
 # The same guest built with a guest kit of no revision (emulibc without
 # __wbx_kit_revision): it must get the answers cores built before revision 1
 # got, sysinfo's among them (MACHINE-SPEC, "Guest kit revisions").

@@ -1071,6 +1071,49 @@ static void handler_other(int sig, siginfo_t *info, void *ucontext) {
 	else old->sa_handler(sig);
 }
 
+/* A stop asked for from another thread (host.c's wbx_stop_guest), delivered
+ * by signal to the thread that calls the guest. It ends the call only when
+ * that thread is running guest code with no fault being handled - the same
+ * place, and the same way, a crash in guest code ends it. Anywhere else it is
+ * left for the next system call (host.c) or the next signal. A signal that is
+ * not a stop goes to whoever had it before. */
+static struct sigaction g_old_stop;
+static void handler_stop(int sig, siginfo_t *info, void *ucontext) {
+	ucontext_t *uc = (ucontext_t *)ucontext;
+	const uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+	if (mb_guest_ctx != NULL && mb_guest_ctx->stop_pending && mb_guest_ctx->esc_rsp != 0
+	    && g_fault_depth == 0 && guest_can_die_here(rip)) {
+#ifdef MB_HAVE_FSBASE
+		/* host C from here on, which needs the host's %fs */
+		if (mb_guest_ctx->fs_swap && mb_guest_ctx->host_fs) mb_wrfsbase(mb_guest_ctx->host_fs);
+#endif
+		mb_guest_ctx->stop_pending = 0;
+		mb_host_guest_death_in_handler(mb_guest_ctx, "%s", mb_host_stop_reason(mb_guest_ctx));
+		uc->uc_mcontext.gregs[REG_RSP] = (greg_t)mb_guest_ctx->esc_rsp;
+		uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)&mb_guarded_escape;
+		leave_every_handler_frame(uc);
+		return;
+	}
+	if (mb_guest_ctx != NULL && mb_guest_ctx->stop_pending) return;   /* ours: asked again later */
+	if (g_old_stop.sa_flags & SA_SIGINFO) {
+		if (g_old_stop.sa_sigaction) g_old_stop.sa_sigaction(sig, info, ucontext);
+	} else if (g_old_stop.sa_handler != SIG_DFL && g_old_stop.sa_handler != SIG_IGN) {
+		g_old_stop.sa_handler(sig);
+	}
+}
+
+void mb_tripguard_stop_signal_install(void) {
+	static int installed;
+	if (installed) return;
+	installed = 1;
+	struct sigaction sa;
+	memset(&sa, 0, sizeof sa);
+	sa.sa_sigaction = handler_stop;
+	sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
+	sigemptyset(&sa.sa_mask);
+	sigaction(MB_STOP_SIGNAL, &sa, &g_old_stop);
+}
+
 #ifdef MB_HAVE_FSBASE
 /* Every OTHER handler in the process, run under the host's thread pointer.
  *
@@ -1245,10 +1288,38 @@ static LONG CALLBACK veh_fs(EXCEPTION_POINTERS *ep);
 /* The per-thread state above is read through TlsGetValue, which writes the
  * thread's last-error value on the way, and the code that faulted may be about
  * to read that value: it is put back. */
+/* A stop asked for from another thread (host.c's wbx_stop_guest): the thread
+ * that calls the guest is suspended, and when it is running guest code with
+ * no fault of this machine being handled, it is sent to the escape - the same
+ * way a crash in guest code is (veh_fs below). Anywhere else it is let go, and
+ * left for the next system call (host.c) or the next ask. 1 when it was sent. */
+int mb_tripguard_stop_thread(void *thread) {
+	HANDLE t = (HANDLE)thread;
+	if (SuspendThread(t) == (DWORD)-1) return 0;
+	CONTEXT c;
+	memset(&c, 0, sizeof c);
+	c.ContextFlags = CONTEXT_FULL;
+	int sent = 0;
+	if (GetThreadContext(t, &c) && mb_guest_ctx != NULL && mb_guest_ctx->stop_pending
+	    && mb_guest_ctx->esc_rsp != 0 && mb_guest_ctx->handling == 0 && code_in_guest((uintptr_t)c.Rip)) {
+		mb_guest_ctx->stop_pending = 0;
+		mb_host_guest_death_in_handler(mb_guest_ctx, "%s", mb_host_stop_reason(mb_guest_ctx));
+		c.Rsp = (DWORD64)mb_guest_ctx->esc_rsp;
+		c.Rip = (DWORD64)(uintptr_t)&mb_guarded_escape;
+		c.ContextFlags = CONTEXT_CONTROL;
+		sent = SetThreadContext(t, &c) != 0;
+	}
+	ResumeThread(t);
+	return sent;
+}
+
 __attribute__((no_stack_protector))
 static LONG CALLBACK veh(EXCEPTION_POINTERS *ep) {
 	const DWORD last_error = GetLastError();
+	mb_context *const handled = mb_guest_ctx;
+	if (handled) InterlockedIncrement(&handled->handling);
 	const LONG r = veh_fs(ep);
+	if (handled) InterlockedDecrement(&handled->handling);
 	/* a death: out of every handler frame at once (see the phase notes) */
 	if (r == EXCEPTION_CONTINUE_EXECUTION && ep->ContextRecord->Rip == (DWORD64)(uintptr_t)&mb_guarded_escape) {
 		fault_depth_set(0);

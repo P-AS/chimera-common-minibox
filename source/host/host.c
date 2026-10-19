@@ -10,8 +10,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 #ifndef _WIN32
 #include <pthread.h>
+#include <signal.h>
 #include <unistd.h>
 #include <sys/uio.h>
 /* the spin sampler's host, and the lock that lets mb_host_destroy wait for it
@@ -21,6 +26,19 @@ static struct mb_host *sample_h;
 #endif
 
 struct mb_host {
+	/* wbx_stop_from_here / wbx_stop_guest: the thread that calls the guest,
+	 * and why a stop was asked for */
+	char stop_why[200];
+	bool have_stop_thread;
+	/* system calls of the kind a waiting or polling loop does not make (all
+	 * but yields, sleeps, clock reads, futexes and thread ids): a frontend's
+	 * watchdog reads it as a sign of life (wbx_guest_activity) */
+	uint64_t activity;
+#ifdef _WIN32
+	void *stop_thread;   /* a HANDLE that may suspend and redirect it */
+#else
+	pthread_t stop_thread;
+#endif
 	/* GuestFaultHandler, raw and through its thunk: looked up once, on the
 	 * first activate (a strcmp over every export, twice, on every state call) */
 	uintptr_t fault_raw, fault_entry;
@@ -286,6 +304,54 @@ bool mb_host_guest_death_in_handler(mb_context *c, const char *fmt, ...) {
 	return escapable;
 }
 
+const char *mb_host_stop_reason(const mb_context *c) {
+	const mb_host *h = c != NULL ? (const mb_host *)c->host_ptr : NULL;
+	return h != NULL && h->stop_why[0] ? h->stop_why : "the host stopped the core";
+}
+
+/* ---- a guest that does not come back (2026-10-19) ----
+ *
+ * A guest that loops forever inside one call froze the frontend: nothing could
+ * stop it from another thread. Now the frontend says which thread makes its
+ * calls (wbx_stop_from_here), and a watchdog of its own may ask for a stop
+ * (wbx_stop_guest): the guest dies at its next system call, in host code, or
+ * at once while it runs its own code - interrupted by a signal on Linux,
+ * suspended and sent to the escape on Windows - exactly as a crash in guest
+ * code ends it. Not while it is in host code (a system call, a callback, a
+ * driver): that is left to finish, and the watchdog asks again. */
+void mb_host_stop_from_here(mb_host *h) {
+#ifdef _WIN32
+	HANDLE self = NULL;
+	if (h->have_stop_thread) CloseHandle((HANDLE)h->stop_thread);
+	h->have_stop_thread = DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &self,
+	                                      THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, 0) != 0;
+	h->stop_thread = self;
+#else
+	mb_tripguard_stop_signal_install();
+	h->stop_thread = pthread_self();
+	h->have_stop_thread = true;
+#endif
+}
+
+int mb_host_stop(mb_host *h, const char *why) {
+	if (!h->have_stop_thread || h->context.esc_rsp == 0 || h->context.dead) return 0;
+	/* the reason is written once per stop: a second ask must not rewrite it
+	 * while the guest's thread may be reading it */
+	if (!__atomic_load_n(&h->context.stop_pending, __ATOMIC_ACQUIRE)) {
+		snprintf(h->stop_why, sizeof h->stop_why, "%s", why != NULL && why[0] ? why : "the host stopped the core");
+		__atomic_store_n(&h->context.stop_pending, 1, __ATOMIC_RELEASE);
+	}
+#ifdef _WIN32
+	return mb_tripguard_stop_thread(h->stop_thread);
+#else
+	return pthread_kill(h->stop_thread, MB_STOP_SIGNAL) == 0;
+#endif
+}
+
+void mb_host_stop_cancel(mb_host *h) { __atomic_store_n(&h->context.stop_pending, 0, __ATOMIC_RELEASE); }
+
+uint64_t mb_host_activity(mb_host *h) { return __atomic_load_n(&h->activity, __ATOMIC_RELAXED); }
+
 bool mb_host_death(mb_host *h, char *out, size_t cap) {
 	const bool dead = h->context.dead != 0;
 	if (out != NULL && cap != 0) {
@@ -419,6 +485,17 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 	/* Already dead - it died in a call made from inside a host callback, and the
 	 * guest that made the callback carried on regardless. It runs nothing more. */
 	if (h->context.dead && h->context.esc_rsp != 0) mb_guarded_escape_now(&h->context);
+	switch (nr) {
+		case NR_sched_yield: case NR_clock_gettime: case NR_nanosleep: case NR_clock_nanosleep:
+		case NR_futex: case NR_gettid: case NR_getpid: break;
+		default: __atomic_add_fetch(&h->activity, 1, __ATOMIC_RELAXED); break;
+	}
+	/* A stop asked for from another thread (wbx_stop_guest): a guest that
+	 * makes system calls stops at the next one, here in host code. */
+	if (h->context.stop_pending && h->context.esc_rsp != 0) {
+		h->context.stop_pending = 0;
+		mb_host_guest_death(&h->context, "%s", h->stop_why);
+	}
 	switch (nr) {
 		case NR_mmap: {
 			bool bad; mb_prot prot = arg_to_prot(a3, &bad); if (bad) return serr(EINVAL);
@@ -1093,6 +1170,9 @@ void mb_host_diag_guest_output(mb_host *h) {
 }
 
 void mb_host_destroy(mb_host *h) {
+#ifdef _WIN32
+	if (h && h->have_stop_thread) CloseHandle((HANDLE)h->stop_thread);
+#endif
 	if (!h) return;
 	/* The fault handlers read the active context through mb_guest_ctx, and every
 	 * guest call sets it. A host that is gone must not be what they read: a second

@@ -134,6 +134,24 @@ void wbx_get_page_data(mb_host *obj, uintptr_t index, mb_return *ret);
  * reason (empty while alive), cut to `cap`. A dead machine returns 0 from
  * every call into it and runs nothing, until wbx_load_state revives it. */
 void wbx_get_death(mb_host *obj, char *out, uintptr_t cap, mb_return *ret);
+/* Stopping a guest that does not come back (2026-10-19). wbx_stop_from_here
+ * names the calling thread as the one that will call into the guest (call it
+ * on that thread; again if the thread changes). wbx_stop_guest, from any other
+ * thread, asks that the call in progress end: the guest dies, as after a crash,
+ * with `why` as the reason (wbx_get_death), at its next system call or at once
+ * while it runs its own code. Not while it is in host code: ret->data is 1 when
+ * the stop was delivered (Linux: the signal was sent; Windows: the thread was
+ * sent out), and asking again later is how a caller waits that out. A call
+ * that ended by itself should be followed by wbx_stop_cancel, so a stop asked
+ * for too late does not end the next one. */
+void wbx_stop_from_here(mb_host *obj, mb_return *ret);
+void wbx_stop_guest(mb_host *obj, const char *why, mb_return *ret);
+void wbx_stop_cancel(mb_host *obj, mb_return *ret);
+/* A count of the guest's system calls, leaving out those a waiting or polling
+ * loop makes (yields, sleeps, clock reads, futexes, thread ids): safe to read
+ * from any thread. A watchdog that sees it move knows the guest is working -
+ * compiling, loading - and not stuck (2026-10-19). */
+void wbx_guest_activity(mb_host *obj, mb_return *ret);
 
 #ifdef __cplusplus
 }

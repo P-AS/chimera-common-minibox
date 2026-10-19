@@ -524,6 +524,39 @@ can do to the process that hosts it.
   ends the process. Windows builds the exception record on that same stack,
   and its dispatcher and the handler need more room than a guard page has.
 
+## Stopping a guest that does not come back (2026-10-19, additive)
+
+A frontend can end a guest call that has run too long from another thread.
+Nothing changes for a guest that is never stopped.
+
+- `wbx_stop_from_here(obj)` is called on the thread that will make the guest
+  calls (once, and again if that thread changes). It installs what the stop
+  needs: on Linux a signal handler for `SIGRTMAX - 3`, on Windows a handle to
+  the thread.
+- `wbx_stop_guest(obj, why)` from any thread asks the call running now to end
+  as the guest's death, with `why` as the reason. The call answers as for any
+  death: an error, and the machine ends. Where the guest is decides when:
+  - in its own code: at once. On Linux the signal sends the thread out of the
+    call; on Windows the thread is suspended, sent out and resumed.
+  - in a system call or a host callback: when it next makes a system call
+    (every system call checks for a stop first).
+  - in host code that never returns to the guest (a GPU call that waits for
+    ever, a fault being handled): not stopped. The frontend asks again.
+- `wbx_stop_cancel(obj)` takes back a stop that was asked for but not yet
+  carried out, for a call that ended by itself in between. A stop is never
+  carried into the next call after a cancel.
+- `wbx_guest_activity(obj)` answers a count of the guest's system calls,
+  leaving out the ones a waiting or polling loop makes: sched_yield,
+  clock_gettime, nanosleep, clock_nanosleep, futex, gettid and getpid. A
+  frontend reads it as a sign of life: a guest whose count moves is working
+  (RPCS3 compiling a game's code with LLVM makes a frame take 90 seconds),
+  one whose count stands still is spinning or only waiting.
+
+Tested by `conformance-stop` (`run_guest --stop`): a guest spinning in its
+own code and one spinning on sched_yield are each stopped from a second
+thread, on Linux and on Windows, and a stop asked for before a call and
+cancelled ends nothing.
+
 ## Answered instead of fatal (spec v2.2, additive)
 
 These calls used to stop the machine (section 7's "everything else" rule),

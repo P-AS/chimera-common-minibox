@@ -492,6 +492,13 @@ typedef struct {
 	 * 2026-10-18). Read by guarded.S and the callback wrappers. */
 	uint32_t guest_mxcsr, host_mxcsr;
 	uint16_t guest_fcw, host_fcw;
+	/* A stop asked for from another thread (wbx_stop_guest, 2026-10-19): the
+	 * guest dies at its next system call, or at once while it runs its own
+	 * code (tripguard.c). 0 when none is asked for. */
+	volatile int stop_pending;
+	/* Faults being handled for this machine right now (Windows): a stop from
+	 * another thread waits until there are none. */
+	volatile long handling;
 } mb_context;
 
 #define MB_GUEST_FCW_START   0x037F
@@ -524,6 +531,18 @@ void mb_host_guest_death(mb_context *c, const char *fmt, ...);
  * by itself - the handler does, by rewriting the context. */
 __attribute__((format(printf, 2, 3)))
 bool mb_host_guest_death_in_handler(mb_context *c, const char *fmt, ...);
+/* why a stop was asked for (wbx_stop_guest), for the death it becomes */
+const char *mb_host_stop_reason(const mb_context *c);
+/* A stop from another thread (host.c's wbx_stop_guest), tripguard.c's half.
+ * Linux: the signal that carries it, installed once; the thread it is sent to
+ * dies there when it is running guest code. Windows: the thread is suspended
+ * and, when it is running guest code, sent to the escape; 1 when it was. */
+#ifdef _WIN32
+int  mb_tripguard_stop_thread(void *thread);
+#else
+#define MB_STOP_SIGNAL (SIGRTMAX - 3)
+void mb_tripguard_stop_signal_install(void);
+#endif
 
 /* Single-instruction %fs swaps (FSGSBASE). The guest and host share the CPU
  * thread; a Rust guest needs %fs = its thread pointer (mb_context.thread_area)
