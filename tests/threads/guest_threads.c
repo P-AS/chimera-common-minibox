@@ -111,6 +111,7 @@ ECL_EXPORT uint64_t RunTls(void) {
 	return on_main | (uint64_t)(uintptr_t)on_new << 8;
 }
 
+#ifndef NO_GUEST_FAULT_HANDLER
 /* The guest's own fault handler (GuestFaultHandler), which an emulator's
  * write tracking uses: called on the faulting thread, it must run as guest
  * code does - its thread locals its own, its system calls accepted. Until it
@@ -395,6 +396,7 @@ ECL_EXPORT uint64_t RunGuestFaultDeclined(void) {
 	page[1] = 0x5a;
 	return 0xfd;
 }
+#endif
 
 /* Never returns: a call through a null pointer from a guest that owns %fs.
  * The fault is outside the guest's memory and arrives with the guest's thread

@@ -52,7 +52,7 @@ if minibox_git_commit == ''
   minibox_git_commit = 'unknown'
 endif
 minibox_build_os = run_command(
-  'sh', '-c', '. /etc/os-release 2>/dev/null && printf "%s %s" "$ID" "$VERSION_ID" || uname -s',
+  'sh', '-c', '[ -r /etc/os-release ] && . /etc/os-release && printf "%s %s" "$ID" "$VERSION_ID" || uname -s',
   check: false).stdout().strip()
 
 minibox_host_c_args = [
