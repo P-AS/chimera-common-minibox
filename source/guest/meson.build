@@ -13,6 +13,11 @@
 #                '-o', '@OUTPUT@', '@INPUT@',
 #                minibox.get_variable('waterbox_emulibc_obj'), '-lgcc' ])
 #
+# On aarch64 a linked guest is finished by wbx-tp-rewrite.py, which points its
+# thread-pointer reads at the machine's slot (MACHINE-SPEC, "aarch64"); put
+# minibox.get_variable('waterbox_guest_link') in front of the link command to
+# have it done (it links, then rewrites the -o; on x86-64 it only links).
+#
 # A generated cross-file (waterbox-guest.ini) is also emitted for consumers that
 # prefer building the guest as a separate cross-compiled meson project.
 #
@@ -41,6 +46,11 @@ waterbox_guest_cflags = [
 waterbox_guest_ldflags = [
   '-static', '-no-pie', '-Wl,--eh-frame-hdr,-O2', '-T', waterbox_linkscript,
 ]
+# Every guest link goes through this: the link, then wbx-tp-rewrite.py on its
+# output (an aarch64 guest reads its thread pointer from the machine's slot,
+# not TPIDR_EL0; x86-64 has nothing to rewrite).
+waterbox_tp_rewrite = files('wbx-tp-rewrite.py')
+waterbox_guest_link = [find_program('python3'), waterbox_tp_rewrite, '--']
 
 # emulibc.o is a meson build artifact, compiled with the just-built musl-gcc.
 # Passing the musl-gcc custom_target as command[0] makes ninja build musl first.
@@ -112,5 +122,6 @@ configure_file(
     'LINKSCRIPT': waterbox_linkscript,
     'MACHINE_ARGS': waterbox_machine_args_ini,
     'CPU_FAMILY': host_machine.cpu_family(),
+    'TP_REWRITE': meson.current_source_dir() / 'wbx-tp-rewrite.py',
   },
 )

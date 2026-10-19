@@ -405,6 +405,15 @@ const mb_layout *mb_tripguard_layout(void);
  * place of x86-64's gs:0x18 (interop_aarch64.S). 64 KiB past MB_ORG, so it is
  * a page of its own on every host the blob's code page is not. */
 #define MB_INTEROP_SLOT   (MB_ORG + 0x10000ull)
+/* aarch64: the guest's thread pointer, one word at a fixed address (MACHINE-
+ * SPEC, "aarch64"). Not TPIDR_EL0: macOS writes the CPU number there at every
+ * context switch, so no value of the guest's survives in it. Guest code reads
+ * this word instead - musl directly, and every `mrs xN, tpidr_el0` the
+ * compiler emitted through the trampolines wbx-tp-rewrite.py links in - and
+ * only the host writes it. 256 MiB below the guest's link base, so an adrp in
+ * the first 3.75 GiB of the image reaches it; 64 KiB-aligned, so it is a page
+ * of its own on every host. */
+#define MB_TP_SLOT        0x36ef0000000ull
 #endif
 
 /* The interop blob and the guest are ALWAYS sysv64, whatever the host is. On a
@@ -492,14 +501,19 @@ bool mb_host_guest_death_in_handler(mb_context *c, const char *fmt, ...);
 static inline uintptr_t mb_rdfsbase(void) { uintptr_t v; __asm__ volatile("rdfsbase %0" : "=r"(v) :: "memory"); return v; }
 static inline void mb_wrfsbase(uintptr_t v) { __asm__ volatile("wrfsbase %0" :: "r"(v) : "memory"); }
 #elif defined(__aarch64__)
-/* aarch64 has one thread pointer, TPIDR_EL0, and both glibc and the guest's
- * musl live on it: there is no spare segment register to give the guest the
- * way C guests have %gs on x86-64. So EVERY aarch64 guest is a swapping guest
- * - fs_swap is always on - and "%fs" below means TPIDR_EL0. User mode may
- * always read and write it, so the probe always says yes. */
+/* aarch64's guest thread pointer is the word at MB_TP_SLOT, and "%fs" below
+ * means that word. EVERY aarch64 guest is a swapping guest - fs_swap is always
+ * on - and the probe always says yes. Unlike x86-64's %fs it is nobody else's:
+ * the host's own thread pointer (TPIDR_EL0 on Linux, TPIDRRO_EL0 on macOS) is
+ * never touched, so host code is safe whatever the word holds, and swapping
+ * it back around host code only keeps the bookkeeping the x86-64 path shares.
+ * It is also one word for the process, not one per thread: only the thread
+ * running the guest may write it (one machine is entered at a time, as the
+ * interop slot already assumes). */
 #define MB_HAVE_FSBASE 1
-static inline uintptr_t mb_rdfsbase(void) { uintptr_t v; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(v) :: "memory"); return v; }
-static inline void mb_wrfsbase(uintptr_t v) { __asm__ volatile("msr tpidr_el0, %0" :: "r"(v) : "memory"); }
+#define MB_TP_IN_MEMORY 1
+static inline uintptr_t mb_rdfsbase(void) { return *(volatile uintptr_t *)MB_TP_SLOT; }
+static inline void mb_wrfsbase(uintptr_t v) { __asm__ volatile("" ::: "memory"); *(volatile uintptr_t *)MB_TP_SLOT = v; __asm__ volatile("" ::: "memory"); }
 #else
 #error "miniBox runs on x86-64 and aarch64 only"
 #endif

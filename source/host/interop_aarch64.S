@@ -20,9 +20,8 @@
  * written on every entry. One machine is entered at a time - the block's
  * address is fixed - so one word per process is all there is to know.
  *
- * What the blob does NOT do is touch TPIDR_EL0: as on x86-64, the guest's and
- * the host's thread pointers are swapped by host C (the syscall dispatcher,
- * mb_guarded_call, the extcall wrappers in context.c).
+ * What the blob does NOT do is touch the guest's thread pointer (the word at
+ * MB_TP_SLOT): as on x86-64, host C and mb_guarded_call keep it.
  *
  * Every way back into guest code zeroes the scratch registers but x0, as the
  * x86-64 blob's stubs do: a guest that spills one must not carry a host
@@ -41,6 +40,8 @@
  *
  * Context offsets: see mb_context and the asserts in context.c.
  */
+
+#include "asm_aarch64.h"
 
 #define CTX_HOST_RSP      0x008
 #define CTX_GUEST_RSP     0x010
@@ -114,11 +115,11 @@
 	mov v15.d[1], xzr
 .endm
 
-	.section .rodata.mb_interop, "a"
+	MB_RODATA_SECTION
 	.balign 16
-	.globl mb_interop_bin
-	.hidden mb_interop_bin
-mb_interop_bin:
+	.globl MB_SYM(mb_interop_bin)
+	MB_HIDDEN(mb_interop_bin)
+MB_SYM(mb_interop_bin):
 	.fill 0x80, 1, 0
 
 /* ---- 0x080 guest_syscall ---- */
@@ -255,9 +256,9 @@ zero_vectors:
 mb_interop_end:
 
 	.balign 4
-	.globl mb_interop_bin_len
-	.hidden mb_interop_bin_len
-mb_interop_bin_len:
-	.word mb_interop_end - mb_interop_bin
+	.globl MB_SYM(mb_interop_bin_len)
+	MB_HIDDEN(mb_interop_bin_len)
+MB_SYM(mb_interop_bin_len):
+	.long mb_interop_end - MB_SYM(mb_interop_bin)
 
-	.section .note.GNU-stack,"",%progbits
+	MB_NOTE_GNU_STACK

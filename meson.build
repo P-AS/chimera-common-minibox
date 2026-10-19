@@ -49,13 +49,15 @@ if build_guest_toolchain
   #   aarch64  the default small model (addressing is pc-relative: any base
   #            works), no return-address signing (keyed per process - a signed
   #            pointer in a savestate is another pointer in the next process),
-  #            no outline atomics (they ask the CPU what it has), and the
+  #            no outline atomics (they ask the CPU what it has), the
   #            arithmetic of the x86-64 machine: no fused multiply-add, signed
-  #            char. The same flags sit in the musl-gcc specs (*cc1).
+  #            char - and x18 left alone, the platform register Linux lends to
+  #            code, Windows keeps its TEB in and macOS zeroes when it likes.
+  #            The same flags sit in the musl-gcc specs (*cc1).
   if host_machine.cpu_family() == 'aarch64'
     waterbox_musl_target = 'waterbox_aarch64'
     waterbox_guest_triplet = 'aarch64-linux-musl'
-    waterbox_cpu_flags = ['-mbranch-protection=none', '-mno-outline-atomics', '-ffp-contract=off', '-fsigned-char']
+    waterbox_cpu_flags = ['-mbranch-protection=none', '-mno-outline-atomics', '-ffp-contract=off', '-fsigned-char', '-ffixed-x18']
   elif host_machine.cpu_family() == 'x86_64'
     waterbox_musl_target = 'waterbox'
     waterbox_guest_triplet = 'x86_64-linux-musl'
