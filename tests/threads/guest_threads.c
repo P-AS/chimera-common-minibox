@@ -66,7 +66,13 @@ ECL_EXPORT uint64_t RunCondvar(uint64_t value) {
 	return (uint64_t)(uintptr_t)r;   /* must equal value*2+1 */
 }
 
-ECL_EXPORT int Init(void) { return 1; }
+/* Ballast: a .bss larger than any page rounding, so that the image's thread-
+ * pointer trampolines (wbx-tp-rewrite.py, aarch64) must go after the .bss and
+ * not merely after the file's bytes - placed over the .bss they would be
+ * zeroed by it, which only an image with a real .bss shows. */
+static volatile uint8_t g_ballast[8u << 20];
+
+ECL_EXPORT int Init(void) { g_ballast[sizeof g_ballast - 1] = 1; return 1; }
 int main(void) { return 0; }
 
 /* Thread-local storage, on a new thread and on the main one: a zeroed local
