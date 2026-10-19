@@ -499,7 +499,34 @@ typedef struct {
 	/* Faults being handled for this machine right now (Windows): a stop from
 	 * another thread waits until there are none. */
 	volatile long handling;
+	/* The guest's working system calls (all but yields, sleeps, clock reads,
+	 * futexes and thread ids), and a count of the frontend's own work for it
+	 * (wbx_count_work_from: a GPU driver call, a compile cache) added on top:
+	 * what a frontend's watchdog reads as a sign of life. A pending stop is
+	 * carried out only while the total stands where it stood when the stop was
+	 * asked for (stop_activity): a guest that worked since is not stuck - a
+	 * driver call that took long came back. */
+	volatile uint64_t activity;
+	uint64_t stop_activity;
+	const uint64_t *extra_work;
 } mb_context;
+
+static inline uint64_t mb_work(const mb_context *c) {
+	uint64_t n = __atomic_load_n(&c->activity, __ATOMIC_RELAXED);
+	if (c->extra_work != NULL) n += __atomic_load_n(c->extra_work, __ATOMIC_RELAXED);
+	return n;
+}
+
+/* Whether a pending stop is to be carried out now. A stop the guest worked
+ * past is dropped (the watchdog asks again if it gets stuck after all). */
+static inline int mb_stop_due(mb_context *c) {
+	if (!c->stop_pending || c->esc_rsp == 0) return 0;
+	if (mb_work(c) != __atomic_load_n(&c->stop_activity, __ATOMIC_RELAXED)) {
+		c->stop_pending = 0;
+		return 0;
+	}
+	return 1;
+}
 
 #define MB_GUEST_FCW_START   0x037F
 #define MB_GUEST_MXCSR_START 0x1F80

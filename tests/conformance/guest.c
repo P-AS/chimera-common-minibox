@@ -488,6 +488,13 @@ ECL_EXPORT int SpinForever(void) { for (;;) g_spun++; }
 ECL_EXPORT int SpinOnSyscalls(void) { for (;;) syscall(SYS_sched_yield); }
 ECL_EXPORT void Yield(int n) { for (int i = 0; i < n; i++) syscall(SYS_sched_yield); }
 ECL_EXPORT void Work(int n) { for (int i = 0; i < n; i++) syscall(SYS_getppid); }
+/* calls the host (the log callback), then yields n times: a stop asked for
+ * inside the callback ends it at the first yield, unless it was dropped */
+ECL_EXPORT int CallHostThenYield(int n) {
+	g_log_cb(7);
+	for (int i = 0; i < n; i++) syscall(SYS_sched_yield);
+	return 1;
+}
 
 /* Dies the way a panicking or out-of-memory guest dies: says something on its
  * stderr, then abort() - which musl turns into tkill(self, SIGABRT). The host

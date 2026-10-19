@@ -143,7 +143,10 @@ void wbx_get_death(mb_host *obj, char *out, uintptr_t cap, mb_return *ret);
  * the stop was delivered (Linux: the signal was sent; Windows: the thread was
  * sent out), and asking again later is how a caller waits that out. A call
  * that ended by itself should be followed by wbx_stop_cancel, so a stop asked
- * for too late does not end the next one. */
+ * for too late does not end the next one. A stop is dropped when the guest
+ * works after it was asked for (wbx_guest_activity moves): a driver call that
+ * took long and came back is not a stuck guest. Asked on the thread running
+ * the call (from a host callback), it waits for the guest's next system call. */
 void wbx_stop_from_here(mb_host *obj, mb_return *ret);
 void wbx_stop_guest(mb_host *obj, const char *why, mb_return *ret);
 void wbx_stop_cancel(mb_host *obj, mb_return *ret);
@@ -152,6 +155,11 @@ void wbx_stop_cancel(mb_host *obj, mb_return *ret);
  * from any thread. A watchdog that sees it move knows the guest is working -
  * compiling, loading - and not stuck (2026-10-19). */
 void wbx_guest_activity(mb_host *obj, mb_return *ret);
+/* A count of the frontend's own work for the guest - its callbacks, a GPU
+ * driver call, a compile cache - for wbx_guest_activity to add in. The
+ * frontend adds to *counter after each piece of work, on the thread that
+ * calls the guest; it must outlive the host. NULL takes it away. */
+void wbx_count_work_from(mb_host *obj, const uint64_t *counter, mb_return *ret);
 
 #ifdef __cplusplus
 }

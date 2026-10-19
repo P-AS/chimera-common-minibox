@@ -105,6 +105,8 @@ void wbx_stop_guest(mb_host *obj, const char *why, mb_return *ret) { ok(ret, (ui
 void wbx_stop_cancel(mb_host *obj, mb_return *ret) { mb_host_stop_cancel(obj); ok(ret, 0); }
 uint64_t mb_host_activity(mb_host *h);
 void wbx_guest_activity(mb_host *obj, mb_return *ret) { ok(ret, (uintptr_t)mb_host_activity(obj)); }
+void mb_host_count_work_from(mb_host *h, const uint64_t *counter);
+void wbx_count_work_from(mb_host *obj, const uint64_t *counter, mb_return *ret) { mb_host_count_work_from(obj, counter); ok(ret, 0); }
 void wbx_get_proc_addr_raw(mb_host *obj, const char *name, mb_return *ret) { ok(ret, mb_host_proc_addr_raw(obj, name)); }
 void wbx_get_callin_addr(mb_host *obj, uintptr_t ptr, mb_return *ret) { ok(ret, mb_host_callin_addr(obj, ptr)); }
 

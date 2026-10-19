@@ -542,6 +542,13 @@ Nothing changes for a guest that is never stopped.
     (every system call checks for a stop first).
   - in host code that never returns to the guest (a GPU call that waits for
     ever, a fault being handled): not stopped. The frontend asks again.
+  - asked on the thread running the call (from inside a host callback):
+    at the guest's next system call.
+
+  A stop is carried out only if the guest has not worked since it was asked
+  for (the count below has not moved); otherwise it is dropped, and the
+  frontend asks again if the guest gets stuck after all. A driver call that
+  took long and came back is not a stuck guest.
 - `wbx_stop_cancel(obj)` takes back a stop that was asked for but not yet
   carried out, for a call that ended by itself in between. A stop is never
   carried into the next call after a cancel.
@@ -551,11 +558,19 @@ Nothing changes for a guest that is never stopped.
   frontend reads it as a sign of life: a guest whose count moves is working
   (RPCS3 compiling a game's code with LLVM makes a frame take 90 seconds),
   one whose count stands still is spinning or only waiting.
+- `wbx_count_work_from(obj, counter)` adds a count the frontend keeps of its
+  own work for the guest (its callbacks: a GPU driver call, a compile cache)
+  into that count. The frontend adds 1 after each piece of work. The counter
+  must outlive the host; NULL takes it away.
 
-Tested by `conformance-stop` (`run_guest --stop`): a guest spinning in its
-own code and one spinning on sched_yield are each stopped from a second
-thread, on Linux and on Windows, and a stop asked for before a call and
-cancelled ends nothing.
+Tested by `conformance-stop` (`run_guest --stop`), on Linux and on Windows:
+a guest spinning in its own code and one spinning on sched_yield are each
+stopped from a second thread (on Linux the second with the stop's signal
+blocked, so the check at a system call is what ends it); a stop asked for
+before a call and cancelled ends nothing; the count moves for getppid and
+not for yields; and a stop asked from inside a host callback ends the guest
+at its next yield, unless the frontend counted work after the ask, when the
+call ends by itself.
 
 ## Answered instead of fatal (spec v2.2, additive)
 

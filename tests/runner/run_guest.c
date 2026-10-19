@@ -311,6 +311,22 @@ static void seal_and_activate(mb_host *h) {
  * A stop asked for after a call ended by itself is cancelled and ends nothing.
  * The count of working system calls moves for getppid and not for a yield. */
 struct stopper { mb_host *h; volatile int done; int asked; };
+/* the callback the guest calls in the third part: asks for a stop from inside
+ * the call, then (when told to) counts work it did for the guest, as a GPU
+ * bridge does after a driver call */
+static mb_host *g_stop_host;
+static uint64_t g_frontend_work;
+static int g_work_after_ask;
+static uintptr_t MB_GUEST_ABI stop_cb(uintptr_t v, uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6) {
+	(void)v;(void)a2;(void)a3;(void)a4;(void)a5;(void)a6;
+	/* static: a sysv function holding a 1 KiB local while it calls a win64
+	 * one crashed mingw's GCC 13 ("internal compiler error: in
+	 * choose_baseaddr") */
+	static mb_return r;
+	wbx_stop_guest(g_stop_host, "asked from inside a callback", &r);
+	if (g_work_after_ask) g_frontend_work++;
+	return 0;
+}
 static void sleep_ms(int ms) {
 #ifdef _WIN32
 	Sleep((DWORD)ms);
@@ -334,6 +350,40 @@ static void *stopper_fn(void *arg)
 		sleep_ms(50);
 	}
 	return 0;
+}
+
+static void stop_from_callback(const char *guest) {
+	/* A stop asked for while the guest is in host code waits for its next
+	 * system call; one the guest worked past is dropped. Here the stop is
+	 * asked inside a host callback, and the frontend's counted work after it
+	 * (wbx_count_work_from) drops it: the call ends by itself. Without the
+	 * work the guest dies at its first yield, with the reason given. */
+	for (int worked = 1; worked >= 0; worked--) {
+		typedef int (MB_GUEST_ABI *n_ret_fn)(int);
+		typedef void (MB_GUEST_ABI *setcb_any)(uintptr_t);
+		mb_host *h = make_host(guest, 0xABCD);
+		mb_return r;
+		wbx_activate_host(h, &r);
+		CHECK(((init_fn)proc(h, "Init"))() == 1);
+		wbx_stop_from_here(h, &r);
+		wbx_count_work_from(h, &g_frontend_work, &r);
+		g_stop_host = h;
+		g_work_after_ask = worked;
+		wbx_get_callback_addr(h, stop_cb, 0, &r);
+		((setcb_any)proc(h, "SetLogCallback"))(r.data);
+		const int got = ((n_ret_fn)proc(h, "CallHostThenYield"))(100);
+		char why[512];
+		wbx_get_death(h, why, sizeof why, &r);
+		printf("run_guest: a stop asked from a callback, %s: came back with %d, dead=%d%s%s\n",
+		       worked ? "with work after it" : "with no work after it", got, (int)r.data,
+		       r.data ? ": " : "", r.data ? why : "");
+		if (worked) CHECK(got == 1 && r.data == 0);
+		else CHECK(got == 0 && r.data == 1 && strstr(why, "asked from inside a callback") != NULL);
+		wbx_stop_cancel(h, &r);
+		wbx_count_work_from(h, NULL, &r);
+		wbx_deactivate_host(h, &r);
+		wbx_destroy_host(h, &r);
+	}
 }
 
 static int stop_flow(const char *guest) {
@@ -392,6 +442,7 @@ static int stop_flow(const char *guest) {
 		wbx_deactivate_host(h, &r);
 		wbx_destroy_host(h, &r);
 	}
+	stop_from_callback(guest);
 	if (fails == 0) printf("run_guest: all checks passed\n");
 	else printf("run_guest: %d checks FAILED\n", fails);
 	return fails ? 1 : 0;

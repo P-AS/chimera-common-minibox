@@ -1081,8 +1081,8 @@ static struct sigaction g_old_stop;
 static void handler_stop(int sig, siginfo_t *info, void *ucontext) {
 	ucontext_t *uc = (ucontext_t *)ucontext;
 	const uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
-	if (mb_guest_ctx != NULL && mb_guest_ctx->stop_pending && mb_guest_ctx->esc_rsp != 0
-	    && g_fault_depth == 0 && guest_can_die_here(rip)) {
+	if (mb_guest_ctx != NULL && mb_guest_ctx->stop_pending && g_fault_depth == 0
+	    && guest_can_die_here(rip) && mb_stop_due(mb_guest_ctx)) {
 #ifdef MB_HAVE_FSBASE
 		/* host C from here on, which needs the host's %fs */
 		if (mb_guest_ctx->fs_swap && mb_guest_ctx->host_fs) mb_wrfsbase(mb_guest_ctx->host_fs);
@@ -1301,7 +1301,7 @@ int mb_tripguard_stop_thread(void *thread) {
 	c.ContextFlags = CONTEXT_FULL;
 	int sent = 0;
 	if (GetThreadContext(t, &c) && mb_guest_ctx != NULL && mb_guest_ctx->stop_pending
-	    && mb_guest_ctx->esc_rsp != 0 && mb_guest_ctx->handling == 0 && code_in_guest((uintptr_t)c.Rip)) {
+	    && mb_guest_ctx->handling == 0 && code_in_guest((uintptr_t)c.Rip) && mb_stop_due(mb_guest_ctx)) {
 		mb_guest_ctx->stop_pending = 0;
 		mb_host_guest_death_in_handler(mb_guest_ctx, "%s", mb_host_stop_reason(mb_guest_ctx));
 		c.Rsp = (DWORD64)mb_guest_ctx->esc_rsp;
