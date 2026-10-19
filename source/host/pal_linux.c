@@ -1,6 +1,6 @@
 /* Platform abstraction layer, Linux x86-64. Mirrors BizHawk waterboxhost src/memory_block/pal.rs
  * (the nix module). Not meant for general consumption - minimal checking. */
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
 #define _GNU_SOURCE
 #include "minibox_internal.h"
 #include <sys/mman.h>
@@ -68,5 +68,14 @@ int mb_pal_protect(mb_range addr, mb_prot prot) {
 int mb_pal_commit(mb_range addr, mb_prot prot) {
 	return mprotect((void *)addr.start, addr.size, prot_to_native(prot));
 }
+
+int mb_pal_map_code(uintptr_t size, mb_range *exec, mb_range *write) {
+	mb_range in = { 0, size };
+	if (mb_pal_map_anon(in, MB_PROT_RWX, exec) != 0) return -1;
+	*write = *exec;
+	return 0;
+}
+
+void mb_pal_unmap_code(mb_range exec, mb_range write) { (void)write; mb_pal_unmap_anon(exec); }
 
 #endif

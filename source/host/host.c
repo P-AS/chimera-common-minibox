@@ -14,6 +14,10 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/uio.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
 /* the spin sampler's host, and the lock that lets mb_host_destroy wait for it
  * (see sample_fn) */
 static pthread_mutex_t sample_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1081,8 +1085,15 @@ static void *sample_fn(void *arg) {
 		if (h && h->active) {
 			const uintptr_t rsp = h->context.guest_rsp;   /* racy by design: a snapshot */
 			uint64_t words[12];
+#if defined(__APPLE__)
+			/* Mach's equivalent: an unmapped page is an error, not a fault */
+			mach_vm_size_t read = 0;
+			const ssize_t got = mach_vm_read_overwrite(mach_task_self(), rsp, sizeof words,
+				(mach_vm_address_t)(uintptr_t)words, &read) == KERN_SUCCESS ? (ssize_t)read : -1;
+#else
 			struct iovec local = { words, sizeof words }, remote = { (void *)rsp, sizeof words };
 			const ssize_t got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+#endif
 			fprintf(stderr, "[S] active=%u rsp=%lx stack:", mb_threads_active_tid(h->threads), (unsigned long)rsp);
 			if (got == (ssize_t)sizeof words)
 				for (int i = 0; i < 12; i++) fprintf(stderr, " %lx", (unsigned long)words[i]);

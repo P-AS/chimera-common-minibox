@@ -113,4 +113,13 @@ int mb_pal_commit(mb_range addr, mb_prot prot) {
 	return -1;
 }
 
+int mb_pal_map_code(uintptr_t size, mb_range *exec, mb_range *write) {
+	mb_range in = { 0, size };
+	if (mb_pal_map_anon(in, MB_PROT_RWX, exec) != 0) return -1;
+	*write = *exec;
+	return 0;
+}
+
+void mb_pal_unmap_code(mb_range exec, mb_range write) { (void)write; mb_pal_unmap_anon(exec); }
+
 #endif

@@ -12,8 +12,9 @@
 #ifndef _WIN32
 #include <sys/syscall.h>
 #include <unistd.h>
-#include <stddef.h>
+#if defined(__linux__)
 #include <sys/auxv.h>
+#endif
 #else
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -252,7 +253,10 @@ uintptr_t mb_get_callback_ptr(uintptr_t slot) {
 #define THUNK_ARENA (16u * MB_PAGESIZE)
 #define THUNK_CAP (THUNK_ARENA / THUNK_SIZE)
 struct mb_thunks {
-	mb_range mem;
+	mb_range mem;      /* where the thunks run */
+	mb_range wmem;     /* where they are written: mem itself, or (macOS, which
+	                      maps nothing writable and executable at once) a
+	                      writable view of the same pages */
 	uintptr_t entries[THUNK_CAP];
 	uintptr_t ptrs[THUNK_CAP];
 	size_t count;
@@ -264,14 +268,13 @@ struct mb_thunks {
 
 mb_thunks *mb_thunks_new(void) {
 	mb_thunks *t = (mb_thunks *)calloc(1, sizeof(mb_thunks));
-	mb_range in = { 0, THUNK_ARENA };
-	if (mb_pal_map_anon(in, MB_PROT_RWX, &t->mem) != 0) { free(t); return NULL; }
+	if (mb_pal_map_code(THUNK_ARENA, &t->mem, &t->wmem) != 0) { free(t); return NULL; }
 	return t;
 }
 
 void mb_thunks_free(mb_thunks *t) {
 	if (!t) return;
-	mb_pal_unmap_anon(t->mem);
+	mb_pal_unmap_code(t->mem, t->wmem);
 	free(t);
 }
 
@@ -303,7 +306,8 @@ uintptr_t mb_thunks_get(mb_thunks *t, uintptr_t guest_entry, mb_context *c) {
 		return 0;
 	}
 	uintptr_t addr = t->mem.start + t->count * THUNK_SIZE;
-	uint8_t *p = (uint8_t *)addr;
+	uint8_t *const wbase = (uint8_t *)(addr - t->mem.start + t->wmem.start);
+	uint8_t *p = wbase;
 	/* The thunk only says which call this is. Everything a call needs - the %fs
 	 * swap a Rust guest wants, the escape record a guest that dies returns
 	 * through - is one routine in guarded.S, entered with r10 = context and
@@ -332,14 +336,14 @@ uintptr_t mb_thunks_get(mb_thunks *t, uintptr_t guest_entry, mb_context *c) {
 #else
 #error "miniBox runs on x86-64 and aarch64 only"
 #endif
-	if ((size_t)(p - (uint8_t *)addr) > THUNK_SIZE) {
+	if ((size_t)(p - wbase) > THUNK_SIZE) {
 		/* Silent overflow here writes over the NEXT thunk, which shows up much
 		 * later as a call into the middle of an instruction. */
 		fprintf(stderr, "miniBox: thunk of %zu bytes does not fit THUNK_SIZE %d\n",
-		        (size_t)(p - (uint8_t *)addr), THUNK_SIZE);
+		        (size_t)(p - wbase), THUNK_SIZE);
 		abort();
 	}
-	__builtin___clear_cache((char *)addr, (char *)p);   /* aarch64: publish the code */
+	__builtin___clear_cache((char *)addr, (char *)addr + (p - wbase));   /* aarch64: publish the code */
 	t->entries[t->count] = guest_entry;
 	t->ptrs[t->count] = addr;
 	t->count++;
@@ -387,8 +391,10 @@ uintptr_t mb_thunks_get_extcall(mb_thunks *t, uintptr_t cb, mb_context *c) {
 		return 0;
 	}
 	uintptr_t addr = t->mem.start + t->mem.size - (t->ext_count + 1) * THUNK_SIZE;
-	uint8_t *p = (uint8_t *)addr;
-	/* The guest's %fs is read back from the context on the way out rather than
+	uint8_t *p = (uint8_t *)(addr - t->mem.start + t->wmem.start);
+	/* (x86-64 only: aarch64's thread pointer is a word no host code reads, so a
+	 * callback needs nothing put back - see MB_TP_IN_MEMORY.)
+	 * The guest's %fs is read back from the context on the way out rather than
 	 * saved from the register on the way in: the context is the live answer,
 	 * and a host that lost the base while the callback ran (Windows drops it
 	 * across a fault, and a GL callback takes plenty) would otherwise have the
