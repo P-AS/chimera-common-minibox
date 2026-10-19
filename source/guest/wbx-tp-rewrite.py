@@ -40,6 +40,7 @@ TP_SLOT = 0x36EF0000000
 EM_X86_64 = 62
 EM_AARCH64 = 183
 PT_LOAD = 1
+PT_GNU_PROPERTY = 0x6474E553
 PF_X, PF_R = 1, 4
 SHT_PROGBITS, SHT_SYMTAB = 1, 2
 SHF_ALLOC, SHF_EXECINSTR = 0x2, 0x4
@@ -51,7 +52,7 @@ MSR_TPIDR = 0xD51BD040           # msr tpidr_el0, xN (| N)
 NOP = 0xD503201F
 
 EHDR = struct.Struct("<16sHHIQQQIHHHHHH")
-PHDR = struct.Struct("<IIQQQQQQ")
+PHDR = struct.Struct("<IIQQQQQQ")   # type, flags, offset, vaddr, paddr, filesz, memsz, align
 SHDR = struct.Struct("<IIQQQQIIQQ")
 SYM = struct.Struct("<IBBHQQ")
 
@@ -197,8 +198,11 @@ def main(argv):
     # The trampolines' segment: after everything the image loads, on its own
     # 64 KiB page, file offset congruent to the address as a loader wants.
     loads = [p for p in phdrs if p[0] == PT_LOAD]
-    top_addr = max(p[3] + p[5] for p in loads)
+    top_addr = max(p[3] + p[6] for p in loads)   # vaddr + memsz: past the .bss
     seg_addr = (top_addr + SEGMENT_ALIGN - 1) & ~(SEGMENT_ALIGN - 1)
+    for p in loads:   # (a segment laid over the .bss would be zeroed by it, or zero it)
+        if p[3] < seg_addr + 12 * len(sites) and seg_addr < p[3] + p[6]:
+            fail(f"{name}: the trampolines at {seg_addr:#x} would overlap the segment at {p[3]:#x}")
 
     tramp = bytearray()
     for pc, foff, reg in sites:
@@ -219,19 +223,27 @@ def main(argv):
         return
 
     # The program headers stay where they are and gain one entry: the guest
-    # reads them from memory (musl finds its PT_TLS at __ehdr_start + e_phoff),
-    # so they must stay inside the first segment. The linker leaves the rest
-    # of that page empty before the first section; the entry goes there, or
-    # nowhere.
+    # reads them from memory (musl finds its PT_TLS at __ehdr_start + e_phoff,
+    # cxxglue its PT_LOADs and PT_GNU_EH_FRAME), so they must stay inside the
+    # first segment. Where the linker left the rest of that page empty the
+    # entry goes after them. Where it did not - binutils on a distribution
+    # whose gcc marks objects for BTI puts .note.gnu.property there - the
+    # PT_GNU_PROPERTY entry gives up its slot: it repeats the PT_NOTE entry
+    # beside it for a kernel's sake, and nothing loads a guest but miniBox,
+    # which reads neither.
     ph_end = e_phoff + (e_phnum + 1) * PHDR.size
     first = min(p for p in loads if p[2] == 0) if any(p[2] == 0 for p in loads) else None
-    if first is None or ph_end > first[2] + first[4]:
+    if first is None or ph_end > first[2] + first[5]:   # offset + filesz
         fail(f"{name}: its program headers are not inside its first segment")
+    room = not any(image[e_phoff + e_phnum * PHDR.size:ph_end])
     for i, sh in enumerate(shdrs):
         if i and sh[1] != 8 and sh[5] and sh[4] < ph_end and e_phoff + e_phnum * PHDR.size < sh[4] + sh[5]:
-            fail(f"{name}: no room after its program headers for one more ({sec_name(sh)} follows them)")
-    if any(image[e_phoff + e_phnum * PHDR.size:ph_end]):
-        fail(f"{name}: no room after its program headers for one more")
+            room = False
+    if not room:
+        spare = [i for i, p in enumerate(phdrs) if p[0] == PT_GNU_PROPERTY]
+        if not spare:
+            fail(f"{name}: no room after its program headers for one more, and no PT_GNU_PROPERTY to give way")
+        del phdrs[spare[0]]
 
     # Append the trampolines, then a section-name table that names them and
     # the section headers - those two moved to the end whole, so nothing
@@ -257,7 +269,8 @@ def main(argv):
         image += SHDR.pack(*sh)
 
     phdrs.append([PT_LOAD, PF_R | PF_X, seg_off, seg_addr, seg_addr, len(tramp), len(tramp), SEGMENT_ALIGN])
-    PHDR.pack_into(image, e_phoff + e_phnum * PHDR.size, *phdrs[-1])
+    for i, ph in enumerate(phdrs):
+        PHDR.pack_into(image, e_phoff + i * PHDR.size, *ph)
 
     EHDR.pack_into(image, 0, ident, e_type, e_machine, e_version, e_entry, e_phoff, new_shoff, e_flags,
                    e_ehsize, e_phentsize, len(phdrs), e_shentsize, len(shdrs), e_shstrndx)
