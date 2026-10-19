@@ -47,7 +47,22 @@ enum {
 	 *
 	 * Any two contexts differ; a host too old to know the question answers 0,
 	 * which a guest must read as "cannot tell" rather than as a context. */
-	GL_OP_CONTEXT_ID = 4
+	GL_OP_CONTEXT_ID = 4,
+
+	/* A buffer's size, for a shadow of a whole mapping (glMapBuffer): a = the
+	 * target (b = 0) or the buffer's name (b = 1). A host too old to know the
+	 * question answers 0, and the guest maps without a shadow.
+	 *
+	 * Shadows (2026-10-19): a mapping the guest flushes or unmaps is a buffer
+	 * of the guest's own, not the driver's memory. The generated map wrappers
+	 * pass it in b and its size in c; a host that shadows fills it (when the
+	 * guest may read it or the unmap copies it all back), copies it to the
+	 * driver on each flush and on the unmap, and answers it - one that
+	 * does not answers the driver's pointer, and the guest frees its buffer.
+	 * The unmap wrappers pass in b where the host writes the shadow it gives
+	 * back, for the guest to free. A persistent map not flushed explicitly
+	 * keeps the driver's pointer (see SHADOWED_MAPS in gen-gl-bridge.py). */
+	GL_OP_BUFFER_SIZE = 5
 };
 
 struct GlVersionArgs {

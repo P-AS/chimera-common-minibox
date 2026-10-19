@@ -41,6 +41,24 @@ STRING_RETURNING = {"glGetString", "glGetStringi"}
 # still links and still "installs" its logger, and the host quietly declines.
 HOST_IGNORES = {"glDebugMessageCallback", "glDebugMessageCallbackARB", "glDebugMessageCallbackKHR"}
 
+# A mapped buffer is the driver's memory. A mapping the guest flushes or
+# unmaps is given a buffer of the guest's own instead, the size of the range
+# (a "shadow"): the host fills it from the driver when the map is made (when
+# the guest may read it, or the unmap copies all of it back), copies it to the
+# driver on each flush and on the unmap, and the unmap hands it back for the
+# guest to free (owner's decision, 2026-10-19). The guest's writes then land in
+# its own memory - in its states, and never in the host's. A persistent map
+# that is not flushed explicitly (a coherent one, or one only read) keeps the
+# driver's pointer: its writes reach the GPU with no call at all, and a copy
+# would have to be made before every draw.
+#   map: b = the shadow (0: none), c = its size; answers the shadow, or the
+#        driver's pointer from a host that does not shadow (the guest then
+#        frees its buffer).
+#   unmap: b = where the host writes the shadow it gives back (0: none).
+SHADOWED_MAPS = {"glMapBufferRange": "range", "glMapNamedBufferRange": "range",
+                 "glMapBuffer": "whole", "glMapNamedBuffer": "whole"}
+SHADOWED_UNMAPS = {"glUnmapBuffer", "glUnmapNamedBuffer"}
+
 
 def parse_typedefs(header_text):
     """name -> (return type, [(type, name), ...]) from glad's PFN typedefs."""
@@ -89,6 +107,10 @@ def split_params(params):
         else:
             result.append((match.group(1).strip(), match.group(2)))
     return result
+
+
+def body_fill_args(args):
+    return "".join(f"\tchimera_a.{arg} = {arg};\n" for _, arg in args)
 
 
 def read_names(path):
@@ -166,6 +188,59 @@ def main():
 			/* declined: see HOST_IGNORES in the generator */
 			(void)a;
 			return 0;""")
+            continue
+
+        if name in SHADOWED_MAPS:
+            named = "Named" in name
+            if SHADOWED_MAPS[name] == "range":
+                size_expr = "(uint64_t)length"
+                shadow_if = "chimera_gl_shadows(access)"
+            else:
+                # no length: the host answers the buffer's size (GL_OP_BUFFER_SIZE),
+                # and a host that does not know the question answers 0 - no shadow
+                key = "(uint64_t)buffer, 1" if named else "(uint64_t)target, 0"
+                size_expr = f"g_bridge(GL_OP_BUFFER_SIZE, {key}, 0, 0, 0)"
+                shadow_if = "true"
+            guest.append(f"""static {ret} GLAD_API_PTR w_{name}({signature})
+{{
+	struct {struct} chimera_a;
+{body_fill_args(args)}	const uint64_t chimera_size = {shadow_if} ? {size_expr} : 0;
+	void *chimera_shadow = chimera_size != 0 ? chimera_gl_shadow_new(chimera_size) : nullptr;
+	const uint64_t chimera_r = g_bridge(CHIMERA_GL_OP_{name}, (uint64_t)(uintptr_t)&chimera_a,
+		(uint64_t)(uintptr_t)chimera_shadow, chimera_shadow ? chimera_size : 0, 0, 0);
+	if (chimera_shadow != nullptr && chimera_r != (uint64_t)(uintptr_t)chimera_shadow)
+		chimera_gl_shadow_free(chimera_shadow);   /* not taken: a host that does not shadow, or a refused map */
+	return ({ret})(uintptr_t)chimera_r;
+}}
+""")
+            # a host that does not shadow maps as before: the driver's pointer
+            # (Chimera's own case shadows; see SHADOWED_MAPS)
+            host.append(f"""		case CHIMERA_GL_OP_{name}:
+		{{
+			struct {struct} *chimera_p = (struct {struct} *)a;
+			if (glad_{name} == NULL) {{ CHIMERA_GL_UNSUPPLIED(CHIMERA_GL_OP_{name}, "{name}"); return 0; }}
+			return (uintptr_t){name}({call_args});
+		}}""")
+            continue
+
+        if name in SHADOWED_UNMAPS:
+            guest.append(f"""static {ret} GLAD_API_PTR w_{name}({signature})
+{{
+	struct {struct} chimera_a;
+	uint64_t chimera_shadow = 0;
+{body_fill_args(args)}	const {ret} chimera_r = ({ret})g_bridge(CHIMERA_GL_OP_{name}, (uint64_t)(uintptr_t)&chimera_a,
+		(uint64_t)(uintptr_t)&chimera_shadow, 0, 0, 0);
+	if (chimera_shadow != 0)
+		chimera_gl_shadow_free((void *)(uintptr_t)chimera_shadow);
+	return chimera_r;
+}}
+""")
+            host.append(f"""		case CHIMERA_GL_OP_{name}:
+		{{
+			struct {struct} *chimera_p = (struct {struct} *)a;
+			if (glad_{name} == NULL) {{ CHIMERA_GL_UNSUPPLIED(CHIMERA_GL_OP_{name}, "{name}"); return 0; }}
+			return (uintptr_t){name}({call_args});
+		}}""")
             continue
 
         if name in STRING_RETURNING:
@@ -278,12 +353,65 @@ void *chimera_gl_lookup(const char *name)
 #include <glad/gl.h>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "gl-bridge.h"
 #include "gl-bridge-ops.h"
 
 static chimera_gl_bridge_fn g_bridge;
+
+/* The shadows of mapped buffers (SHADOWED_MAPS in the generator): memory of
+ * the guest's own, aligned as a driver's mapping is. */
+static bool chimera_gl_shadows(GLbitfield access)
+{{
+	if ((access & GL_MAP_PERSISTENT_BIT) == 0) return true;   /* unmapped before it is used */
+	/* persistent: shadowed only when its writes are flushed explicitly */
+	return (access & GL_MAP_COHERENT_BIT) == 0 && (access & GL_MAP_FLUSH_EXPLICIT_BIT) != 0 && (access & GL_MAP_WRITE_BIT) != 0;
+}}
+/* A shadow's size is kept in the 64 bytes before it. One freed shadow is kept
+ * for the next map of a like size: a renderer that maps and unmaps every frame
+ * would otherwise be given new memory each time, and fault in every page of
+ * it. It is the guest's memory, so a state holds it like any other. */
+static void *chimera_gl_spare;
+static uint64_t chimera_gl_shadow_size(void *p)
+{{
+	return *(uint64_t *)((char *)p - 64);
+}}
+static void *chimera_gl_shadow_new(uint64_t size)
+{{
+	const uint64_t need = (size + 63) & ~(uint64_t)63;
+	if (chimera_gl_spare != nullptr)
+	{{
+		const uint64_t has = chimera_gl_shadow_size(chimera_gl_spare);
+		if (has >= need && has / 2 <= need)
+		{{
+			void *p = chimera_gl_spare;
+			chimera_gl_spare = nullptr;
+			return p;
+		}}
+	}}
+	void *base = nullptr;
+	if (posix_memalign(&base, 64, (size_t)(need + 64)) != 0) return nullptr;
+	*(uint64_t *)base = need;
+	return (char *)base + 64;
+}}
+static void chimera_gl_shadow_free(void *p)
+{{
+	if (p == nullptr) return;
+	if (chimera_gl_spare == nullptr)
+	{{
+		chimera_gl_spare = p;
+		return;
+	}}
+	void *drop = p;
+	if (chimera_gl_shadow_size(p) > chimera_gl_shadow_size(chimera_gl_spare))
+	{{
+		drop = chimera_gl_spare;   /* the larger one is kept */
+		chimera_gl_spare = p;
+	}}
+	std::free((char *)drop - 64);
+}}
 
 """ + string_keep + "\n" + "\n".join(guest) + f"""
 /* Returns false when the host is older than this guest - it would not know
