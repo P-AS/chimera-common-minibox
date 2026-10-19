@@ -5,7 +5,7 @@ guest_threads_wbx = custom_target('guest_threads.wbx',
   input: 'guest_threads.c',
   output: 'guest_threads.wbx',
   command: [
-    waterbox_musl_gcc, waterbox_guest_cflags, waterbox_guest_ldflags,
+    waterbox_guest_link + [waterbox_musl_gcc], waterbox_guest_cflags, waterbox_guest_ldflags,
     '-std=c11', '-o', '@OUTPUT@', '@INPUT@', waterbox_emulibc_obj, '-lgcc',
   ],
 )

@@ -9,15 +9,17 @@
  *     (r10/r11 there), the arguments untouched in x0-x7;
  *   - the escape record saves x19-x28, the frame pointer and the link
  *     register, and d8-d15: what AAPCS64 says a callee keeps;
- *   - "%fs" is TPIDR_EL0, which glibc and the guest's musl both live on. Every
- *     aarch64 guest owns it (fs_swap is always on), so the host's is parked at
- *     entry and put back on the way out exactly as guarded.S does for a Rust
- *     guest;
+ *   - "%fs" is the word at MB_TP_SLOT, where an aarch64 guest finds its
+ *     thread pointer (minibox_internal.h). Every aarch64 guest owns it
+ *     (fs_swap is always on), so what it held is parked at entry and put back
+ *     on the way out exactly as guarded.S does for a Rust guest;
  *   - the interop blob keeps no per-host-thread block (no gs), so an escape
  *     has only the context's four stack fields to put back.
  *
  * Layout: CTX_* must match mb_context (context.c asserts every one).
  */
+
+#include "asm_aarch64.h"
 
 #define CTX_THREAD_AREA   0x000
 #define CTX_HOST_RSP      0x008
@@ -43,21 +45,21 @@
 #define FRAME_SIZE          208
 
 	.text
-	.globl mb_guarded_call
-	.globl mb_guarded_escape
-	.globl mb_guarded_escape_now
-	.hidden mb_guarded_call
-	.hidden mb_guarded_escape
-	.hidden mb_guarded_escape_now
-	.type mb_guarded_call, %function
-	.type mb_guarded_escape, %function
-	.type mb_guarded_escape_now, %function
+	.globl MB_SYM(mb_guarded_call)
+	.globl MB_SYM(mb_guarded_escape)
+	.globl MB_SYM(mb_guarded_escape_now)
+	MB_HIDDEN(mb_guarded_call)
+	MB_HIDDEN(mb_guarded_escape)
+	MB_HIDDEN(mb_guarded_escape_now)
+	MB_TYPE_FUNCTION(MB_SYM(mb_guarded_call))
+	MB_TYPE_FUNCTION(MB_SYM(mb_guarded_escape))
+	MB_TYPE_FUNCTION(MB_SYM(mb_guarded_escape_now))
 
 /* Entered by a guest-entry thunk (a branch, not a call: x30 is still the
  * caller's return address) with x9 = the context and x10 = the guest
  * function, the guest's arguments untouched in x0-x7. */
 	.p2align 4
-mb_guarded_call:
+MB_SYM(mb_guarded_call):
 	sub sp, sp, #FRAME_SIZE
 	stp x19, x20, [sp, #FRAME_X19 + 0]
 	stp x21, x22, [sp, #FRAME_X19 + 16]
@@ -90,15 +92,11 @@ mb_guarded_call:
 	add x11, x11, #1
 	str x11, [x9, #CTX_CALLS]
 
-	/* the host's thread pointer, where the syscall dispatcher and the way
-	 * out both read it */
-	adrp x11, :got:mb_fs_swap
-	ldr x11, [x11, #:got_lo12:mb_fs_swap]
-	ldrb w11, [x11]
-	cbz w11, 1f
-	mrs x11, tpidr_el0
+	/* what the slot held, where the syscall dispatcher and the way out both
+	 * read it */
+	tp_slot_addr x12
+	ldr x11, [x12]
 	str x11, [x9, #CTX_HOST_FS]
-1:
 	/* a dead machine runs nothing */
 	ldrb w11, [x9, #CTX_DEAD]
 	cbnz w11, .Lrefused
@@ -108,7 +106,7 @@ mb_guarded_call:
 	cbz w11, 2f
 	ldr x11, [x9, #CTX_THREAD_AREA]
 	cbz x11, 2f
-	msr tpidr_el0, x11
+	str x11, [x12]
 2:
 	/* call_guest_impl, at its fixed address: 0x35f00000200 */
 	movz x11, #0x0200
@@ -121,14 +119,10 @@ mb_guarded_call:
 	ldr x9, [sp, #FRAME_CTX]
 	ldr x10, [sp, #FRAME_PREV_ESC]
 	str x10, [x9, #CTX_ESC_RSP]
-	/* the host's thread pointer back, whenever entry parked it */
-	adrp x10, :got:mb_fs_swap
-	ldr x10, [x10, #:got_lo12:mb_fs_swap]
-	ldrb w10, [x10]
-	cbz w10, 3f
+	/* and what the slot held back */
 	ldr x10, [x9, #CTX_HOST_FS]
-	msr tpidr_el0, x10
-3:
+	tp_slot_addr x11
+	str x10, [x11]
 	ldp d8, d9, [sp, #FRAME_D8 + 0]
 	ldp d10, d11, [sp, #FRAME_D8 + 16]
 	ldp d12, d13, [sp, #FRAME_D8 + 32]
@@ -145,19 +139,19 @@ mb_guarded_call:
 .Lrefused:
 	mov x0, #0
 	b .Llanding
-	.size mb_guarded_call, . - mb_guarded_call
+	MB_SIZE(MB_SYM(mb_guarded_call))
 
 /* From host C (x0 = the context): leave for the innermost record now.
  * Everything on the host stack below that record is abandoned. */
 	.p2align 4
-mb_guarded_escape_now:
+MB_SYM(mb_guarded_escape_now):
 	ldr x1, [x0, #CTX_ESC_RSP]
 	mov sp, x1
 
 /* From a fault handler, which has pointed the interrupted context's sp at the
  * record and its pc here. Undoes what the blob's entry did to the context,
  * then leaves the way a return would, with 0. */
-mb_guarded_escape:
+MB_SYM(mb_guarded_escape):
 	ldr x9, [sp, #FRAME_CTX]
 	ldr x10, [sp, #FRAME_HOST_RSP]
 	str x10, [x9, #CTX_HOST_RSP]
@@ -169,6 +163,6 @@ mb_guarded_escape:
 	str x10, [x9, #CTX_GUEST_RSP_ALT]
 	mov x0, #0
 	b .Llanding
-	.size mb_guarded_escape, . - mb_guarded_escape
+	MB_SIZE(MB_SYM(mb_guarded_escape))
 
-	.section .note.GNU-stack,"",%progbits
+	MB_NOTE_GNU_STACK
