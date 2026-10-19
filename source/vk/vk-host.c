@@ -193,9 +193,11 @@ struct memory_state {
  * map_attach). */
 static uint64_t s_work;
 
+struct template_state;
 struct entry {
 	uint64_t host;              /* 0 once destroyed */
 	struct memory_state *memory;  /* for a VkDeviceMemory */
+	struct template_state *tmpl;  /* for a VkDescriptorUpdateTemplate: its entries */
 	uint32_t parent;            /* the pool a set or a command buffer dies with */
 	uint32_t first_child;       /* a pool's: the newest of what dies with it, 0 none */
 	uint32_t next_sibling;      /* a child's: the one made before it in the same pool */
@@ -335,6 +337,8 @@ static void vkb_forget(uint64_t id, int kind)
 		return;
 	free(e->memory);
 	e->memory = NULL;
+	free(e->tmpl);
+	e->tmpl = NULL;
 	e->host = 0;
 	if (e->parent == 0 && e->first_child == 0) {
 		e->gen++;
@@ -357,6 +361,8 @@ static void vkb_forget_children(uint32_t parent)
 		const uint32_t next = e->next_sibling;
 		free(e->memory);
 		e->memory = NULL;
+		free(e->tmpl);
+		e->tmpl = NULL;
 		e->host = 0;
 		e->next_sibling = 0;
 		e->gen++;
@@ -508,6 +514,7 @@ static const char *const kDeviceExtensions[] = {
 	"VK_EXT_index_type_uint8", "VK_EXT_robustness2", "VK_EXT_depth_range_unrestricted",
 	"VK_EXT_border_color_swizzle", "VK_EXT_rgba10x6_formats", "VK_EXT_ycbcr_2plane_444_formats",
 	"VK_IMG_filter_cubic", "VK_EXT_filter_cubic", "VK_KHR_push_descriptor",
+	"VK_KHR_descriptor_update_template",
 };
 
 static int allowed(const char *name, const char *const *list, size_t n)
@@ -1055,6 +1062,169 @@ static uint64_t vkb_special_vkResetDescriptorPool(uint64_t op, struct vkb_vkRese
 	return (uint64_t)(int64_t)r;
 }
 
+/* ---------------------------------------------------------------------------
+ * Descriptor update templates. The data of vkUpdateDescriptorSetWithTemplate
+ * and vkCmdPushDescriptorSetWithTemplate holds image views, samplers, buffers
+ * and buffer views at offsets only the template says. Passed through, the
+ * driver was handed the guest's handles as objects and the host died inside
+ * it, and the template commands were retired for that. Now the host keeps
+ * each template's entries, and each use copies the data and translates every
+ * handle in it as vkUpdateDescriptorSets's arrays are. */
+struct template_state {
+	uint32_t count;
+	VkDescriptorUpdateTemplateEntry entries[];
+};
+
+/* One descriptor's bytes in a template's data; 0 for a type the host cannot
+ * translate (an acceleration structure, a mutable one). An inline uniform
+ * block is bytes: its count is how many. */
+static size_t vkb_desc_size(VkDescriptorType t)
+{
+	if (vkb_desc_uses_image(t))
+		return sizeof(VkDescriptorImageInfo);
+	if (vkb_desc_uses_buffer(t))
+		return sizeof(VkDescriptorBufferInfo);
+	if (vkb_desc_uses_view(t))
+		return sizeof(VkBufferView);
+	if (t == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK)
+		return 1;
+	return 0;
+}
+
+/* The data with every handle in it the driver's, in the arena. vkb_bad for a
+ * template the host does not know. */
+static const void *vkb_template_data(uint64_t id, const void *data)
+{
+	struct entry *e = vkb_entry(id, VKB_K_DescriptorUpdateTemplate);
+	if (!e || !e->tmpl) {
+		vkb_bad = 1;
+		return NULL;
+	}
+	const struct template_state *t = e->tmpl;
+	size_t size = 0;
+	for (uint32_t i = 0; i < t->count; i++) {
+		const VkDescriptorUpdateTemplateEntry *en = &t->entries[i];
+		if (en->descriptorCount == 0)
+			continue;
+		const size_t one = vkb_desc_size(en->descriptorType);
+		const size_t end = en->descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK
+			? (size_t)en->offset + en->descriptorCount
+			: (size_t)en->offset + (size_t)(en->descriptorCount - 1) * en->stride + one;
+		if (end > size)
+			size = end;
+	}
+	if (size == 0)
+		return data;
+	if (!data) {
+		vkb_bad = 1;
+		return NULL;
+	}
+	uint8_t *c = vkb_copy(data, size);
+	for (uint32_t i = 0; c && i < t->count; i++) {
+		const VkDescriptorUpdateTemplateEntry *en = &t->entries[i];
+		const VkDescriptorType type = en->descriptorType;
+		if (type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK)
+			continue;
+		for (uint32_t k = 0; k < en->descriptorCount; k++) {
+			uint8_t *at = c + en->offset + (size_t)k * en->stride;
+			if (vkb_desc_uses_image(type)) {
+				VkDescriptorImageInfo info;
+				memcpy(&info, at, sizeof info);
+				vkb_cur_desc_type = type;
+				vkb_x_VkDescriptorImageInfo(&info);
+				memcpy(at, &info, sizeof info);
+			} else if (vkb_desc_uses_buffer(type)) {
+				VkDescriptorBufferInfo info;
+				memcpy(&info, at, sizeof info);
+				vkb_x_VkDescriptorBufferInfo(&info);
+				memcpy(at, &info, sizeof info);
+			} else {
+				uint64_t view;
+				memcpy(&view, at, sizeof view);
+				view = vkb_h0(view, VKB_K_BufferView);
+				memcpy(at, &view, sizeof view);
+			}
+		}
+	}
+	return c;
+}
+
+static uint64_t vkb_special_vkCreateDescriptorUpdateTemplate(uint64_t op, struct vkb_vkCreateDescriptorUpdateTemplate_args *a)
+{
+	const VkDevice device = (VkDevice)(uintptr_t)vkb_h((uint64_t)(uintptr_t)a->device, VKB_K_Device);
+	if (!a->pCreateInfo || !a->pDescriptorUpdateTemplate || !vkb_fn.vkCreateDescriptorUpdateTemplate)
+		return vkb_refuse(op, (uint64_t)(int64_t)VK_ERROR_INITIALIZATION_FAILED);
+	VkDescriptorUpdateTemplateCreateInfo info = *a->pCreateInfo;
+	vkb_x_VkDescriptorUpdateTemplateCreateInfo(&info);
+	const uint32_t n = info.descriptorUpdateEntryCount;
+	if (vkb_bad || (n && !info.pDescriptorUpdateEntries))
+		return vkb_refuse(op, (uint64_t)(int64_t)VK_ERROR_INITIALIZATION_FAILED);
+	for (uint32_t i = 0; i < n; i++)
+		if (!vkb_desc_size(info.pDescriptorUpdateEntries[i].descriptorType))
+			return vkb_refuse(op, (uint64_t)(int64_t)VK_ERROR_INITIALIZATION_FAILED);
+	struct template_state *t = malloc(sizeof *t + (size_t)n * sizeof t->entries[0]);
+	if (!t)
+		return (uint64_t)(int64_t)VK_ERROR_OUT_OF_HOST_MEMORY;
+	t->count = n;
+	if (n)
+		memcpy(t->entries, info.pDescriptorUpdateEntries, (size_t)n * sizeof t->entries[0]);
+	VkDescriptorUpdateTemplate made = VK_NULL_HANDLE;
+	const VkResult r = vkb_fn.vkCreateDescriptorUpdateTemplate(device, &info, NULL, &made);
+	if (r < 0) {
+		free(t);
+		return (uint64_t)(int64_t)r;
+	}
+	const uint64_t id = vkb_new(VKB_K_DescriptorUpdateTemplate, (uint64_t)made);
+	struct entry *e = id ? vkb_entry(id, VKB_K_DescriptorUpdateTemplate) : NULL;
+	if (!e) {
+		vkb_fn.vkDestroyDescriptorUpdateTemplate(device, made, NULL);
+		free(t);
+		return (uint64_t)(int64_t)VK_ERROR_OUT_OF_HOST_MEMORY;
+	}
+	e->tmpl = t;
+	*a->pDescriptorUpdateTemplate = (VkDescriptorUpdateTemplate)id;
+	return (uint64_t)(int64_t)r;
+}
+
+static uint64_t vkb_special_vkDestroyDescriptorUpdateTemplate(uint64_t op, struct vkb_vkDestroyDescriptorUpdateTemplate_args *a)
+{
+	const VkDevice device = (VkDevice)(uintptr_t)vkb_h((uint64_t)(uintptr_t)a->device, VKB_K_Device);
+	const VkDescriptorUpdateTemplate t =
+		(VkDescriptorUpdateTemplate)vkb_h0((uint64_t)a->descriptorUpdateTemplate, VKB_K_DescriptorUpdateTemplate);
+	if (vkb_bad || !vkb_fn.vkDestroyDescriptorUpdateTemplate)
+		return vkb_refuse(op, 0);
+	vkb_fn.vkDestroyDescriptorUpdateTemplate(device, t, NULL);
+	if (t)
+		vkb_forget((uint64_t)a->descriptorUpdateTemplate, VKB_K_DescriptorUpdateTemplate);
+	return 0;
+}
+
+static uint64_t vkb_special_vkUpdateDescriptorSetWithTemplate(uint64_t op, struct vkb_vkUpdateDescriptorSetWithTemplate_args *a)
+{
+	const VkDevice device = (VkDevice)(uintptr_t)vkb_h((uint64_t)(uintptr_t)a->device, VKB_K_Device);
+	const VkDescriptorSet set = (VkDescriptorSet)vkb_h((uint64_t)a->descriptorSet, VKB_K_DescriptorSet);
+	const VkDescriptorUpdateTemplate t =
+		(VkDescriptorUpdateTemplate)vkb_h((uint64_t)a->descriptorUpdateTemplate, VKB_K_DescriptorUpdateTemplate);
+	const void *data = vkb_template_data((uint64_t)a->descriptorUpdateTemplate, a->pData);
+	if (vkb_bad || !vkb_fn.vkUpdateDescriptorSetWithTemplate)
+		return vkb_refuse(op, 0);
+	vkb_fn.vkUpdateDescriptorSetWithTemplate(device, set, t, data);
+	return 0;
+}
+
+static uint64_t vkb_special_vkCmdPushDescriptorSetWithTemplate(uint64_t op, struct vkb_vkCmdPushDescriptorSetWithTemplate_args *a)
+{
+	const VkCommandBuffer cb = (VkCommandBuffer)vkb_h((uint64_t)(uintptr_t)a->commandBuffer, VKB_K_CommandBuffer);
+	const VkDescriptorUpdateTemplate t =
+		(VkDescriptorUpdateTemplate)vkb_h((uint64_t)a->descriptorUpdateTemplate, VKB_K_DescriptorUpdateTemplate);
+	const VkPipelineLayout layout = (VkPipelineLayout)vkb_h((uint64_t)a->layout, VKB_K_PipelineLayout);
+	const void *data = vkb_template_data((uint64_t)a->descriptorUpdateTemplate, a->pData);
+	if (vkb_bad || !vkb_fn.vkCmdPushDescriptorSetWithTemplate)
+		return vkb_refuse(op, 0);
+	vkb_fn.vkCmdPushDescriptorSetWithTemplate(cb, t, layout, a->set, data);
+	return 0;
+}
+
 /* A primary command buffer's inheritance info is ignored, and so may point
  * anywhere. It is followed only for a secondary one. */
 static uint64_t vkb_special_vkBeginCommandBuffer(uint64_t op, struct vkb_vkBeginCommandBuffer_args *a)
@@ -1109,13 +1279,16 @@ static void destroy_objects(void)
 		DESTROY(QueryPool, vkDestroyQueryPool, VkQueryPool)
 		DESTROY(DeviceMemory, vkFreeMemory, VkDeviceMemory)
 		DESTROY(SamplerYcbcrConversion, vkDestroySamplerYcbcrConversion, VkSamplerYcbcrConversion)
-		/* (no update templates or private data slots: the bridge does not
-		 * offer them - see the generator) */
+		DESTROY(DescriptorUpdateTemplate, vkDestroyDescriptorUpdateTemplate, VkDescriptorUpdateTemplate)
+		/* (no private data slots: the bridge does not offer them - see the
+		 * generator) */
 		default: continue;      /* not the device's: an instance, a queue */
 		}
 #undef DESTROY
 		free(e->memory);
 		e->memory = NULL;
+		free(e->tmpl);
+		e->tmpl = NULL;
 		e->host = 0;
 	}
 }
@@ -1130,6 +1303,8 @@ static void forget_device_entries(void)
 			continue;
 		free(e->memory);
 		e->memory = NULL;
+		free(e->tmpl);
+		e->tmpl = NULL;
 		e->host = 0;
 	}
 }
@@ -1161,8 +1336,10 @@ static void destroy_context(void)
 		s_instance = VK_NULL_HANDLE;
 	}
 	s_physical = VK_NULL_HANDLE;
-	for (uint32_t i = 1; i < s_entry_count; i++)
+	for (uint32_t i = 1; i < s_entry_count; i++) {
 		free(s_entries[i].memory);
+		free(s_entries[i].tmpl);
+	}
 	s_entry_count = 1;
 	s_free_count = 0;
 	/* the slots start again, so the handles do under another ordinal: one the

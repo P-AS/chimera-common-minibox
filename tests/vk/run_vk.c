@@ -211,6 +211,24 @@ int main(int argc, char **argv)
 		EXPECT((uint32_t)value(9) == direct.push_limit, "how many descriptors may be pushed differs through the bridge");
 		EXPECT((uint32_t)value(10) == direct.pushed_inside, "the pushed triangle's colour differs through the bridge");
 		EXPECT(value(11) == direct.pushed_hash, "the image drawn with a pushed uniform differs through the bridge");
+		/* Pushed through a template: the third colour, (0.5, 0, 0.5, 0.5) +
+		 * (0.25, 0.25, 0.5, 0.5) = (0.75, 0.25, 1, 1). The bridge must
+		 * translate the buffer's handle inside the template's data. */
+		if (direct.templ_inside) {
+			fprintf(stderr, "direct : template inside %08x image %016llx\n", direct.templ_inside,
+				(unsigned long long)direct.templ_hash);
+			fprintf(stderr, "bridged: template inside %08x image %016llx\n", (uint32_t)value(15),
+				(unsigned long long)value(16));
+			px = (const uint8_t *)&direct.templ_inside;
+			EXPECT((px[0] == 0xbf || px[0] == 0xc0) && (px[1] == 0x3f || px[1] == 0x40) &&
+			       px[2] == 0xff && px[3] == 0xff,
+			       "the direct run's templated triangle is %02x %02x %02x %02x, not the third uniform plus the push constant",
+			       px[0], px[1], px[2], px[3]);
+			EXPECT((uint32_t)value(15) == direct.templ_inside, "the triangle pushed through a template differs through the bridge");
+			EXPECT(value(16) == direct.templ_hash, "the image drawn with a template differs through the bridge");
+		} else {
+			fprintf(stderr, "NOT TESTED: this device has no VK_KHR_descriptor_update_template, so no template was used\n");
+		}
 	} else {
 		fprintf(stderr, "NOT TESTED: this device has no VK_KHR_push_descriptor, so nothing was pushed\n");
 		EXPECT(value(9) == 0, "the bridge offers push descriptors where the device has none");

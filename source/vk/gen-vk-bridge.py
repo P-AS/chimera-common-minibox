@@ -49,6 +49,8 @@ HOST_SPECIAL = {
     "vkFlushMappedMemoryRanges", "vkInvalidateMappedMemoryRanges",
     "vkBeginCommandBuffer", "vkAllocateCommandBuffers", "vkAllocateDescriptorSets",
     "vkDestroyCommandPool", "vkDestroyDescriptorPool", "vkResetDescriptorPool",
+    "vkCreateDescriptorUpdateTemplate", "vkDestroyDescriptorUpdateTemplate",
+    "vkUpdateDescriptorSetWithTemplate", "vkCmdPushDescriptorSetWithTemplate",
 }
 
 # Retired in vk-entry-points.txt (a "-" line keeps its opcode, so no other
@@ -60,7 +62,9 @@ HOST_SPECIAL = {
 # guest's handle counters as objects and the host process died inside it. A
 # renderer told NULL uses vkUpdateDescriptorSets, or stops in its own sandbox.
 # (vkCreate/DestroyDescriptorUpdateTemplate and the private data slots go with
-# them, and VK_EXT_private_data is not offered.)
+# them, and VK_EXT_private_data is not offered.) The template commands came
+# back at the end of the list, written by hand (vk-host.c): the host keeps each
+# template's entries and translates every handle in the data by them.
 
 # Commands that write every entry of their output array even when they fail
 # (VK_NULL_HANDLE for each one that was not made).

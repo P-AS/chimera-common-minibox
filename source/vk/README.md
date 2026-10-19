@@ -233,12 +233,31 @@ RPCS3 running Tekken 6, which died calling address 0 and then, with the
 guest half alone fixed, waited for ever on llvmpipe, runs on llvmpipe and on
 the GTX 1060.
 
-Four commands of extensions on the allow-list are still not in the list, so
-a renderer that asks for them is answered with nothing:
-`vkCmdSetPatchControlPointsEXT` and `vkCmdSetLogicOpEXT`
-(`VK_EXT_extended_dynamic_state2`), `vkCmdSetLineStipple`
-(`VK_EXT_line_rasterization`) and `vkCmdPushDescriptorSetWithTemplate`
-(`VK_KHR_push_descriptor`). No core here calls them.
+Four commands of extensions on the allow-list were not in the list, so a
+renderer that asked for them was answered with nothing: `vkCmdSetPatchControlPointsEXT`
+and `vkCmdSetLogicOpEXT` (`VK_EXT_extended_dynamic_state2`),
+`vkCmdSetLineStipple` (`VK_EXT_line_rasterization`) and
+`vkCmdPushDescriptorSetWithTemplate` (`VK_KHR_push_descriptor`). They are at
+the end of the list now (the owner's decision, 2026-10-19), and with the last
+the descriptor update templates came back: `vkCreateDescriptorUpdateTemplate`,
+`vkDestroyDescriptorUpdateTemplate` and `vkUpdateDescriptorSetWithTemplate`
+were retired because their data holds image views, samplers, buffers and
+buffer views at offsets only the template says, and the driver was handed
+the guest's handles. They are written by hand (`vk-host.c`): the host keeps
+each template's entries, and each use copies the data and translates every
+handle in it, as `vkUpdateDescriptorSets`'s arrays are. A template with an
+entry the host cannot translate (an acceleration structure) is refused when
+it is made. `VK_KHR_descriptor_update_template` is on the allow-list, for a
+renderer that asked for Vulkan 1.0. A core built with the longer list needs
+a Chimera at least as new.
+
+The test draws the pushed triangle once more, its uniform pushed through a
+template whose buffer sits eight bytes into the data, and compares the
+picture with the direct run's; and the commands with two names it compares
+take in the template commands and the three others, with their extensions
+on. On llvmpipe it passes, and with the host and the list as they were it
+fails: no picture, and the bridge answered nothing for six commands the
+driver has.
 
 Not yet tested: a secondary command buffer, a texture sampled, a compute
 pipeline, a sparse binding. Nothing runs the Windows test by itself: CI

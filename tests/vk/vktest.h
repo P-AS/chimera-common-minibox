@@ -20,6 +20,7 @@
 #pragma once
 
 #include <vulkan/vulkan_core.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 #include "triangle-spv.h"
@@ -42,6 +43,8 @@ struct vkt_result {
 	uint64_t pushed_hash;   /* every byte of that image */
 	uint32_t event_set;     /* 1: an event set by a command in the queue was then found set; 0: the device has no VK_KHR_synchronization2 */
 	uint32_t names_present; /* bit i: vkGetDeviceProcAddr answered either name of pair i (vkt_name_pairs) */
+	uint32_t templ_inside;  /* a pixel of the triangle drawn with its uniform pushed through a template; 0 = no templates */
+	uint64_t templ_hash;    /* every byte of that image */
 };
 
 /* Commands with two names each, an extension's and a version's. The device
@@ -55,6 +58,21 @@ static const char *const vkt_name_pairs[][2] = {
 	{"vkCmdCopyBuffer2KHR", "vkCmdCopyBuffer2"},
 	{"vkCmdSetCullModeEXT", "vkCmdSetCullMode"},
 	{"vkTrimCommandPoolKHR", "vkTrimCommandPool"},
+	/* the descriptor update templates, back in the bridge, and three
+	 * commands of offered extensions that were missing from it */
+	{"vkCreateDescriptorUpdateTemplateKHR", "vkCreateDescriptorUpdateTemplate"},
+	{"vkUpdateDescriptorSetWithTemplateKHR", "vkUpdateDescriptorSetWithTemplate"},
+	{"vkCmdPushDescriptorSetWithTemplateKHR", "vkCmdPushDescriptorSetWithTemplate"},
+	{"vkCmdSetLineStippleEXT", "vkCmdSetLineStipple"},
+	{"vkCmdSetPatchControlPointsEXT", "vkCmdSetPatchControlPointsEXT"},
+	{"vkCmdSetLogicOpEXT", "vkCmdSetLogicOpEXT"},
+};
+
+/* What a template's data looks like here: the buffer's handle after eight
+ * bytes of something else, at an offset only the template says. */
+struct vkt_templ_data {
+	uint64_t before;
+	VkDescriptorBufferInfo info;
 };
 
 #define VKT_SIDE 64
@@ -123,8 +141,11 @@ static void vkt_run(vkt_lookup get, struct vkt_result *out, int through_bridge)
 	static const char *const push_name = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
 	static VkExtensionProperties ext[512];
 	static const char *const sync2_name = VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME;
-	int has_props2 = 0, has_push = 0, has_sync2 = 0;
-	const char *dev_ext[2];
+	static const char *const templ_name = VK_KHR_DESCRIPTOR_UPDATE_TEMPLATE_EXTENSION_NAME;
+	static const char *const eds2_name = VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME;
+	static const char *const line_name = VK_EXT_LINE_RASTERIZATION_EXTENSION_NAME;
+	int has_props2 = 0, has_push = 0, has_sync2 = 0, has_templ = 0, has_eds2 = 0, has_line = 0;
+	const char *dev_ext[6];
 	uint32_t dev_ext_count = 0;
 	count_ext = 512;
 	r = VKT(vkEnumerateInstanceExtensionProperties)(NULL, &count_ext, ext);
@@ -185,7 +206,20 @@ static void vkt_run(vkt_lookup get, struct vkt_result *out, int through_bridge)
 	for (uint32_t i = 0; has_props2 && i < count_ext; i++) {
 		has_push |= strcmp(ext[i].extensionName, push_name) == 0;
 		has_sync2 |= strcmp(ext[i].extensionName, sync2_name) == 0;
+		has_eds2 |= strcmp(ext[i].extensionName, eds2_name) == 0;
+		has_line |= strcmp(ext[i].extensionName, line_name) == 0;
 	}
+	for (uint32_t i = 0; i < count_ext; i++)
+		has_templ |= strcmp(ext[i].extensionName, templ_name) == 0;
+	/* the template commands, and two extensions whose commands the bridge
+	 * did not have: with them on, the driver answers those commands, and the
+	 * bridge must too (vkt_name_pairs) */
+	if (has_templ)
+		dev_ext[dev_ext_count++] = templ_name;
+	if (has_eds2)
+		dev_ext[dev_ext_count++] = eds2_name;
+	if (has_line)
+		dev_ext[dev_ext_count++] = line_name;
 	if (has_push) {
 		/* how many may be pushed: a structure chained to the device's
 		 * properties, which the driver fills in where it lies */
@@ -570,6 +604,64 @@ static void vkt_run(vkt_lookup get, struct vkt_result *out, int through_bridge)
 		VKT_STEP(112, VKT(vkInvalidateMappedMemoryRanges)(dev, 1, back));
 		memcpy(&out->pushed_inside, (const uint8_t *)image_bytes + (8 * VKT_SIDE + 8) * 4, 4);
 		out->pushed_hash = vkt_hash(image_bytes, VKT_BYTES);
+
+		/* ---- and pushed through a template ----
+		 * The data a template reads holds the buffer's handle at an offset
+		 * only the template knows; through the bridge it is the guest's
+		 * handle until the host translates it by the template's entries.
+		 * Yet another colour, so the picture says this uniform was read. */
+		if (has_templ) {
+			PFN_vkCreateDescriptorUpdateTemplateKHR make_templ = (PFN_vkCreateDescriptorUpdateTemplateKHR)
+				VKT(vkGetDeviceProcAddr)(dev, "vkCreateDescriptorUpdateTemplateKHR");
+			PFN_vkDestroyDescriptorUpdateTemplateKHR drop_templ = (PFN_vkDestroyDescriptorUpdateTemplateKHR)
+				VKT(vkGetDeviceProcAddr)(dev, "vkDestroyDescriptorUpdateTemplateKHR");
+			PFN_vkCmdPushDescriptorSetWithTemplateKHR push_templ = (PFN_vkCmdPushDescriptorSetWithTemplateKHR)
+				VKT(vkGetDeviceProcAddr)(dev, "vkCmdPushDescriptorSetWithTemplateKHR");
+			VKT_NEED(130, make_templ && drop_templ && push_templ);
+			VkBuffer ubo3 = VK_NULL_HANDLE;
+			VkDeviceMemory ubo3_mem = VK_NULL_HANDLE;
+			void *ubo3_bytes = NULL;
+			VKT_STEP(131, vkt_buffer(get, dev, &mem, 256, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &ubo3, &ubo3_mem, &ubo3_bytes));
+			const float colour3[4] = { 0.5f, 0.0f, 0.5f, 0.5f };
+			memcpy(ubo3_bytes, colour3, sizeof colour3);
+			VkMappedMemoryRange written3 = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, .memory = ubo3_mem,
+			                                 .offset = 0, .size = VK_WHOLE_SIZE };
+			VKT_STEP(132, VKT(vkFlushMappedMemoryRanges)(dev, 1, &written3));
+			struct vkt_templ_data data = { 0x5555555555555555ull, { ubo3, 0, 16 } };
+			VkDescriptorUpdateTemplateEntry entry = { .dstBinding = 0, .dstArrayElement = 0, .descriptorCount = 1,
+				.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .offset = offsetof(struct vkt_templ_data, info),
+				.stride = sizeof(VkDescriptorBufferInfo) };
+			VkDescriptorUpdateTemplateCreateInfo tci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO,
+				.descriptorUpdateEntryCount = 1, .pDescriptorUpdateEntries = &entry,
+				.templateType = VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_PUSH_DESCRIPTORS_KHR,
+				.descriptorSetLayout = pushed_set_layout, .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+				.pipelineLayout = pushed_layout, .set = 0 };
+			VkDescriptorUpdateTemplate templ = VK_NULL_HANDLE;
+			VKT_STEP(133, make_templ(dev, &tci, NULL, &templ));
+			VkCommandBuffer templated = VK_NULL_HANDLE;
+			VKT_STEP(134, VKT(vkAllocateCommandBuffers)(dev, &cbai, &templated));
+			VKT_STEP(135, VKT(vkBeginCommandBuffer)(templated, &draw_begin));
+			VKT(vkCmdBeginRenderPass)(templated, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+			VKT(vkCmdBindPipeline)(templated, VK_PIPELINE_BIND_POINT_GRAPHICS, pushed_pipeline);
+			push_templ(templated, templ, pushed_layout, 0, &data);
+			VKT(vkCmdPushConstants)(templated, pushed_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof add, add);
+			VKT(vkCmdBindVertexBuffers)(templated, 0, 1, &vbo, &zero);
+			VKT(vkCmdDraw)(templated, 3, 1, 0, 0);
+			VKT(vkCmdEndRenderPass)(templated);
+			VKT(vkCmdCopyImageToBuffer)(templated, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf[0], 1, &region);
+			VKT_STEP(136, VKT(vkEndCommandBuffer)(templated));
+			VKT_STEP(137, VKT(vkResetFences)(dev, 1, &fence));
+			submit.pCommandBuffers = &templated;
+			VKT_STEP(138, VKT(vkQueueSubmit)(queue, 1, &submit, fence));
+			VKT_STEP(139, VKT(vkWaitForFences)(dev, 1, &fence, VK_TRUE, 10ull * 1000 * 1000 * 1000));
+			VKT_STEP(140, VKT(vkInvalidateMappedMemoryRanges)(dev, 1, back));
+			memcpy(&out->templ_inside, (const uint8_t *)image_bytes + (8 * VKT_SIDE + 8) * 4, 4);
+			out->templ_hash = vkt_hash(image_bytes, VKT_BYTES);
+			drop_templ(dev, templ, NULL);
+			VKT(vkUnmapMemory)(dev, ubo3_mem);
+			VKT(vkDestroyBuffer)(dev, ubo3, NULL);
+			VKT(vkFreeMemory)(dev, ubo3_mem, NULL);
+		}
 
 		VKT(vkDestroyPipeline)(dev, pushed_pipeline, NULL);
 		VKT(vkUnmapMemory)(dev, ubo2_mem);
