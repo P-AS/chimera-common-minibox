@@ -31,6 +31,25 @@ subdir('source/host')
 # ---------------------------------------------------------------------------
 build_guest_toolchain = not meson.is_cross_build()
 
+# The compiler guests are built with: one that makes ELF for the machine's CPU,
+# whatever the host's own objects are. By default the host's gcc; -Dguest_cc
+# names another (a cross gcc, for a host whose own compiler does not make ELF).
+waterbox_guest_cc = get_option('guest_cc')
+if build_guest_toolchain and waterbox_guest_cc == ''
+  waterbox_guest_cc = 'gcc'
+endif
+if build_guest_toolchain and not find_program(waterbox_guest_cc, required: false).found()
+  # the host still builds and its unit tests still run; a guest built
+  # elsewhere runs through it (tests/runner)
+  warning('no guest compiler (' + waterbox_guest_cc + '): the guest toolchain, the guests and their tests are skipped')
+  build_guest_toolchain = false
+endif
+# The cross tools beside a cross gcc: aarch64-elf-gcc -> aarch64-elf-ar.
+waterbox_guest_tool_prefix = ''
+if waterbox_guest_cc.endswith('-gcc')
+  waterbox_guest_tool_prefix = waterbox_guest_cc.substring(0, -3)
+endif
+
 if build_guest_toolchain
   waterbox_sysroot = meson.current_build_dir() / 'guest-sysroot'
   musl_src         = meson.current_source_dir() / 'extern' / 'musl'
@@ -71,6 +90,14 @@ if build_guest_toolchain
   endif
   musl_cflags = ' '.join(['-Werror', '-fvisibility=hidden'] + waterbox_cpu_flags + waterbox_common_flags)
 
+  # The wrapper (musl-gcc and its specs) is how everything compiles for the
+  # guest, so it is asked for by name: left to itself musl builds it only
+  # around a gcc that targets glibc, which a cross gcc does not.
+  musl_configure_tools = ['--enable-wrapper=gcc']
+  if waterbox_guest_tool_prefix != ''
+    musl_configure_tools += ['AR=' + waterbox_guest_tool_prefix + 'ar', 'RANLIB=' + waterbox_guest_tool_prefix + 'ranlib']
+  endif
+
   # Phase 1: configure musl out-of-tree. Writes config.mak + a Makefile symlink
   # into the build root (the custom_target cwd).
   musl_config = custom_target('musl-config',
@@ -84,8 +111,8 @@ if build_guest_toolchain
       '--libdir=' + waterbox_sysroot / 'lib',
       '--includedir=' + waterbox_sysroot / 'include',
       '--syslibdir=' + waterbox_sysroot / 'syslib',
-    ],
-    env: {'CC': 'gcc', 'CFLAGS': musl_cflags},
+    ] + musl_configure_tools,
+    env: {'CC': waterbox_guest_cc, 'CFLAGS': musl_cflags},
   )
 
   # Phase 2: build + install musl (reads config.mak from the same build root).
@@ -102,7 +129,7 @@ if build_guest_toolchain
     input: musl_config,
     output: 'musl-gcc',
     depend_files: musl_dep_files,
-    command: [find_program('make'), '-j', 'install'],
+    command: [find_program('gmake', 'make'), '-j', 'install'],
     console: true,
   )
 
@@ -125,6 +152,10 @@ if build_guest_toolchain
   # already owns. It is still fully meson-driven - no manual step, no script file.
   # -------------------------------------------------------------------------
   waterbox_cpp_guest = get_option('guest_cpp')
+  if waterbox_cpp_guest and waterbox_guest_cc != 'gcc'
+    # (the recipe below drives the host's own gcc and g++)
+    error('-Dguest_cpp builds with the host\'s gcc only, not ' + waterbox_guest_cc)
+  endif
   if waterbox_cpp_guest
     gcc_version = run_command('gcc', '-dumpfullversion', check: true).stdout().strip()
     cpp_dir = meson.current_build_dir() / 'cpp-toolchain'
