@@ -1376,14 +1376,14 @@ static int has_command(struct vkb_has_command_args *args)
 	return 1;
 }
 
-/* CHIMERA_VK_SETTLED=1: a question about how far the GPU has got - a fence,
- * an event, a semaphore's count, whether query results are there yet, or a
- * wait with a timeout short of forever - is answered as if the GPU had
- * finished everything already submitted: the device is waited on first, and
- * the wait itself then only looks. The answer then depends on what was
- * submitted and not on how fast the GPU is (analysis of 2026-10-18). Off
- * unless asked for: what it costs is being measured (each such question
- * waits for the whole device). s_settles counts the waits. */
+/* A question about how far the GPU has got - a fence, an event, a
+ * semaphore's count, whether query results are there yet, or a wait with a
+ * timeout short of forever - is answered as if the GPU had finished
+ * everything already submitted: the device is waited on first, and the wait
+ * itself then only looks. The answer then depends on what was submitted and
+ * not on how fast the GPU is (analysis of 2026-10-18). On for everyone since
+ * 2026-10-19 (the owner's decision, measured under 1% on a GTX 1060);
+ * CHIMERA_VK_SETTLED=0 turns it off. s_settles counts the waits. */
 static int s_settled = -1;
 static unsigned long s_settles;
 
@@ -1475,7 +1475,7 @@ static uintptr_t dispatch_one(uintptr_t op, uintptr_t a, uintptr_t b, uintptr_t 
 		s_work++;
 	if (s_settled < 0) {
 		const char *asked = getenv("CHIMERA_VK_SETTLED");
-		s_settled = asked && asked[0] && asked[0] != '0';
+		s_settled = !(asked && asked[0] == '0');
 	}
 	if (s_settled)
 		settle_before(op, (void *)a);

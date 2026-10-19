@@ -139,11 +139,12 @@ a call.
 A question about how far the GPU has got - a fence's or an event's status, a
 semaphore's count, whether query results are there yet, a wait with a
 timeout short of forever - gets an answer that depends on the GPU's speed,
-and a core can take a different path because of it. `CHIMERA_VK_SETTLED=1`
-waits for the whole device before each such question and turns a timed wait
-into a look, so the answer depends only on what was submitted. The first
-line of `CHIMERA_VK_STATS` says how many such waits there were. Off unless
-asked for. Measured 2026-10-18 on a GTX 1060: PCSX2 with a game, 900 frames,
+and a core can take a different path because of it. So the host half waits
+for the whole device before each such question and turns a timed wait into
+a look, and the answer depends only on what was submitted; on since
+2026-10-19, and `CHIMERA_VK_SETTLED=0` turns it off. The first line of
+`CHIMERA_VK_STATS` says how many such waits there were. Measured 2026-10-18
+on a GTX 1060: PCSX2 with a game, 900 frames,
 896 waits and 0.13 s more in the host half, the same time overall; RPCS3,
 600 frames, 1198 waits and 0.9% longer; Dolphin asked no such question. Two
 runs of each came out the same with it and without it, so on those
