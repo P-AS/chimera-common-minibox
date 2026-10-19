@@ -6,7 +6,7 @@ guest_wbx = custom_target('guest.wbx',
   input: 'guest.c',
   output: 'guest.wbx',
   command: [
-    waterbox_musl_gcc, waterbox_guest_cflags, waterbox_guest_ldflags,
+    waterbox_guest_link + [waterbox_musl_gcc], waterbox_guest_cflags, waterbox_guest_ldflags,
     '-std=c11', '-o', '@OUTPUT@', '@INPUT@', waterbox_emulibc_obj, '-lgcc',
   ],
 )
@@ -37,7 +37,7 @@ guest_kit0_wbx = custom_target('guest-kit0.wbx',
   input: 'guest.c',
   output: 'guest-kit0.wbx',
   command: [
-    waterbox_musl_gcc, waterbox_guest_cflags, waterbox_guest_ldflags,
+    waterbox_guest_link + [waterbox_musl_gcc], waterbox_guest_cflags, waterbox_guest_ldflags,
     '-std=c11', '-o', '@OUTPUT@', '@INPUT@', emulibc_kit0, '-lgcc',
   ],
 )
@@ -90,7 +90,7 @@ guest_v3_wbx = custom_target('guest-v3.wbx',
   input: 'guest-v3.c',
   output: 'guest-v3.wbx',
   command: [
-    waterbox_musl_gcc, waterbox_guest_cflags, waterbox_guest_ldflags,
+    waterbox_guest_link + [waterbox_musl_gcc], waterbox_guest_cflags, waterbox_guest_ldflags,
     '-std=c11', '-o', '@OUTPUT@', '@INPUT@', waterbox_emulibc_obj, '-lgcc',
   ],
 )

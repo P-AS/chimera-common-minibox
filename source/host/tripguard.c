@@ -1262,8 +1262,11 @@ void mb_tripguard_stop_signal_install(void) {
 	sigaction(MB_STOP_SIGNAL, &sa, &g_old_stop);
 }
 
-#ifdef MB_HAVE_FSBASE
+#if defined(MB_HAVE_FSBASE) && !defined(MB_TP_IN_MEMORY)
 /* Every OTHER handler in the process, run under the host's thread pointer.
+ * (x86-64 only: aarch64's guest thread pointer is a word of memory no host
+ * code reads, so another handler is safe as it is - and swapping that word
+ * from another thread would pull it out from under the guest's.)
  *
  * Guest code with thread locals runs with the guest's %fs installed (on
  * aarch64, TPIDR_EL0, which every guest has swapped in). A signal
@@ -1352,7 +1355,7 @@ static void initialize(void) {
 	if (sigaction(SIGILL, &other, &g_old_ill) != 0 || sigaction(SIGFPE, &other, &g_old_fpe) != 0) {
 		perror("miniBox sigaction"); abort();
 	}
-#ifdef MB_HAVE_FSBASE
+#if defined(MB_HAVE_FSBASE) && !defined(MB_TP_IN_MEMORY)
 	wrap_foreign_handlers();
 #endif
 }

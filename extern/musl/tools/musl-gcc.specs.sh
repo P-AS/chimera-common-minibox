@@ -6,13 +6,15 @@ arch=$4
 # no red zone (a dirty-tracking fault may land at any instruction). aarch64 has
 # no red zone to begin with; it needs no return-address signing (keyed per
 # process: a signed pointer in a savestate is a different pointer in the next
-# process), no outline atomics (they ask the CPU what it has), and arithmetic
-# that rounds as x86-64's does - no fused multiply-add, and a signed char.
+# process), no outline atomics (they ask the CPU what it has), arithmetic
+# that rounds as x86-64's does - no fused multiply-add, and a signed char -
+# and x18 left alone: it is the platform register, which Linux lends to code,
+# Windows keeps its TEB in and macOS zeroes when it likes.
 # aarch64's long double is IEEE quad in software, so libc itself calls
 # libgcc (__addtf3 and friends): libgcc goes around libc there, as gcc's own
 # link does. x86-64's long double is the x87's, and libc needs nothing of it.
 case "$arch" in
-waterbox_aarch64) cc1_machine="-mbranch-protection=none -mno-outline-atomics -ffp-contract=off -fsigned-char"
+waterbox_aarch64) cc1_machine="-mbranch-protection=none -mno-outline-atomics -ffp-contract=off -fsigned-char -ffixed-x18"
 	libgcc_spec="-lgcc" ;;
 waterbox) cc1_machine="-mno-red-zone"
 	libgcc_spec="" ;;
