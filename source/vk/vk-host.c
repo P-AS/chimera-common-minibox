@@ -553,63 +553,6 @@ static uint64_t vkb_special_vkEnumerateDeviceLayerProperties(uint64_t op, struct
 	return VK_SUCCESS;
 }
 
-/* Which of the machine's devices. One is offered: a renderer that chose
- * between several would choose differently on the next machine. */
-static VkPhysicalDevice choose_device(void)
-{
-	PFN_vkEnumeratePhysicalDevices enumerate =
-		(PFN_vkEnumeratePhysicalDevices)s_gipa(s_instance, "vkEnumeratePhysicalDevices");
-	PFN_vkGetPhysicalDeviceProperties props =
-		(PFN_vkGetPhysicalDeviceProperties)s_gipa(s_instance, "vkGetPhysicalDeviceProperties");
-	uint32_t n = 0;
-	if (!enumerate || !props || enumerate(s_instance, &n, NULL) < 0 || n == 0)
-		return VK_NULL_HANDLE;
-	VkPhysicalDevice *all = calloc(n, sizeof *all);
-	if (!all || enumerate(s_instance, &n, all) < 0) {
-		free(all);
-		return VK_NULL_HANDLE;
-	}
-	const char *want = getenv("CHIMERA_VK_DEVICE");
-	int best = -1, best_rank = -1;
-	for (uint32_t i = 0; i < n; i++) {
-		VkPhysicalDeviceProperties p;
-		props(all[i], &p);
-		int rank = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3 :
-		           p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2 :
-		           p.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU ? 1 : 0;
-		if (want && *want)
-			rank = strstr(p.deviceName, want) ? 4 : -1;
-		if (rank > best_rank) {
-			best = (int)i;
-			best_rank = rank;
-		}
-	}
-	VkPhysicalDevice chosen = best >= 0 ? all[best] : VK_NULL_HANDLE;
-	if (chosen) {
-		VkPhysicalDeviceProperties p;
-		props(chosen, &p);
-		snprintf(s_description, sizeof s_description, "%.180s (Vulkan %u.%u.%u, driver %u.%u.%u)", p.deviceName,
-			VK_API_VERSION_MAJOR(p.apiVersion), VK_API_VERSION_MINOR(p.apiVersion), VK_API_VERSION_PATCH(p.apiVersion),
-			VK_API_VERSION_MAJOR(p.driverVersion), VK_API_VERSION_MINOR(p.driverVersion),
-			VK_API_VERSION_PATCH(p.driverVersion));
-	}
-	free(all);
-	return chosen;
-}
-
-struct create_instance_call {
-	PFN_vkCreateInstance fn;
-	const VkInstanceCreateInfo *info;
-	VkInstance *instance;
-	VkResult r;
-};
-
-static void create_instance_there(void *p)
-{
-	struct create_instance_call *c = p;
-	c->r = c->fn(c->info, NULL, c->instance);
-}
-
 #ifdef __APPLE__
 static int has_instance_extension(const char *name)
 {
@@ -642,6 +585,69 @@ static int has_device_extension(VkPhysicalDevice phys, const char *name)
 	return found;
 }
 #endif
+
+/* Which of the machine's devices. One is offered: a renderer that chose
+ * between several would choose differently on the next machine. */
+static VkPhysicalDevice choose_device(void)
+{
+	PFN_vkEnumeratePhysicalDevices enumerate =
+		(PFN_vkEnumeratePhysicalDevices)s_gipa(s_instance, "vkEnumeratePhysicalDevices");
+	PFN_vkGetPhysicalDeviceProperties props =
+		(PFN_vkGetPhysicalDeviceProperties)s_gipa(s_instance, "vkGetPhysicalDeviceProperties");
+	uint32_t n = 0;
+	if (!enumerate || !props || enumerate(s_instance, &n, NULL) < 0 || n == 0)
+		return VK_NULL_HANDLE;
+	VkPhysicalDevice *all = calloc(n, sizeof *all);
+	if (!all || enumerate(s_instance, &n, all) < 0) {
+		free(all);
+		return VK_NULL_HANDLE;
+	}
+	const char *want = getenv("CHIMERA_VK_DEVICE");
+	int best = -1, best_rank = -1;
+	for (uint32_t i = 0; i < n; i++) {
+		VkPhysicalDeviceProperties p;
+		props(all[i], &p);
+		int rank = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 6 :
+		           p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 4 :
+		           p.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU ? 2 : 0;
+#ifdef __APPLE__
+		/* the same GPU can answer twice, through MoltenVK (a subset of
+		 * Vulkan) and through Mesa's KosmicKrisp (all of it): the whole wins */
+		if (!has_device_extension(all[i], "VK_KHR_portability_subset"))
+			rank++;
+#endif
+		if (want && *want)
+			rank = strstr(p.deviceName, want) ? 8 : -1;
+		if (rank > best_rank) {
+			best = (int)i;
+			best_rank = rank;
+		}
+	}
+	VkPhysicalDevice chosen = best >= 0 ? all[best] : VK_NULL_HANDLE;
+	if (chosen) {
+		VkPhysicalDeviceProperties p;
+		props(chosen, &p);
+		snprintf(s_description, sizeof s_description, "%.180s (Vulkan %u.%u.%u, driver %u.%u.%u)", p.deviceName,
+			VK_API_VERSION_MAJOR(p.apiVersion), VK_API_VERSION_MINOR(p.apiVersion), VK_API_VERSION_PATCH(p.apiVersion),
+			VK_API_VERSION_MAJOR(p.driverVersion), VK_API_VERSION_MINOR(p.driverVersion),
+			VK_API_VERSION_PATCH(p.driverVersion));
+	}
+	free(all);
+	return chosen;
+}
+
+struct create_instance_call {
+	PFN_vkCreateInstance fn;
+	const VkInstanceCreateInfo *info;
+	VkInstance *instance;
+	VkResult r;
+};
+
+static void create_instance_there(void *p)
+{
+	struct create_instance_call *c = p;
+	c->r = c->fn(c->info, NULL, c->instance);
+}
 
 static uint64_t vkb_special_vkCreateInstance(uint64_t op, struct vkb_vkCreateInstance_args *a)
 {
