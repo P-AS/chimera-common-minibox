@@ -136,6 +136,21 @@ ECL_EXPORT int AnswersAreWritten(void) {
  * the host's (2026-10-18). Read before anything of the function can touch
  * them. */
 ECL_EXPORT __attribute__((naked)) uint64_t CalleeSavedOnEntry(void) {
+#if defined(__aarch64__)
+	/* x19-x28 and the frame pointer (d8-d15 are EntryXmm's) */
+	__asm__ volatile(
+		"orr x0, x19, x20\n\t"
+		"orr x0, x0, x21\n\t"
+		"orr x0, x0, x22\n\t"
+		"orr x0, x0, x23\n\t"
+		"orr x0, x0, x24\n\t"
+		"orr x0, x0, x25\n\t"
+		"orr x0, x0, x26\n\t"
+		"orr x0, x0, x27\n\t"
+		"orr x0, x0, x28\n\t"
+		"orr x0, x0, x29\n\t"
+		"ret");
+#elif defined(__x86_64__)
 	__asm__ volatile(
 		"movq %rbx, %rax\n\t"
 		"orq %rbp, %rax\n\t"
@@ -144,6 +159,9 @@ ECL_EXPORT __attribute__((naked)) uint64_t CalleeSavedOnEntry(void) {
 		"orq %r14, %rax\n\t"
 		"orq %r15, %rax\n\t"
 		"ret");
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 }
 
 /* A length that is not a whole number of pages is rounded up, as the kernel
@@ -160,11 +178,13 @@ ECL_EXPORT int UnalignedLengthsRoundUp(void) {
 	return 1;
 }
 
+#if defined(__x86_64__)   /* aarch64 has no direction flag */
 /* Returns with the direction flag set, which no correct function does: the
  * host must not run on with it (2026-10-18). */
 ECL_EXPORT __attribute__((naked)) int ReturnsBackwards(void) {
 	__asm__ volatile("std\n\tmovl $1, %eax\n\tret");
 }
+#endif
 
 /* A cancellable call keeps its fourth argument. With pthread_cancel linked,
  * musl makes such calls through __syscall_cp_asm, which put the fourth in r10,
@@ -184,11 +204,20 @@ ECL_EXPORT int CancellableCallKeepsItsArguments(void) {
 
 /* The floating-point control words are the guest's own (mb_context,
  * 2026-10-18): what it sees on entry, and that what it sets survives an
- * exported call, a syscall and a host callback. Read as (fcw << 32) | mxcsr. */
+ * exported call, a syscall and a host callback. Read as (fcw << 32) | mxcsr;
+ * on aarch64 FPCR in the MXCSR place and 0 for the x87 word. */
 static uint64_t fpu_read(void) {
+#if defined(__aarch64__)
+	uint64_t v;
+	__asm__ volatile("mrs %0, fpcr" : "=r"(v));
+	return (uint32_t)v;
+#elif defined(__x86_64__)
 	uint16_t cw; uint32_t mx;
 	__asm__ volatile("fnstcw %0\n\tstmxcsr %1" : "=m"(cw), "=m"(mx));
 	return ((uint64_t)cw << 32) | mx;
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 }
 ECL_EXPORT uint64_t FpuSeen(void) { return fpu_read(); }
 /* what the guest's start-up code (its constructors) ran with */
@@ -196,8 +225,15 @@ static uint64_t g_fpu_at_start;
 __attribute__((constructor)) static void fpu_at_start(void) { g_fpu_at_start = fpu_read(); }
 ECL_EXPORT uint64_t FpuAtStart(void) { return g_fpu_at_start; }
 ECL_EXPORT void FpuSet(uint32_t fcw, uint32_t mxcsr) {
+#if defined(__aarch64__)
+	(void)fcw;
+	__asm__ volatile("msr fpcr, %0" : : "r"((uint64_t)mxcsr));
+#elif defined(__x86_64__)
 	const uint16_t cw = (uint16_t)fcw;
 	__asm__ volatile("fldcw %0\n\tldmxcsr %1" : : "m"(cw), "m"(mxcsr));
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 }
 ECL_EXPORT uint64_t FpuAfterSyscall(void) { (void)getpid(); return fpu_read(); }
 ECL_EXPORT uint64_t FpuAfterCallback(void) { if (g_log_cb) g_log_cb(0); return fpu_read(); }

@@ -16,9 +16,16 @@
  *
  * The x86-64 blob finds the running context through gs:0x18, a per-host-thread
  * block; aarch64 has no free register for that, so the context lives in one
- * word at MB_INTEROP_SLOT (MB_ORG + 0x10000, its own page, read-write),
- * written on every entry. One machine is entered at a time - the block's
- * address is fixed - so one word per process is all there is to know.
+ * word at MB_INTEROP_SLOT (MB_ORG + 0x10000, its own page, read-write). As
+ * gs:0x18 is, it is written on every way into guest code and cleared on every
+ * way out (a system call and a callback included), so a fault handler can
+ * tell a thread inside a guest call from one in host code (tripguard.c). One
+ * machine is entered at a time - the block's address is fixed - so one word
+ * per process is all there is to know.
+ *
+ * A callback runs with the host's floating-point control register, as the
+ * x86-64 wrappers (context.c) give it the host's words: the guest's FPCR is
+ * kept in the context on the way out and loaded again on the way back.
  *
  * What the blob does NOT do is touch the guest's thread pointer (the word at
  * MB_TP_SLOT): as on x86-64, host C and mb_guarded_call keep it.
@@ -50,12 +57,9 @@
 #define CTX_DISPATCH      0x028
 #define CTX_HOST_PTR      0x030
 #define CTX_EXTCALL       0x038
+#define CTX_GUEST_MXCSR   0x258   /* FPCR, on aarch64 */
+#define CTX_HOST_MXCSR    0x25c
 
-/* x = MB_INTEROP_SLOT (0x35f00010000) */
-.macro slot_addr x
-	movz \x, #0x0001, lsl #16
-	movk \x, #0x035f, lsl #32
-.endm
 
 /* everything a guest could read back but x0 */
 .macro zero_scratch
@@ -125,8 +129,9 @@ MB_SYM(mb_interop_bin):
 /* ---- 0x080 guest_syscall ---- */
 	.org 0x80
 	stp x29, x30, [sp, #-16]!
-	slot_addr x16
-	ldr x16, [x16]
+	interop_slot_addr x17
+	ldr x16, [x17]
+	str xzr, [x17]
 	mov x17, sp
 	str x17, [x16, #CTX_GUEST_RSP]
 	ldr x17, [x16, #CTX_HOST_RSP]
@@ -138,6 +143,8 @@ MB_SYM(mb_interop_bin):
 	ldr x17, [x16, #CTX_DISPATCH]
 	blr x17
 	ldr x16, [sp], #16
+	interop_slot_addr x17
+	str x16, [x17]
 	/* the guest stack to return to: guest_rsp, which a thread switch in
 	 * the dispatcher may have pointed at another thread's */
 	ldr x17, [x16, #CTX_GUEST_RSP]
@@ -169,7 +176,7 @@ call_guest_impl:
 	stp d10, d11, [sp, #-16]!
 	stp d12, d13, [sp, #-16]!
 	stp d14, d15, [sp, #-16]!
-	slot_addr x11
+	interop_slot_addr x11
 	str x9, [x11]
 	mov x11, sp
 	str x11, [x9, #CTX_HOST_RSP]
@@ -191,8 +198,9 @@ call_guest_impl:
 	bl zero_vectors
 	blr x10
 	/* back from the guest: x0 is its answer */
-	slot_addr x16
-	ldr x16, [x16]
+	interop_slot_addr x17
+	ldr x16, [x17]
+	str xzr, [x17]
 	mov x17, sp
 	str x17, [x16, #CTX_GUEST_RSP]
 	ldr x17, [x16, #CTX_HOST_RSP]
@@ -226,17 +234,26 @@ call_guest_impl:
 	.org 0x700
 extcall_common:
 	stp x29, x30, [sp, #-16]!
-	slot_addr x16
-	ldr x16, [x16]
+	interop_slot_addr x17
+	ldr x16, [x17]
+	str xzr, [x17]
 	mov x17, sp
 	str x17, [x16, #CTX_GUEST_RSP]
 	ldr x17, [x16, #CTX_HOST_RSP]
 	mov sp, x17
 	str x16, [sp, #-16]!
+	mrs x17, fpcr
+	str w17, [x16, #CTX_GUEST_MXCSR]
+	ldr w17, [x16, #CTX_HOST_MXCSR]
+	msr fpcr, x17
 	add x17, x16, #CTX_EXTCALL
 	ldr x17, [x17, x9, lsl #3]
 	blr x17
 	ldr x16, [sp], #16
+	ldr w17, [x16, #CTX_GUEST_MXCSR]
+	msr fpcr, x17
+	interop_slot_addr x17
+	str x16, [x17]
 	ldr x17, [x16, #CTX_GUEST_RSP]
 	mov sp, x17
 	ldp x29, x30, [sp], #16

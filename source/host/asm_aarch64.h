@@ -20,6 +20,13 @@
 #define MB_NOTE_GNU_STACK    .section .note.GNU-stack,"",%progbits
 #endif
 
+/* x = MB_INTEROP_SLOT (0x35f00010000): the context of the guest call this
+ * thread is in, 0 while it runs host code (interop_aarch64.S) */
+.macro interop_slot_addr x
+	movz \x, #0x0001, lsl #16
+	movk \x, #0x035f, lsl #32
+.endm
+
 /* x = MB_TP_SLOT (0x36ef0000000): the guest's thread pointer, a word of
  * memory on aarch64 (minibox_internal.h) */
 .macro tp_slot_addr x
