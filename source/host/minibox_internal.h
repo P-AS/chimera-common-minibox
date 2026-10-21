@@ -686,20 +686,31 @@ extern uintptr_t mb_early_tp;
 void      mb_context_init(mb_context *c, uintptr_t guest_rsp, uintptr_t guest_rsp_alt, mb_syscall_cb dispatch);
 void      mb_prepare_thread(void);              /* install gs base once per host thread */
 #ifndef _WIN32
+#define MB_HIDDEN __attribute__((visibility("hidden")))
+/* the trampolines that run the guest's fault handler on the faulting thread's
+ * own stack (guarded.S, guarded_aarch64.S; tripguard.c) */
+MB_HIDDEN void mb_fault_tramp_guest(void), mb_fault_tramp_guest_end(void);
+MB_HIDDEN void mb_fault_tramp_host(void), mb_fault_tramp_host_end(void);
+#if defined(__x86_64__)
 /* this host thread's block at the gs base (context.c), and the words in it
- * that hand a fault to the trampoline that runs the guest's fault handler on
- * the faulting thread's own stack (guarded.S, tripguard.c) */
+ * that hand a fault to the trampoline */
 uintptr_t *mb_thread_block(void);
 #define MB_TIB_FAULT_FN       4   /* the function to call (guest ABI) */
 #define MB_TIB_FAULT_RIP      5   /* the interrupted rip, rdi and rsi */
 #define MB_TIB_FAULT_RDI      6
 #define MB_TIB_FAULT_RSI      7
 #define MB_TIB_FAULT_DECLINED 8   /* the address the handler did not claim */
-#define MB_HIDDEN __attribute__((visibility("hidden")))
-MB_HIDDEN void mb_fault_tramp_guest(void), mb_fault_tramp_guest_end(void);
-MB_HIDDEN void mb_fault_tramp_host(void), mb_fault_tramp_host_end(void);
 /* what the trampoline saves the vector state with (tripguard.c) */
 MB_HIDDEN extern uint64_t mb_xsave_size, mb_xsave_mask;
+#elif defined(__aarch64__)
+/* where each trampoline's udf is: the SIGILL that puts the registers back */
+MB_HIDDEN void mb_fault_tramp_guest_resume(void), mb_fault_tramp_host_resume(void);
+#define MB_FAULT_RECORD_WORDS 34   /* x0-x30, sp, pc, pstate */
+#define MB_FAULT_TRAMP_FRAME  816  /* the trampoline's own frame (guarded_aarch64.S) */
+#define MB_FAULT_TRAMP_ADDR   36   /* its word that holds the fault's address */
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 #endif
 uintptr_t mb_call_guest_simple(uintptr_t entry, mb_context *c);
 uintptr_t mb_get_callback_ptr(uintptr_t slot); /* fixed extcall thunk address */

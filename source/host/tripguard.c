@@ -31,7 +31,7 @@ static int g_nblocks = 0;
  * (guarded.S, Linux) is the guest's too: it runs on the guest's stack with the
  * guest's %fs, and a fault in it is one the guest took. */
 static bool in_guest_tramp(uintptr_t rip) {
-#if !defined(_WIN32) && defined(__x86_64__)
+#ifndef _WIN32
 	return rip >= (uintptr_t)&mb_fault_tramp_guest && rip < (uintptr_t)&mb_fault_tramp_guest_end;
 #else
 	(void)rip;
@@ -56,7 +56,9 @@ static uintptr_t gs_context_slot(void) {
 #ifdef _WIN32
 	return (uintptr_t)__readgsqword(0x18);   /* the TEB's SubSystemTib */
 #elif defined(__aarch64__)
-	return 0;   /* the aarch64 blob's slot is not cleared on the way out yet */
+	/* no gs: the aarch64 blob's one word, set and cleared the same way
+	 * (interop_aarch64.S), mapped by the time a machine exists */
+	return *(volatile const uintptr_t *)MB_INTEROP_SLOT;
 #else
 	uintptr_t base = 0;
 	if (syscall(SYS_arch_prctl, 0x1004 /* ARCH_GET_GS */, &base) != 0 || base == 0) return 0;
@@ -922,16 +924,18 @@ static void sigsafe_report_nested(uintptr_t inner_fault, uintptr_t inner_rip) {
 	(void)ignored;
 }
 
+#if defined(__x86_64__)
 /* What the fault trampoline (guarded.S) saves the vector state with: xsave's
  * area for every feature the OS turned on, or fxsave's 512 bytes without it.
  * AMX's tile data is left out of the mask: Linux makes it trap on first use,
  * and code that never asked for it has none to keep. Set at initialize. */
 MB_HIDDEN uint64_t mb_xsave_size = 512;
 MB_HIDDEN uint64_t mb_xsave_mask = 0;
+#endif
 
 static void xsave_measure(void) {
 #if defined(__aarch64__)
-	return;   /* no xsave: the aarch64 path has no trampoline yet (send_to_guest) */
+	return;   /* the aarch64 trampoline saves q0-q31: a fixed size */
 #elif defined(__x86_64__)
 	uint32_t a, b, c, d;
 	__asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
@@ -973,12 +977,41 @@ static bool guest_writable(uintptr_t addr) {
  *
  * A handler that answers 0 leaves the address in the gs block, and the retry
  * of the instruction finds it there: an unhandled fault, as with no handler.
- * True when the thread was pointed at the trampoline. */
+ * True when the thread was pointed at the trampoline.
+ *
+ * aarch64: the same, with the interrupted registers in a record of this
+ * thread's (the trampoline copies it to its frame first thing) and the
+ * declined address in a thread local; the trampoline ends in a udf that
+ * fault_tramp_resume answers. */
+#if defined(__aarch64__)
+static __thread uintptr_t g_fault_record[MB_FAULT_RECORD_WORDS];
+static __thread uintptr_t g_fault_declined;
+#endif
 static bool send_to_guest(ucontext_t *uc, uintptr_t addr, bool write, bool from_host_code) {
 #if defined(__aarch64__)
-	/* No trampoline for aarch64 yet: the guest's handler is not called. */
-	(void)uc; (void)addr; (void)write; (void)from_host_code;
-	return false;
+	const uintptr_t declined = g_fault_declined;
+	g_fault_declined = 0;
+	if (declined == addr) return false;
+	if (!g_guest_fault || !guest_protected(addr, write)) return false;
+	const mb_guest_fault_fn fn = from_host_code && g_guest_fault_entered ? g_guest_fault_entered : g_guest_fault;
+	const uintptr_t sp = (uintptr_t)UC_SP(uc);
+	const uintptr_t top = (sp - 128) & ~(uintptr_t)15;
+	if (!from_host_code) {
+		const uintptr_t frame = MB_FAULT_TRAMP_FRAME + 256;
+		for (uintptr_t a = (top - frame) & ~(uintptr_t)MB_PAGEMASK; a < top; a += MB_PAGESIZE)
+			if (!guest_writable(a)) return false;
+	}
+	for (int i = 0; i < 31; i++) g_fault_record[i] = (uintptr_t)uc->uc_mcontext.regs[i];
+	g_fault_record[31] = sp;
+	g_fault_record[32] = (uintptr_t)uc->uc_mcontext.pc;
+	g_fault_record[33] = (uintptr_t)uc->uc_mcontext.pstate;
+	UC_SP(uc) = top;
+	UC_PC(uc) = (uintptr_t)(from_host_code ? &mb_fault_tramp_host : &mb_fault_tramp_guest);
+	uc->uc_mcontext.regs[0] = addr;
+	uc->uc_mcontext.regs[1] = write ? 1 : 0;
+	uc->uc_mcontext.regs[2] = (uintptr_t)fn;
+	uc->uc_mcontext.regs[3] = (uintptr_t)g_fault_record;
+	return true;
 #elif defined(__x86_64__)
 	uintptr_t *tib = mb_thread_block();
 	const uintptr_t declined = tib[MB_TIB_FAULT_DECLINED];
@@ -1145,18 +1178,43 @@ void mb_tripguard_ensure_altstack(void) {
 
 /* An illegal instruction (ud2) or an integer division by zero in guest code is
  * the guest dying too. Anyone else's - a runtime that turns SIGFPE into a
- * managed exception, say - goes to whoever had the signal before. */
-static struct sigaction g_old_ill, g_old_fpe;
+ * managed exception, say - goes to whoever had the signal before. On aarch64
+ * a bus error too: a jump to an address that is not a multiple of 4 (a wild
+ * call) raises SIGBUS there, where x86-64 faults with SIGSEGV. */
+static struct sigaction g_old_ill, g_old_fpe, g_old_bus;
+
+#if defined(__aarch64__)
+/* The udf a fault trampoline ends with (guarded_aarch64.S): the guest's
+ * handler has run and the vector state is back. Every general register, sp,
+ * pc and the flags come back from the record on the trampoline's frame, and
+ * the instruction that faulted runs again. A handler that answered 0 (x0
+ * here) leaves the address declined: the retry is an unhandled fault. */
+static bool fault_tramp_resume(ucontext_t *uc) {
+	const uintptr_t pc = (uintptr_t)UC_PC(uc);
+	if (pc != (uintptr_t)&mb_fault_tramp_guest_resume && pc != (uintptr_t)&mb_fault_tramp_host_resume)
+		return false;
+	const uintptr_t *rec = (const uintptr_t *)(uintptr_t)UC_SP(uc);
+	if ((uint32_t)uc->uc_mcontext.regs[0] == 0) g_fault_declined = rec[MB_FAULT_TRAMP_ADDR];
+	for (int i = 0; i < 31; i++) uc->uc_mcontext.regs[i] = rec[i];
+	uc->uc_mcontext.sp = rec[31];
+	uc->uc_mcontext.pc = rec[32];
+	uc->uc_mcontext.pstate = rec[33];
+	return true;
+}
+#endif
 
 static void handler_other(int sig, siginfo_t *info, void *ucontext) {
 	ucontext_t *uc = (ucontext_t *)ucontext;
+#if defined(__aarch64__)
+	if (sig == SIGILL && fault_tramp_resume(uc)) return;
+#endif
 	const uintptr_t rip = (uintptr_t)UC_PC(uc);
 	if (guest_can_die_here(rip)) {
 #ifdef MB_HAVE_FSBASE
 		/* host C from here on, which needs the host's %fs */
 		if (mb_guest_ctx->fs_swap && mb_guest_ctx->host_fs) mb_wrfsbase(mb_guest_ctx->host_fs);
 #endif
-		mb_diag_banner(sig == SIGILL ? "the guest ran an illegal instruction" : "the guest divided by zero");
+		mb_diag_banner(sig == SIGILL ? "the guest ran an illegal instruction" : sig == SIGBUS ? "a bus error in guest code" : "the guest divided by zero");
 		say_uc_regs(uc);
 #if defined(__aarch64__)
 		/* musl's a_crash() on aarch64 (arch/waterbox_aarch64): udf #0xf4, the
@@ -1172,6 +1230,9 @@ static void handler_other(int sig, siginfo_t *info, void *ucontext) {
 				"the core stopped itself after finding its own memory corrupt (a halt at %p)", (void *)rip)
 			: sig == SIGILL
 			? mb_host_guest_death_in_handler(mb_guest_ctx, "the core ran an illegal instruction at %p", (void *)rip)
+			: sig == SIGBUS
+			? mb_host_guest_death_in_handler(mb_guest_ctx, "the core crashed: a bus error at address %p (at %p)",
+				info->si_addr, (void *)rip)
 			: mb_host_guest_death_in_handler(mb_guest_ctx, "the core divided by zero at %p", (void *)rip);
 		if (escapable) {
 				UC_SP(uc) = mb_guest_ctx->esc_rsp;
@@ -1180,7 +1241,7 @@ static void handler_other(int sig, siginfo_t *info, void *ucontext) {
 			return;
 		}
 	}
-	const struct sigaction *old = sig == SIGILL ? &g_old_ill : &g_old_fpe;
+	const struct sigaction *old = sig == SIGILL ? &g_old_ill : sig == SIGBUS ? &g_old_bus : &g_old_fpe;
 	if (old->sa_flags & SA_SIGINFO) old->sa_sigaction(sig, info, ucontext);
 	else if (old->sa_handler == SIG_DFL || old->sa_handler == SIG_IGN) signal(sig, SIG_DFL);   /* the instruction runs again and the default takes it */
 	else old->sa_handler(sig);
@@ -1355,6 +1416,9 @@ static void initialize(void) {
 	if (sigaction(SIGILL, &other, &g_old_ill) != 0 || sigaction(SIGFPE, &other, &g_old_fpe) != 0) {
 		perror("miniBox sigaction"); abort();
 	}
+#if defined(__aarch64__)
+	if (sigaction(SIGBUS, &other, &g_old_bus) != 0) { perror("miniBox sigaction"); abort(); }
+#endif
 #if defined(MB_HAVE_FSBASE) && !defined(MB_TP_IN_MEMORY)
 	wrap_foreign_handlers();
 #endif

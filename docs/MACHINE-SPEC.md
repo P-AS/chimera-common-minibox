@@ -758,8 +758,26 @@ Windows), so the aarch64 machine keeps clear of what those OSes disagree on:
 - **Exported calls, system calls and callbacks** follow AAPCS64: the guest
   calls `guest_syscall` (0x35f00000080) with `blr`, the number in x8 and the
   arguments in x0-x5; on entering an export every vector register reads zero,
-  and after a syscall or a callback every scratch register but x0 does
-  (interop_aarch64.S).
+  and so do x19-x28 and the frame pointer, and after a syscall or a callback
+  every scratch register but x0 does (interop_aarch64.S, guarded_aarch64.S).
+- **The floating-point control words** (section 9) are FPCR alone, which a
+  guest starts at 0 (round to nearest, no flush-to-zero, no default NaN: what
+  Linux gives a process and musl assumes). It is loaded and kept at the same
+  boundaries as x86-64's words, and GuestFpuState1 carries it in the MXCSR
+  field, with 0 for the x87 word. FPSR, which holds the cumulative exception
+  flags MXCSR keeps on x86-64, is not swapped: a guest that reads its flags
+  after a syscall or a callback may find the host's added.
+- **The guest's fault handler** runs on the faulting thread's stack, as on
+  x86-64, from a trampoline in the host (guarded_aarch64.S). aarch64 cannot
+  branch back to the faulting instruction without a register to hold its
+  address, so the trampoline ends in a `udf` whose SIGILL the host answers by
+  putting every general register, sp, the flags and the pc back; the vector
+  registers, FPSR and FPCR the trampoline puts back itself.
+- **Faults.** A jump to an address that is not a multiple of 4 is a SIGBUS on
+  aarch64 (a SIGSEGV on x86-64); in guest code it is the guest's death like
+  any other crash. The interop context word (0x35f00010000, x86-64's gs:0x18)
+  is set while a thread is in a guest call and cleared while it runs host
+  code, so a fault outside the guest's memory is judged the same way.
 - **Pages.** The machine's page is 4 KiB here too. A host whose pages are
   larger (16 KiB: macOS, Asahi Linux; 64 KiB) protects whole host pages, so a
   guest that exports GuestFaultHandler is refused there (see "Guest fault
