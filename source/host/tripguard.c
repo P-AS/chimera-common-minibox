@@ -1396,6 +1396,29 @@ static void wrap_foreign_handlers(void) {
 		if (sigaction(sig, &sa, NULL) != 0) g_foreign[sig].sa_handler = SIG_DFL;
 	}
 }
+#elif defined(MB_TP_IN_MEMORY)
+/* aarch64: the handlers already installed when miniBox starts - the
+ * runtime's - need no thread pointer put back (the guest's is a word of
+ * memory no host code reads), but they need SA_ONSTACK all the same, for the
+ * reason above: without it the kernel builds the handler's frame on the
+ * guest's stack. Mono's suspend handler waits there in sigsuspend, and its
+ * restart signal's frame, further down the guest's stack, can reach a clean
+ * tracked page and kill the process. So each is installed again as it was,
+ * with SA_ONSTACK added; the handler itself is not wrapped. */
+static void foreign_handlers_onstack(void) {
+	for (int sig = 1; sig < NSIG; sig++) {
+		if (sig == SIGKILL || sig == SIGSTOP || sig == SIGSEGV || sig == SIGBUS
+		    || sig == SIGILL || sig == SIGFPE) continue;
+		struct sigaction old;
+		if (sigaction(sig, NULL, &old) != 0) continue;
+		const bool has_handler = (old.sa_flags & SA_SIGINFO)
+			? old.sa_sigaction != NULL
+			: old.sa_handler != SIG_DFL && old.sa_handler != SIG_IGN;
+		if (!has_handler || (old.sa_flags & SA_ONSTACK)) continue;
+		old.sa_flags |= SA_ONSTACK;
+		(void)sigaction(sig, &old, NULL);
+	}
+}
 #endif
 
 static void initialize(void) {
@@ -1421,6 +1444,8 @@ static void initialize(void) {
 #endif
 #if defined(MB_HAVE_FSBASE) && !defined(MB_TP_IN_MEMORY)
 	wrap_foreign_handlers();
+#elif defined(MB_TP_IN_MEMORY)
+	foreign_handlers_onstack();
 #endif
 }
 
