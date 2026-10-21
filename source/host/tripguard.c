@@ -1078,9 +1078,33 @@ static void handler_other(int sig, siginfo_t *info, void *ucontext) {
  * left for the next system call (host.c) or the next signal. A signal that is
  * not a stop goes to whoever had it before. */
 static struct sigaction g_old_stop;
+/* No stack protector on this frame either: the check reads %fs:0x28, and the
+ * signal can come in while the guest's %fs is in. */
+__attribute__((no_stack_protector))
 static void handler_stop(int sig, siginfo_t *info, void *ucontext) {
 	ucontext_t *uc = (ucontext_t *)ucontext;
 	const uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+#ifdef MB_HAVE_FSBASE
+	/* The stop usually comes in while the thread runs guest code, and with a
+	 * guest that keeps its own %fs (fs_swap: xemu's does) the guest's thread
+	 * pointer is still in. Host C reads its own thread's variables through
+	 * %fs - g_fault_depth below, and the C library's in everything the death
+	 * path calls - so the host's goes back first, as handler() does, and the
+	 * guest's on the way out to the guest. Read through the guest's, the
+	 * C library's allocator took the guest's memory for its own, and a stop
+	 * of xemu on Linux crashed in realloc instead of stopping (chimera#330).
+	 * Only for a guest pointer (the rip in guest code, or one of the guest's
+	 * thread pointers): the frontend's own threads get this signal never,
+	 * but a stray one is left exactly as it came. */
+	const uintptr_t tp_now = mb_fs_swap && mb_guest_ctx ? mb_rdfsbase() : 0;
+	const bool guest_tp = mb_fs_swap && mb_guest_ctx && mb_guest_ctx->fs_swap && mb_guest_ctx->host_fs
+		&& tp_now != mb_guest_ctx->host_fs
+		&& (rip_in_guest(rip) || tp_now == mb_guest_ctx->thread_area || (mb_early_tp && tp_now == mb_early_tp));
+	if (guest_tp) mb_wrfsbase(mb_guest_ctx->host_fs);
+#else
+	const bool guest_tp = false;
+	const uintptr_t tp_now = 0;
+#endif
 	if (mb_guest_ctx != NULL && mb_guest_ctx->stop_pending && g_fault_depth == 0
 	    && guest_can_die_here(rip) && mb_stop_due(mb_guest_ctx)) {
 #ifdef MB_HAVE_FSBASE
@@ -1094,12 +1118,21 @@ static void handler_stop(int sig, siginfo_t *info, void *ucontext) {
 		leave_every_handler_frame(uc);
 		return;
 	}
-	if (mb_guest_ctx != NULL && mb_guest_ctx->stop_pending) return;   /* ours: asked again later */
+	if (mb_guest_ctx != NULL && mb_guest_ctx->stop_pending) {   /* ours: asked again later */
+#ifdef MB_HAVE_FSBASE
+		if (guest_tp) mb_wrfsbase(tp_now);
+#endif
+		return;
+	}
 	if (g_old_stop.sa_flags & SA_SIGINFO) {
 		if (g_old_stop.sa_sigaction) g_old_stop.sa_sigaction(sig, info, ucontext);
 	} else if (g_old_stop.sa_handler != SIG_DFL && g_old_stop.sa_handler != SIG_IGN) {
 		g_old_stop.sa_handler(sig);
 	}
+#ifdef MB_HAVE_FSBASE
+	if (guest_tp) mb_wrfsbase(tp_now);
+#endif
+	(void)tp_now;
 }
 
 void mb_tripguard_stop_signal_install(void) {

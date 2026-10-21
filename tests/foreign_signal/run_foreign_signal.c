@@ -58,6 +58,22 @@ static void *sender(void *arg) {
 
 typedef int (*init_fn)(void);
 typedef uint64_t (*spin_fn)(uint64_t);
+/* the stop of the second part, asked from another thread as the frontend's
+ * watchdog asks it: every 50 ms from 200 ms on, until the call has come back */
+static atomic_int g_stop_done;
+static void *stop_sender(void *arg) {
+	mb_host *h = (mb_host *)arg;
+	mb_return r;
+	struct timespec ts = { 0, 200000000L };
+	nanosleep(&ts, NULL);
+	for (int i = 0; i < 200 && !atomic_load(&g_stop_done); i++) {
+		wbx_stop_guest(h, "stopped by the foreign-signal test", &r);
+		struct timespec t50 = { 0, 50000000L };
+		nanosleep(&t50, NULL);
+	}
+	return NULL;
+}
+
 static uintptr_t proc(mb_host *h, const char *n){mb_return r;wbx_get_proc_addr(h,n,&r);if(r.error_message[0]){fprintf(stderr,"proc %s:%s\n",n,r.error_message);exit(2);}return r.data;}
 
 int main(int argc, char **argv) {
@@ -92,6 +108,35 @@ int main(int argc, char **argv) {
 	for (int i = 0; i < 4 && fails == 0; i++) spun = Spin(n);
 	atomic_store(&g_done, 1);
 	pthread_join(s, NULL);
+
+	/* The second part (chimera#330): a stop (wbx_stop_guest) of this guest,
+	 * which keeps its own %fs, while it spins. The stop's handler runs host C,
+	 * and host C reads its own thread's variables through %fs, so the host's
+	 * has to go back first. Read through the guest's, a stop of xemu crashed
+	 * in the C library's realloc instead of ending the call. The call must
+	 * end, dead, with the stop's reason, and afterwards the host's thread
+	 * locals and its allocator must still be the host's. */
+	wbx_stop_from_here(h, &r);
+	pthread_t st;
+	CHECK(pthread_create(&st, NULL, stop_sender, h) == 0);
+	const uint64_t endless = Spin(UINT64_MAX >> 1);
+	atomic_store(&g_stop_done, 1);
+	pthread_join(st, NULL);
+	char why[256];
+	wbx_get_death(h, why, sizeof why, &r);
+	printf("Spin for ever -> %llu, dead=%d: %s\n", (unsigned long long)endless, (int)r.data, why);
+	CHECK(r.data == 1 && strstr(why, "stopped by the foreign-signal test") != NULL);
+	CHECK(t_canary == CANARY);
+	for (int i = 0; i < 1000; i++) {
+		unsigned char *p = malloc(64 + (size_t)i);
+		CHECK(p != NULL);
+		if (p == NULL) break;
+		memset(p, i & 0xff, 64 + (size_t)i);
+		unsigned char *q = realloc(p, 4096 + (size_t)i);
+		CHECK(q != NULL && q[0] == (unsigned char)(i & 0xff));
+		free(q);
+	}
+
 	wbx_deactivate_host(h, &r);
 	wbx_destroy_host(h, &r);
 

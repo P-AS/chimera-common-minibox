@@ -572,6 +572,17 @@ not for yields; and a stop asked from inside a host callback ends the guest
 at its next yield, unless the frontend counted work after the ask, when the
 call ends by itself.
 
+On Linux the stop's signal handler puts the host's `%fs` back before it runs
+any host code, as the fault handler does, when the signal came in while a
+guest that keeps its own `%fs` (it declares thread locals) was running: host
+code reads its own thread's variables through `%fs`. Read through the
+guest's, the stop was never carried out in a test guest and crashed in the C
+library's `realloc` with xemu (chimera#330). Tested by `foreign-signal`'s
+second part: its guest, which has thread locals, is stopped while it spins,
+the call ends dead with the stop's reason, and the host's thread locals and
+allocator are the host's afterwards. Without the change the spin never
+ended.
+
 ## Answered instead of fatal (spec v2.2, additive)
 
 These calls used to stop the machine (section 7's "everything else" rule),
