@@ -396,6 +396,72 @@ static void test_host_file(void) {
 
 /* dup: a second descriptor on the same file, starting where the first one
  * is and moving on its own; a writable file stays single-open */
+/* A writable file on the host's disk (a core's tool writing its result): the
+ * guest's writes reach the disk before the unmount, a gap reads as zeros,
+ * it is single-open, it can be cut short, and an existing file is emptied. */
+static void test_host_file_writable(void) {
+	char path[512];
+	int tmpfd = host_tempfile(path, sizeof path, "mb-fs-out");
+	CHECK(tmpfd >= 0);
+	CHECK_EQ((size_t)write(tmpfd, "old contents", 12), (size_t)12);
+	close(tmpfd);
+
+	mb_fs *fs = mb_fs_new();
+	CHECK_EQ(mb_fs_mount_path_writable(fs, "out", path), 0);
+	CHECK_EQ(mb_fs_mount_path_writable(fs, "out", path), -EEXIST);
+	mb_sword fd = mb_fs_open(fs, "out", O_RDWR);
+	CHECK(fd >= 0);
+	CHECK_EQ(mb_fs_open(fs, "out", O_RDONLY), -EACCES);   /* single-open */
+	CHECK_EQ(mb_fs_dup(fs, (int)fd), -EACCES);
+	uint8_t ks[256];
+	int64_t size;
+	CHECK_EQ(mb_fs_stat_fd(fs, (int)fd, ks), 0);
+	memcpy(&size, ks + 48, sizeof size);                   /* kstat.st_size */
+	CHECK_EQ(size, (int64_t)0);                            /* emptied */
+
+	CHECK_EQ(mb_fs_write(fs, (int)fd, (const uint8_t *)"abcd", 4), 4);
+	CHECK_EQ(mb_fs_pwrite(fs, (int)fd, (const uint8_t *)"XY", 2, 8), 2);   /* a gap of 4 */
+	CHECK_EQ(mb_fs_sync_fd(fs, (int)fd), 0);
+	/* on the disk already, before any unmount */
+	{
+		FILE *f = fopen(path, "rb");
+		CHECK(f != NULL);
+		uint8_t disk[16];
+		size_t got = f ? fread(disk, 1, sizeof disk, f) : 0;
+		if (f) fclose(f);
+		CHECK_EQ(got, (size_t)10);
+		CHECK_EQ(memcmp(disk, "abcd\0\0\0\0XY", 10), 0);
+	}
+	/* read back through the guest's own descriptor */
+	uint8_t back[16];
+	CHECK_EQ(mb_fs_seek(fs, (int)fd, 2, SEEK_SET), 2);
+	CHECK_EQ(mb_fs_read(fs, (int)fd, back, 16), 8);
+	CHECK_EQ(memcmp(back, "cd\0\0\0\0XY", 8), 0);
+	CHECK_EQ(mb_fs_seek(fs, (int)fd, 0, SEEK_END), 10);
+	/* cut short */
+	CHECK_EQ(mb_fs_truncate_fd(fs, (int)fd, 3), 0);
+	CHECK_EQ(mb_fs_stat_fd(fs, (int)fd, ks), 0);
+	memcpy(&size, ks + 48, sizeof size);
+	CHECK_EQ(size, (int64_t)3);
+
+	CHECK_EQ(mb_fs_unmount(fs, "out", NULL, NULL), -EBUSY);   /* still open */
+	CHECK_EQ(mb_fs_close(fs, (int)fd), 0);
+	uint8_t *data = (uint8_t *)1; size_t len = 99;
+	CHECK_EQ(mb_fs_unmount(fs, "out", &data, &len), 0);
+	CHECK(data == NULL);                                   /* nothing handed back: it is on the disk */
+	CHECK_EQ(len, (size_t)0);
+	{
+		FILE *f = fopen(path, "rb");
+		uint8_t disk[16];
+		size_t got = f ? fread(disk, 1, sizeof disk, f) : 0;
+		if (f) fclose(f);
+		CHECK_EQ(got, (size_t)3);
+		CHECK_EQ(memcmp(disk, "abc", 3), 0);
+	}
+	mb_fs_free(fs);
+	remove(path);
+}
+
 static void test_dup(void) {
 	mb_fs *fs = mb_fs_new();
 	CHECK_EQ(mb_fs_mount(fs, "f", (const uint8_t *)DOG, sizeof(DOG)-1, false), 0);
@@ -429,6 +495,7 @@ static void run_all(void) {
 	RUN(test_stdout_write);
 	RUN(test_output_copy);
 	RUN(test_host_file);
+	RUN(test_host_file_writable);
 	RUN(test_dup);
 }
 TEST_MAIN()

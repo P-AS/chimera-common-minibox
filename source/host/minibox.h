@@ -68,6 +68,14 @@ void wbx_mount_file(mb_host *obj, const char *name, mb_read_callback cb, uintptr
  * so a savestate does not change either. The file must not change while it is
  * mounted: its length is taken once, at mount. */
 void wbx_mount_file_path(mb_host *obj, const char *name, const char *host_path, mb_return *ret);
+/* Mounts a file on the host's disk for WRITING: created empty (or emptied when
+ * it is there), and the guest's writes go to the disk as it makes them, so
+ * nothing it writes waits in memory. For a guest whose job ends in a file - a
+ * core's tool that writes a decompressed game - not for a machine being
+ * played: like every writable file it is in no savestate, it may be open once
+ * at a time, and unmounting it closes it (a write the disk would not take is
+ * the guest's ENOSPC, a close that fails the unmount's error). */
+void wbx_mount_file_path_writable(mb_host *obj, const char *name, const char *host_path, mb_return *ret);
 void wbx_unmount_file(mb_host *obj, const char *name, mb_write_callback cb, uintptr_t userdata, mb_return *ret);
 void wbx_save_state(mb_host *obj, mb_write_callback cb, uintptr_t userdata, mb_return *ret);
 void wbx_load_state(mb_host *obj, mb_read_callback cb, uintptr_t userdata, mb_return *ret);

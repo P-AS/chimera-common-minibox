@@ -22,6 +22,7 @@ int       mb_host_seal(mb_host *h, char *errbuf, size_t errlen);
 int       mb_host_set_clock_start(mb_host *h, uint64_t unix_seconds, char *errbuf, size_t errlen);
 int       mb_host_mount(mb_host *h, const char *name, const uint8_t *data, size_t len, bool writable);
 int       mb_host_mount_path(mb_host *h, const char *name, const char *path);
+int       mb_host_mount_path_writable(mb_host *h, const char *name, const char *path);
 int       mb_host_unmount(mb_host *h, const char *name, uint8_t **out, size_t *outlen);
 size_t    mb_host_page_len(mb_host *h);
 const uint8_t *mb_host_hash(mb_host *h);
@@ -146,9 +147,17 @@ void wbx_mount_file_path(mb_host *obj, const char *name, const char *host_path, 
 	ok(ret, 0);
 }
 
+void wbx_mount_file_path_writable(mb_host *obj, const char *name, const char *host_path, mb_return *ret) {
+	int rc = mb_host_mount_path_writable(obj, name, host_path);
+	if (rc == -EEXIST) { err(ret, "mount failed (already mounted?)"); return; }
+	if (rc != 0) { err(ret, "cannot create the file to mount"); return; }
+	ok(ret, 0);
+}
+
 void wbx_unmount_file(mb_host *obj, const char *name, mb_write_callback cb, uintptr_t userdata, mb_return *ret) {
 	uint8_t *data = NULL; size_t len = 0;
 	int rc = mb_host_unmount(obj, name, cb ? &data : NULL, &len);
+	if (rc == -EIO) { err(ret, "the file written on the disk could not be finished (is the disk full?)"); return; }
 	if (rc != 0) { err(ret, "unmount failed"); return; }
 	/* the file is gone from the machine by now: a failed hand-over is said */
 	const int32_t wrote = (cb && data) ? cb(userdata, data, len) : 0;

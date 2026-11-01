@@ -16,11 +16,21 @@
  * bytes a guest reads are the same either way, so nothing about the machine
  * changes - and a read-only file has nothing to save, so a savestate does not
  * change either. Writable mounts stay in memory: they are memory cards and
- * save files, they are small, and their contents belong to the machine. */
+ * save files, they are small, and their contents belong to the machine.
+ *
+ * The one exception is a writable file ON THE HOST'S DISK (F_HOST_OUT,
+ * mb_fs_mount_path_writable), for a guest that is not a machine being played
+ * but a job whose result is a file: a core's tool that decompresses a game
+ * writes gigabytes, and those go to the disk as they are written instead of
+ * waiting in memory for the unmount. Such a file is in no savestate, as no
+ * writable file's bytes are. */
 #include "minibox_internal.h"
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <io.h>
+#else
+#include <unistd.h>
 #endif
 #include <errno.h>
 #include <stdatomic.h>
@@ -51,15 +61,15 @@ typedef struct {
 #define SEEK_CUR 1
 #define SEEK_END 2
 
-typedef enum { F_EMPTY, F_SYSOUT, F_REGULAR, F_HOST } file_kind;
+typedef enum { F_EMPTY, F_SYSOUT, F_REGULAR, F_HOST, F_HOST_OUT } file_kind;
 typedef struct {
 	char *name;
 	file_kind kind;
 	FILE *sysout;      /* F_SYSOUT */
-	FILE *host;        /* F_HOST: the file on the host's disk, read on demand */
+	FILE *host;        /* F_HOST, F_HOST_OUT: the file on the host's disk */
 	uint8_t *data;     /* F_REGULAR */
 	size_t len, cap;
-	bool writable;     /* F_REGULAR: has no hash */
+	bool writable;     /* F_REGULAR, F_HOST_OUT (always) */
 } mounted_file;
 
 typedef struct {
@@ -132,6 +142,25 @@ static FILE *open_read(const char *path) {
 #endif
 }
 
+/* created, or emptied when it is there, for reading and writing */
+static FILE *open_write(const char *path) {
+#if defined(_WIN32)
+	int n = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+	if (n <= 0) return NULL;
+	wchar_t *wide = (wchar_t *)malloc((size_t)n * sizeof(wchar_t));
+	if (!wide) return NULL;
+	MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, n);
+	FILE *f = _wfopen(wide, L"w+b");
+	free(wide);
+	return f;
+#else
+	return fopen(path, "w+b");
+#endif
+}
+
+static bool host_file(const mounted_file *f) { return f->kind == F_HOST || f->kind == F_HOST_OUT; }
+static bool has_bytes(const mounted_file *f) { return f->kind == F_REGULAR || host_file(f); }
+
 static mounted_file *add(mb_fs *fs) {
 	if (fs->n == fs->cap) { fs->cap = fs->cap ? fs->cap * 2 : 8; fs->files = realloc(fs->files, fs->cap * sizeof(mounted_file)); }
 	mounted_file *f = &fs->files[fs->n++];
@@ -176,7 +205,7 @@ void mb_fs_free(mb_fs *fs) {
 	for (size_t i = 0; i < fs->n; i++) {
 		free(fs->files[i].name);
 		free(fs->files[i].data);
-		if (fs->files[i].kind == F_HOST && fs->files[i].host) fclose(fs->files[i].host);
+		if (host_file(&fs->files[i]) && fs->files[i].host) fclose(fs->files[i].host);
 	}
 	free(fs->files); free(fs->hs); free(fs);
 }
@@ -212,16 +241,35 @@ int mb_fs_mount_path(mb_fs *fs, const char *name, const char *path) {
 	return 0;
 }
 
+/* Mounts a host file for writing (see the header): created empty, or emptied
+ * when it is there. Single-open, as every writable file is. */
+int mb_fs_mount_path_writable(mb_fs *fs, const char *name, const char *path) {
+	if (by_name(fs, name)) return -EEXIST;
+	FILE *fp = open_write(path);
+	if (!fp) return -ENOENT;
+	mounted_file *f = add(fs);
+	f->name = strdup(name); f->kind = F_HOST_OUT; f->writable = true;
+	f->host = fp; f->len = f->cap = 0; f->data = NULL;
+	return 0;
+}
+
 int mb_fs_unmount(mb_fs *fs, const char *name, uint8_t **out_data, size_t *out_len) {
 	for (size_t i = 0; i < fs->n; i++) {
 		if (strcmp(fs->files[i].name, name) == 0) {
 			mounted_file *f = &fs->files[i];
-			if (f->kind != F_REGULAR && f->kind != F_HOST) return -EINVAL;   /* permanent (stdio) */
+			if (!has_bytes(f)) return -EINVAL;   /* permanent (stdio) */
 			if (file_is_open(fs, i)) return -EBUSY;      /* still open */
-			if (f->kind == F_HOST) {
-				/* nothing to hand back: the bytes never left the disk */
+			if (host_file(f)) {
+				/* nothing to hand back: the bytes are on the disk */
 				if (out_data) { *out_data = NULL; *out_len = 0; }
-				fclose(f->host);
+				if (fclose(f->host) != 0 && f->kind == F_HOST_OUT) {
+					/* what was written did not all reach the disk */
+					free(f->name);
+					memmove(&fs->files[i], &fs->files[i+1], (fs->n - i - 1) * sizeof(mounted_file));
+					fs->n--;
+					for (size_t j = 0; j < fs->hn; j++) if (fs->hs[j].file > i) fs->hs[j].file--;
+					return -EIO;
+				}
 			}
 			else if (out_data) { *out_data = f->data; *out_len = f->len; } else free(f->data);
 			free(f->name);
@@ -241,9 +289,9 @@ mb_sword mb_fs_open(mb_fs *fs, const char *name, int flags) {
 	size_t idx = (size_t)(f - fs->files);
 	/* writable files stay single-open; read-only mounts may be opened many
 	 * times, each open with its own position */
-	if (f->kind == F_REGULAR && f->writable && file_is_open(fs, idx)) return -EACCES;
+	if (has_bytes(f) && f->writable && file_is_open(fs, idx)) return -EACCES;
 	bool can_read = f->kind != F_SYSOUT;
-	bool can_write = (f->kind == F_SYSOUT) || (f->kind == F_REGULAR && f->writable);
+	bool can_write = (f->kind == F_SYSOUT) || (has_bytes(f) && f->writable);
 	switch (flags & O_ACCMODE) {
 		case O_RDONLY: if (!can_read) return -EACCES; break;
 		case O_WRONLY: if (!can_write) return -EACCES; break;
@@ -268,7 +316,7 @@ mb_sword mb_fs_dup(mb_fs *fs, int fd) {
 	if (!h) return -EBADF;
 	const size_t file = h->file, pos = h->pos;
 	mounted_file *f = &fs->files[file];
-	if (f->kind == F_REGULAR && f->writable) return -EACCES;
+	if (has_bytes(f) && f->writable) return -EACCES;
 	open_handle *d = handle_add(fs, file);   /* may move fs->hs: h is stale */
 	d->pos = pos;
 	return d->fd;
@@ -362,7 +410,7 @@ size_t mb_fs_read_avail(mb_fs *fs, int fd, size_t n) {
 	open_handle *h = handle_by_fd(fs, fd);
 	if (!h) return 0;
 	const mounted_file *f = &fs->files[h->file];
-	if (f->kind != F_REGULAR && f->kind != F_HOST) return 0;
+	if (!has_bytes(f)) return 0;
 	const size_t left = h->pos < f->len ? f->len - h->pos : 0;
 	return n < left ? n : left;
 }
@@ -375,7 +423,7 @@ mb_sword mb_fs_read(mb_fs *fs, int fd, uint8_t *buf, size_t n) {
 	if (f->kind == F_SYSOUT) return -EBADF;
 	/* past the end (a seek may go there): end of file */
 	size_t avail = h->pos < f->len ? f->len - h->pos : 0, take = n < avail ? n : avail;
-	if (f->kind == F_HOST) {
+	if (host_file(f)) {
 		/* The handle's position is the guest's; the host file's own position is
 		 * shared between every handle on it, so it is set from ours each time
 		 * rather than trusted.
@@ -499,6 +547,17 @@ int mb_set_output_file(const char *path) {
 	return 0;
 }
 
+/* n bytes of a guest's buffer into a host file at `at`. Reading guest memory
+ * is safe for the kernel (only its WRITES into guest pages go unseen, see
+ * mb_fs_read), so the buffer goes to fwrite as it is. A gap left by writing
+ * past the end reads as zeros, as the host's own file system makes it. */
+static mb_sword host_write(mounted_file *f, const uint8_t *buf, size_t n, size_t at) {
+	if (seek64(f->host, (int64_t)at, SEEK_SET) != 0) return -EIO;
+	if (fwrite(buf, 1, n, f->host) != n) { clearerr(f->host); return -ENOSPC; }
+	if (at + n > f->len) f->len = at + n;
+	return (mb_sword)n;
+}
+
 mb_sword mb_fs_write(mb_fs *fs, int fd, const uint8_t *buf, size_t n) {
 	open_handle *h = handle_by_fd(fs, fd);
 	if (!h) return not_open(fs, -ENOENT);
@@ -512,6 +571,11 @@ mb_sword mb_fs_write(mb_fs *fs, int fd, const uint8_t *buf, size_t n) {
 	if (f->kind == F_EMPTY || !f->writable) return -EBADF;
 	size_t newpos = h->pos + n;
 	if (newpos < h->pos) return -EFBIG;
+	if (f->kind == F_HOST_OUT) {
+		const mb_sword wrote = host_write(f, buf, n, h->pos);
+		if (wrote > 0) h->pos += (size_t)wrote;
+		return wrote;
+	}
 	if (newpos > f->cap) {
 		uint8_t *grown = realloc(f->data, newpos);
 		if (!grown) return -ENOSPC;
@@ -535,11 +599,12 @@ mb_sword mb_fs_pwrite(mb_fs *fs, int fd, const uint8_t *buf, size_t n, mb_sword 
 	if (!h) return -EBADF;
 	mounted_file *f = &fs->files[h->file];
 	if (f->kind == F_SYSOUT) return -ESPIPE;
-	if (f->kind != F_REGULAR || !f->writable) return -EBADF;
+	if ((f->kind != F_REGULAR && f->kind != F_HOST_OUT) || !f->writable) return -EBADF;
 	if (offset < 0) return -EINVAL;
 	if (n == 0) return 0;   /* nothing written is nothing grown, wherever it points */
 	const size_t at = (size_t)offset, end = at + n;
 	if (end < at) return -EFBIG;
+	if (f->kind == F_HOST_OUT) return host_write(f, buf, n, at);
 	if (end > f->cap) {
 		uint8_t *grown = realloc(f->data, end);
 		if (!grown) return -ENOSPC;
@@ -555,7 +620,7 @@ mb_sword mb_fs_seek(mb_fs *fs, int fd, mb_sword offset, int whence) {
 	open_handle *h = handle_by_fd(fs, fd);
 	if (!h) return not_open(fs, -EINVAL);
 	mounted_file *f = &fs->files[h->file];
-	if (f->kind != F_REGULAR && f->kind != F_HOST) return fs->linux_answers ? -ESPIPE : -EINVAL;
+	if (!has_bytes(f)) return fs->linux_answers ? -ESPIPE : -EINVAL;
 	mb_sword newpos;
 	switch (whence) {
 		case SEEK_SET: newpos = offset; break;
@@ -586,7 +651,7 @@ static void fill_stat(kstat *s, bool can_read, bool can_write, bool can_seek, in
 static mb_sword stat_file(mounted_file *f, kstat *s) {
 	if (f->kind == F_SYSOUT) fill_stat(s, false, true, false, 0);
 	else if (f->kind == F_EMPTY) fill_stat(s, true, false, false, 0);
-	else fill_stat(s, true, f->writable, true, (int64_t)f->len);   /* F_HOST: writable is false */
+	else fill_stat(s, true, f->writable, true, (int64_t)f->len);   /* F_HOST: writable is false, F_HOST_OUT true */
 	return 0;
 }
 
@@ -602,13 +667,31 @@ mb_sword mb_fs_stat_fd(mb_fs *fs, int fd, void *ks) {
 }
 /* fsync/fdatasync/syncfs: there is nothing to flush - a mounted file lives in
  * host memory, and what reaches a host file is written when it is unmounted -
- * so the only answer that can differ is whether the descriptor is open. */
+ * so the only answer that can differ is whether the descriptor is open. A
+ * file written to the host's disk hands what it holds to the host. */
 mb_sword mb_fs_sync_fd(mb_fs *fs, int fd) {
-	return handle_by_fd(fs, fd) ? 0 : -EBADF;
+	open_handle *h = handle_by_fd(fs, fd);
+	if (!h) return -EBADF;
+	mounted_file *f = &fs->files[h->file];
+	if (f->kind == F_HOST_OUT && fflush(f->host) != 0) return -EIO;
+	return 0;
 }
 mb_sword mb_fs_truncate_name(mb_fs *fs, const char *name, mb_sword size) {
 	mounted_file *f = by_name(fs, name);
 	if (!f) return -ENOENT;
+	if (f->kind == F_HOST_OUT && size >= 0) {
+		if (fflush(f->host) != 0) return -EIO;
+#if defined(_WIN32)
+		if (_chsize_s(_fileno(f->host), (__int64)size) != 0) return -EIO;
+#else
+		if (ftruncate(fileno(f->host), (off_t)size) != 0) return -EIO;
+#endif
+		f->len = f->cap = (size_t)size;
+		for (size_t j = 0; j < fs->hn; j++) {
+			if (&fs->files[fs->hs[j].file] == f && fs->hs[j].pos > f->len) fs->hs[j].pos = f->len;
+		}
+		return 0;
+	}
 	if (f->kind != F_REGULAR || !f->writable || size < 0) return -EBADF;
 	uint8_t *data = realloc(f->data, size ? (size_t)size : 1);
 	if (!data) return -ENOMEM;

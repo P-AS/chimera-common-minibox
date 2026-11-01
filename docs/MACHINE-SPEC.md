@@ -363,7 +363,12 @@ writable file is EACCES. fd allocation is lowest-unused; open checks only
 O_ACCMODE. The open descriptors and their positions are in states (section
 6, OpenFileTable1); a writable file's bytes are not, and stay as they are
 across a load, so a core keeps data it writes in its own memory instead
-(Chimera mounts every file read-only). The answers for a descriptor that
+(Chimera mounts every file read-only for a machine). A writable file may
+instead live on the host's disk (wbx_mount_file_path_writable, 2026-11-01,
+additive): created empty, or emptied when it is there, and written to the
+disk as the guest writes, so a large result never waits in memory; it is
+for a guest whose job ends in a file (a core's tool), and behaves as any
+other writable file - single-open, no dup, in no state. The answers for a descriptor that
 is not open, for seeking a stream and for a seek past the end depend on the
 guest kit's revision ("Guest kit revisions", revision 2). Fabricated stat: st_dev=1, st_ino=1, st_nlink=0, st_blksize=4096,
 S_IFREG if seekable else S_IFIFO, constant timestamps (1262304000000 s,
