@@ -705,14 +705,20 @@ void mb_host_page_init(void) {
 	uintptr_t size = got > 0 ? (uintptr_t)got : MB_PAGESIZE;
 #endif
 	g_os_page = size;
+#ifdef MB_HOST_PAGE_TESTING
 	/* Testing: behave as if the OS page were larger, which any host can do
 	 * (protecting a larger aligned range is always possible). This is how a 4
-	 * KiB machine runs the 16 and 64 KiB groupings; never smaller than real. */
+	 * KiB machine runs the 16 and 64 KiB groupings; never smaller than real.
+	 * Only in miniBox's own build (source/host/meson.build), which its tests
+	 * and the cores' test scripts use: a host a frontend ships builds without
+	 * it, so no variable in a player's environment changes how its machine
+	 * protects memory. */
 	const char *force = getenv("MB_HOST_PAGE");
 	if (force != NULL && *force != '\0') {
 		const uintptr_t want = (uintptr_t)strtoull(force, NULL, 0);
 		if (want > size) size = want;
 	}
+#endif
 	unsigned shift = MB_PAGESHIFT;
 	while (((uintptr_t)1 << shift) < size) shift++;
 	if (((uintptr_t)1 << shift) != size) {

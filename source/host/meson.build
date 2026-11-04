@@ -57,6 +57,9 @@ minibox_build_os = run_command(
 
 minibox_host_c_args = [
   '-fno-strict-aliasing',
+  # MB_HOST_PAGE (memblock.c) is read only by this build, for the tests; a
+  # frontend that compiles the host itself leaves it out
+  '-DMB_HOST_PAGE_TESTING=1',
   '-DMB_BUILD_COMMIT="' + minibox_git_commit + '"',
   '-DMB_BUILD_COMPILER="' + meson.get_compiler('c').get_id() + ' ' + meson.get_compiler('c').version() + '"',
   '-DMB_BUILD_OS="' + minibox_build_os + '"',

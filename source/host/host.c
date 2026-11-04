@@ -857,10 +857,10 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 		case NR_exit_group:
 			mb_host_guest_death(&h->context, "the core exited (status %lld)", (long long)(intptr_t)a1);
 #if defined(__aarch64__)
-		/* An aarch64 guest's thread pointer is TPIDR_EL0, swapped in by the host
-		 * around guest code (MB_HAVE_FSBASE), so musl tells the host instead of
-		 * writing it (arch/waterbox_aarch64 __set_thread_area); dispatch puts it
-		 * in the register on the way back. */
+		/* An aarch64 guest's thread pointer is the word at MB_TP_SLOT, which
+		 * only the host writes (MB_HAVE_FSBASE), so musl tells the host instead
+		 * of writing it (arch/waterbox_aarch64 __set_thread_area); dispatch
+		 * puts it in the word on the way back. */
 		case NR_set_thread_area:
 			if (a1 == 0) return serr(EINVAL);   /* no thread pointer is null */
 			h->context.thread_area = a1;
@@ -1164,8 +1164,9 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 	 * while the instructions would have worked. */
 	{ const bool fs_ok = mb_fsbase_ok();
 #if defined(__aarch64__)
-	  /* every aarch64 guest: its musl reaches pthread_self through TPIDR_EL0
-	   * (arch/waterbox_aarch64), with or without thread locals of its own */
+	  /* every aarch64 guest: its musl reaches pthread_self through the word
+	   * at MB_TP_SLOT (arch/waterbox_aarch64), with or without thread locals
+	   * of its own */
 	  h->context.fs_swap = fs_ok; }
 #elif defined(__x86_64__)
 	  h->context.fs_swap = mb_elf_has_tls(h->elf) && fs_ok && !getenv("MB_NO_FS_SWAP"); }

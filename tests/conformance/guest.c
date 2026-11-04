@@ -205,12 +205,14 @@ ECL_EXPORT int CancellableCallKeepsItsArguments(void) {
 /* The floating-point control words are the guest's own (mb_context,
  * 2026-10-18): what it sees on entry, and that what it sets survives an
  * exported call, a syscall and a host callback. Read as (fcw << 32) | mxcsr;
- * on aarch64 FPCR in the MXCSR place and 0 for the x87 word. */
+ * on aarch64 FPCR in the MXCSR place and FPSR's flags in the x87 word's,
+ * packed as the host packs them (bits 0-7, and QC as bit 8). */
 static uint64_t fpu_read(void) {
 #if defined(__aarch64__)
-	uint64_t v;
-	__asm__ volatile("mrs %0, fpcr" : "=r"(v));
-	return (uint32_t)v;
+	uint64_t cr, sr;
+	__asm__ volatile("mrs %0, fpcr\n\tmrs %1, fpsr" : "=r"(cr), "=r"(sr));
+	const uint64_t flags = (sr & 0xff) | ((sr >> 27) & 1) << 8;
+	return (flags << 32) | (uint32_t)cr;
 #elif defined(__x86_64__)
 	uint16_t cw; uint32_t mx;
 	__asm__ volatile("fnstcw %0\n\tstmxcsr %1" : "=m"(cw), "=m"(mx));
@@ -226,8 +228,8 @@ __attribute__((constructor)) static void fpu_at_start(void) { g_fpu_at_start = f
 ECL_EXPORT uint64_t FpuAtStart(void) { return g_fpu_at_start; }
 ECL_EXPORT void FpuSet(uint32_t fcw, uint32_t mxcsr) {
 #if defined(__aarch64__)
-	(void)fcw;
-	__asm__ volatile("msr fpcr, %0" : : "r"((uint64_t)mxcsr));
+	const uint64_t sr = (uint64_t)(fcw & 0xff) | (uint64_t)((fcw >> 8) & 1) << 27;
+	__asm__ volatile("msr fpcr, %0\n\tmsr fpsr, %1" : : "r"((uint64_t)mxcsr), "r"(sr));
 #elif defined(__x86_64__)
 	const uint16_t cw = (uint16_t)fcw;
 	__asm__ volatile("fldcw %0\n\tldmxcsr %1" : : "m"(cw), "m"(mxcsr));

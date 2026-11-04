@@ -16,8 +16,9 @@
  *   - the interop blob keeps no per-host-thread block (no gs): an escape has
  *     the context's four stack fields to put back, and the context word at
  *     MB_INTEROP_SLOT to clear, where guarded.S clears gs:0x18;
- *   - the floating-point control words are FPCR alone, kept in the context's
- *     MXCSR fields (minibox_internal.h, mb_fpu_get);
+ *   - the floating-point words are FPCR, kept in the context's MXCSR fields,
+ *     and FPSR's flags, packed into its x87 word fields (minibox_internal.h,
+ *     mb_fpu_get: bits 0-7 as they are, QC as bit 8);
  *   - the guest's fault handler runs from a trampoline that cannot end by
  *     returning to the faulting instruction (that needs a register): it ends
  *     in a udf, and tripguard.c's SIGILL handler puts every register back.
@@ -39,6 +40,8 @@
 #define CTX_CALLS         0x250
 #define CTX_GUEST_MXCSR   0x258   /* FPCR, on aarch64 */
 #define CTX_HOST_MXCSR    0x25c
+#define CTX_GUEST_FCW     0x260   /* FPSR's flags, packed, on aarch64 */
+#define CTX_HOST_FCW      0x262
 
 /* the escape record, at the stack pointer the blob is called with */
 #define FRAME_CTX           0
@@ -51,6 +54,7 @@
 #define FRAME_X29           128
 #define FRAME_D8            144  /* d8..d15 */
 #define FRAME_PREV_FPCR     208  /* the context's host FPCR before this call */
+#define FRAME_PREV_FPSR     212  /* and its host FPSR flags (16 bits) */
 #define FRAME_SIZE          224
 
 	.text
@@ -100,15 +104,24 @@ MB_SYM(mb_guarded_call):
 	ldr x11, [x9, #CTX_CALLS]
 	add x11, x11, #1
 	str x11, [x9, #CTX_CALLS]
-	/* the floating-point control register: the host's parked in the context
-	 * (the outer call's kept in the record), the guest's loaded. Before the
-	 * dead check, so the landing is the same for every way of arriving. */
+	/* the floating-point control register and flags: the host's parked in
+	 * the context (the outer call's kept in the record), the guest's loaded.
+	 * Before the dead check, so the landing is the same for every way of
+	 * arriving. */
 	ldr w11, [x9, #CTX_HOST_MXCSR]
 	str w11, [sp, #FRAME_PREV_FPCR]
 	mrs x11, fpcr
 	str w11, [x9, #CTX_HOST_MXCSR]
 	ldr w11, [x9, #CTX_GUEST_MXCSR]
 	msr fpcr, x11
+	ldrh w11, [x9, #CTX_HOST_FCW]
+	strh w11, [sp, #FRAME_PREV_FPSR]
+	mrs x11, fpsr
+	fpsr_pack w11, w12
+	strh w11, [x9, #CTX_HOST_FCW]
+	ldrh w11, [x9, #CTX_GUEST_FCW]
+	fpsr_unpack x11, x12
+	msr fpsr, x11
 
 	/* what the slot held, where the syscall dispatcher and the way out both
 	 * read it */
@@ -155,14 +168,22 @@ MB_SYM(mb_guarded_call):
 	ldr x10, [x9, #CTX_HOST_FS]
 	tp_slot_addr x11
 	str x10, [x11]
-	/* the guest's FPCR kept, the host's back, and the outer call's host
-	 * FPCR back in the context */
+	/* the guest's FPCR and flags kept, the host's back, and the outer
+	 * call's host words back in the context */
 	mrs x10, fpcr
 	str w10, [x9, #CTX_GUEST_MXCSR]
 	ldr w10, [x9, #CTX_HOST_MXCSR]
 	msr fpcr, x10
 	ldr w10, [sp, #FRAME_PREV_FPCR]
 	str w10, [x9, #CTX_HOST_MXCSR]
+	mrs x10, fpsr
+	fpsr_pack w10, w11
+	strh w10, [x9, #CTX_GUEST_FCW]
+	ldrh w10, [x9, #CTX_HOST_FCW]
+	fpsr_unpack x10, x11
+	msr fpsr, x10
+	ldrh w10, [sp, #FRAME_PREV_FPSR]
+	strh w10, [x9, #CTX_HOST_FCW]
 	ldp d8, d9, [sp, #FRAME_D8 + 0]
 	ldp d10, d11, [sp, #FRAME_D8 + 16]
 	ldp d12, d13, [sp, #FRAME_D8 + 32]

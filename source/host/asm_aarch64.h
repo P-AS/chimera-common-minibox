@@ -34,4 +34,21 @@
 	movk \x, #0x036e, lsl #32
 .endm
 
+/* FPSR's flags in the 16 bits the context keeps them in (minibox_internal.h,
+ * mb_a64_fpsr_pack): bits 0-7 as they are, QC (bit 27) as bit 8. wv: FPSR in,
+ * the packed word out; wt: scratch. */
+.macro fpsr_pack wv, wt
+	ubfx \wt, \wv, #27, #1
+	and \wv, \wv, #0xff
+	orr \wv, \wv, \wt, lsl #8
+.endm
+
+/* and back: xv the packed word in (zero-extended), FPSR's value out; xt:
+ * scratch */
+.macro fpsr_unpack xv, xt
+	ubfx \xt, \xv, #8, #1
+	and \xv, \xv, #0xff
+	orr \xv, \xv, \xt, lsl #27
+.endm
+
 #endif

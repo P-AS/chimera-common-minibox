@@ -273,7 +273,8 @@ static bool drop_fs_for_test(void) {
 __attribute__((no_stack_protector))
 static bool insn_has_fs_prefix(uintptr_t rip) {
 #if defined(__aarch64__)
-	/* TPIDR_EL0 is never dropped by the OS: there is nothing to repair */
+	/* the guest's thread pointer is a word of memory (MB_TP_SLOT), which no
+	 * OS drops: there is nothing to repair */
 	(void)rip;
 	return false;
 #endif
@@ -1332,8 +1333,7 @@ void mb_tripguard_stop_signal_install(void) {
  * code reads, so another handler is safe as it is - and swapping that word
  * from another thread would pull it out from under the guest's.)
  *
- * Guest code with thread locals runs with the guest's %fs installed (on
- * aarch64, TPIDR_EL0, which every guest has swapped in). A signal
+ * Guest code with thread locals runs with the guest's %fs installed. A signal
  * the host's own runtime sends itself can land there - Mono stops each thread
  * for its garbage collector with one - and its handler, host code, then reads
  * its thread-locals through the guest's pointer and dies: a PCSX2 core,

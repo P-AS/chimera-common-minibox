@@ -563,22 +563,35 @@ static inline void mb_fpu_set(const uint16_t *fcw, const uint32_t *mxcsr) {
 	__asm__ volatile("fldcw %0\n\tldmxcsr %1" : : "m"(*fcw), "m"(*mxcsr));
 }
 #elif defined(__aarch64__)
-/* aarch64 has one control register, FPCR (rounding, flush-to-zero, default
- * NaN; its upper half is reserved), kept in the MXCSR field; the x87 word
- * field is always 0. A guest starts at 0: round to nearest, no flushing, what
- * Linux gives a new process and what musl assumes. */
+/* aarch64 keeps its control in FPCR (rounding, flush-to-zero, default NaN;
+ * its upper half is reserved), kept in the MXCSR field, and its cumulative
+ * exception flags in FPSR, which x86-64 keeps in MXCSR itself. The flags go
+ * in the x87 word field, packed: FPSR bits 0-7 (IOC, DZC, OFC, UFC, IXC and
+ * IDC; 5 and 6 are reserved) as they are, and QC (bit 27, the saturation
+ * flag) as bit 8. The rest of FPSR is reserved on aarch64. So the guest's
+ * flags are its own, as on x86-64: what host code raises never reaches it,
+ * and what it raised is in its states. A guest starts at 0 in both: round to
+ * nearest, no flushing, no flags - what Linux gives a new process and what
+ * musl assumes. The same packing is in guarded_aarch64.S and
+ * interop_aarch64.S. */
 #define MB_GUEST_FCW_START   0
 #define MB_GUEST_MXCSR_START 0
 
+static inline uint16_t mb_a64_fpsr_pack(uint64_t fpsr) {
+	return (uint16_t)((fpsr & 0xff) | ((fpsr >> 27) & 1) << 8);
+}
+static inline uint64_t mb_a64_fpsr_unpack(uint16_t word) {
+	return (uint64_t)(word & 0xff) | (uint64_t)((word >> 8) & 1) << 27;
+}
 static inline void mb_fpu_get(uint16_t *fcw, uint32_t *mxcsr) {
-	uint64_t v;
-	__asm__ volatile("mrs %0, fpcr" : "=r"(v));
-	*fcw = 0;
-	*mxcsr = (uint32_t)v;
+	uint64_t cr, sr;
+	__asm__ volatile("mrs %0, fpcr\n\tmrs %1, fpsr" : "=r"(cr), "=r"(sr));
+	*fcw = mb_a64_fpsr_pack(sr);
+	*mxcsr = (uint32_t)cr;
 }
 static inline void mb_fpu_set(const uint16_t *fcw, const uint32_t *mxcsr) {
-	(void)fcw;
-	__asm__ volatile("msr fpcr, %0" : : "r"((uint64_t)*mxcsr));
+	__asm__ volatile("msr fpcr, %0\n\tmsr fpsr, %1"
+	                 : : "r"((uint64_t)*mxcsr), "r"(mb_a64_fpsr_unpack(*fcw)));
 }
 #else
 #error "miniBox runs on x86-64 and aarch64 only"

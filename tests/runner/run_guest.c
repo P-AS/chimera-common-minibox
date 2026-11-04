@@ -103,16 +103,29 @@ static void host_fpu_set(uint16_t cw, uint32_t mx) { __asm__ volatile("fldcw %0\
 #define FPU_GUEST_CW 0x077F   /* round down, both units */
 #define FPU_GUEST_MX 0x3F80
 #elif defined(__aarch64__)
-/* aarch64 has FPCR alone, in the MXCSR place; the x87 word is always 0, and
- * FPCR keeps no sticky flags (those are FPSR's) */
-static void host_fpu_get(uint16_t *cw, uint32_t *mx) { uint64_t v; __asm__ volatile("mrs %0, fpcr" : "=r"(v)); *cw = 0; *mx = (uint32_t)v; }
-static void host_fpu_set(uint16_t cw, uint32_t mx) { (void)cw; __asm__ volatile("msr fpcr, %0" : : "r"((uint64_t)mx)); }
+/* aarch64 has FPCR in the MXCSR place, which keeps no sticky flags, and
+ * FPSR's flags in the x87 word's, packed as the host packs them
+ * (minibox_internal.h): bits 0-7 as they are, QC (bit 27) as bit 8. So the
+ * flags are compared here, where x86-64 leaves MXCSR's out: the host's are
+ * set to inexact, which host code may raise again without changing them, and
+ * the guest's to invalid and QC, which neither side raises by itself. */
+static uint16_t fpsr_pack(uint64_t v) { return (uint16_t)((v & 0xff) | ((v >> 27) & 1) << 8); }
+static uint64_t fpsr_unpack(uint16_t w) { return (uint64_t)(w & 0xff) | (uint64_t)((w >> 8) & 1) << 27; }
+static void host_fpu_get(uint16_t *cw, uint32_t *mx) {
+	uint64_t cr, sr;
+	__asm__ volatile("mrs %0, fpcr\n\tmrs %1, fpsr" : "=r"(cr), "=r"(sr));
+	*cw = fpsr_pack(sr);
+	*mx = (uint32_t)cr;
+}
+static void host_fpu_set(uint16_t cw, uint32_t mx) {
+	__asm__ volatile("msr fpcr, %0\n\tmsr fpsr, %1" : : "r"((uint64_t)mx), "r"(fpsr_unpack(cw)));
+}
 #define FPU_FLAGS 0u
-#define FPU_START_CW 0
+#define FPU_START_CW 0            /* no flags */
 #define FPU_START_MX 0            /* round to nearest, no flushing */
-#define FPU_HOST_CW  0
+#define FPU_HOST_CW  0x0010       /* IXC: inexact */
 #define FPU_HOST_MX  0x00C00000u  /* RMode: round toward zero */
-#define FPU_GUEST_CW 0
+#define FPU_GUEST_CW 0x0101       /* IOC and QC: invalid, saturated */
 #define FPU_GUEST_MX 0x00800000u  /* RMode: round down */
 #else
 #error "miniBox runs on x86-64 and aarch64 only"

@@ -23,9 +23,10 @@
  * machine is entered at a time - the block's address is fixed - so one word
  * per process is all there is to know.
  *
- * A callback runs with the host's floating-point control register, as the
- * x86-64 wrappers (context.c) give it the host's words: the guest's FPCR is
- * kept in the context on the way out and loaded again on the way back.
+ * A callback runs with the host's floating-point control register and
+ * flags, as the x86-64 wrappers (context.c) give it the host's words: the
+ * guest's FPCR and FPSR flags are kept in the context on the way out and
+ * loaded again on the way back (the flags packed, minibox_internal.h).
  *
  * What the blob does NOT do is touch the guest's thread pointer (the word at
  * MB_TP_SLOT): as on x86-64, host C and mb_guarded_call keep it.
@@ -59,6 +60,8 @@
 #define CTX_EXTCALL       0x038
 #define CTX_GUEST_MXCSR   0x258   /* FPCR, on aarch64 */
 #define CTX_HOST_MXCSR    0x25c
+#define CTX_GUEST_FCW     0x260   /* FPSR's flags, packed, on aarch64 */
+#define CTX_HOST_FCW      0x262
 
 
 /* everything a guest could read back but x0 */
@@ -246,12 +249,21 @@ extcall_common:
 	str w17, [x16, #CTX_GUEST_MXCSR]
 	ldr w17, [x16, #CTX_HOST_MXCSR]
 	msr fpcr, x17
+	mrs x17, fpsr
+	fpsr_pack w17, w10
+	strh w17, [x16, #CTX_GUEST_FCW]
+	ldrh w17, [x16, #CTX_HOST_FCW]
+	fpsr_unpack x17, x10
+	msr fpsr, x17
 	add x17, x16, #CTX_EXTCALL
 	ldr x17, [x17, x9, lsl #3]
 	blr x17
 	ldr x16, [sp], #16
 	ldr w17, [x16, #CTX_GUEST_MXCSR]
 	msr fpcr, x17
+	ldrh w17, [x16, #CTX_GUEST_FCW]
+	fpsr_unpack x17, x10
+	msr fpsr, x17
 	interop_slot_addr x17
 	str x16, [x17]
 	ldr x17, [x16, #CTX_GUEST_RSP]
