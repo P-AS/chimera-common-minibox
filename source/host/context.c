@@ -83,8 +83,6 @@ uintptr_t *mb_thread_block(void) { return g_tib; }
 
 
 #ifdef __APPLE__
-/* for guarded.S: this thread's block, made at mb_prepare_thread (OS gs only) */
-MB_HIDDEN uintptr_t mb_gs_block_c(void) { return (uintptr_t)g_tib; }
 #include <pthread.h>
 /* This thread's gs base as the OS has it: &pthread_self()->tsd[0]. Nothing
  * reads it directly, so it is found the way it is laid out - a pthread key's
@@ -108,18 +106,28 @@ static uintptr_t os_gs_base(void) {
 }
 #endif
 
+/* This thread's block, made if it has not been. */
+static void make_thread_block(void) {
+	if (g_tib[0] == MB_GS_MAGIC) return;
+	g_tib[MB_TIB_SELF] = (uintptr_t)g_tib;
+	g_tib[MB_TIB_HOST_GS] = os_gs_base();
+	if (g_tib[MB_TIB_HOST_GS] == 0) {
+		fprintf(stderr, "miniBox: cannot find this thread's gs base\n");
+		abort();
+	}
+	g_tib[0] = MB_GS_MAGIC;   /* last: it is what says the rest is there */
+}
+
+/* for guarded.S, on the OS's gs: the block this thread's guest runs on. A thread
+ * that enters a guest without having been prepared is made one here, since the
+ * swap back to the OS's gs is told by the block's magic, and a thread left on a
+ * block that has none would run host code on it. */
+MB_HIDDEN uintptr_t mb_gs_block_c(void) { make_thread_block(); return (uintptr_t)g_tib; }
+
 void mb_prepare_thread(void) {
 	init_interop_area();
 #ifdef __APPLE__
-	if (g_tib[0] != MB_GS_MAGIC) {
-		g_tib[0] = MB_GS_MAGIC;
-		g_tib[MB_TIB_SELF] = (uintptr_t)g_tib;
-		g_tib[MB_TIB_HOST_GS] = os_gs_base();
-		if (g_tib[MB_TIB_HOST_GS] == 0) {
-			fprintf(stderr, "miniBox: cannot find this thread's gs base\n");
-			abort();
-		}
-	}
+	make_thread_block();
 #elif !defined(_WIN32)
 	uintptr_t gs = 0;
 	if (syscall(SYS_arch_prctl, 0x1004 /*ARCH_GET_GS*/, &gs) == 0 && gs == 0) {

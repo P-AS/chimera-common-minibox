@@ -288,8 +288,12 @@ mb_guarded_escape_now:
 mb_guarded_escape:
 #ifdef __APPLE__
 	/* the undo below writes the thread's block through gs, whichever side
-	 * of the boundary was running when the guest died */
+	 * of the boundary was running when the guest died. The bounds it copies
+	 * back are in the 24 bytes just below this stack pointer, where a call
+	 * would put its return address, so the call is made further down */
+	leaq -256(%rsp), %rsp
 	callq mb_gs_to_guest
+	leaq 256(%rsp), %rsp
 #endif
 	movq FRAME_CTX(%rsp), %r10
 	/* the stack bounds the blob pushed on its way in, just below the return
