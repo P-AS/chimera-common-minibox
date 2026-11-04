@@ -56,9 +56,15 @@ static uintptr_t gs_context_slot(void) {
 #ifdef _WIN32
 	return (uintptr_t)__readgsqword(0x18);   /* the TEB's SubSystemTib */
 #else
+#ifdef __APPLE__
+	/* the thread's gs is the guest's block only while it runs a guest, and
+	 * says so itself (mb_gs_in_guest); the OS's own is not ours to read */
+	return mb_gs_in_guest() ? mb_gs_context_now() : 0;
+#else
 	uintptr_t base = 0;
 	if (syscall(SYS_arch_prctl, 0x1004 /* ARCH_GET_GS */, &base) != 0 || base == 0) return 0;
 	return *(volatile const uintptr_t *)(base + 0x18);
+#endif
 #endif
 }
 
@@ -581,6 +587,23 @@ bool mb_page_readable(uintptr_t p) {
 	close(fd);
 	return found && readable;
 }
+#elif defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+/* The kernel's own answer, one Mach trap, no allocation: the region at or
+ * after the address, and the address counts when the region starts at or
+ * before it and may be read. */
+bool mb_page_readable(uintptr_t p) {
+	mach_vm_address_t addr = p;
+	mach_vm_size_t size = 0;
+	vm_region_basic_info_data_64_t info;
+	mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+	mach_port_t object = MACH_PORT_NULL;
+	if (mach_vm_region(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64,
+	                   (vm_region_info_t)&info, &count, &object) != KERN_SUCCESS)
+		return false;
+	return addr <= p && (info.protection & VM_PROT_READ) != 0;
+}
 #else
 bool mb_page_readable(uintptr_t p) { (void)p; return true; }
 #endif
@@ -621,11 +644,66 @@ void mb_tripguard_say_guest_stack(uintptr_t rsp) { say_guest_stack(rsp); }
 #ifndef _WIN32
 /* ---- Linux: SIGSEGV via sigaction, chaining to the previous handler ---- */
 #include <signal.h>
+#ifdef __APPLE__
+#include <sys/ucontext.h>
+#include <stdint.h>
+typedef uint64_t greg_t;
+/* The registers of a signal's ucontext, named as `uc->uc_mcontext MB_GREG_RIP`
+ * reads on both systems (Linux: gregs[REG_RIP]; macOS: the mcontext64 behind
+ * a pointer). REG_ERR is the page-fault error code: bit 1 is a write. */
+#define MB_GREG_RIP ->__ss.__rip
+#define MB_GREG_RSP ->__ss.__rsp
+#define MB_GREG_RBP ->__ss.__rbp
+#define MB_GREG_RAX ->__ss.__rax
+#define MB_GREG_RBX ->__ss.__rbx
+#define MB_GREG_RCX ->__ss.__rcx
+#define MB_GREG_RDX ->__ss.__rdx
+#define MB_GREG_RSI ->__ss.__rsi
+#define MB_GREG_RDI ->__ss.__rdi
+#define MB_GREG_R8  ->__ss.__r8
+#define MB_GREG_R9  ->__ss.__r9
+#define MB_GREG_R10 ->__ss.__r10
+#define MB_GREG_R11 ->__ss.__r11
+#define MB_GREG_R12 ->__ss.__r12
+#define MB_GREG_R13 ->__ss.__r13
+#define MB_GREG_R14 ->__ss.__r14
+#define MB_GREG_R15 ->__ss.__r15
+#define MB_GREG_ERR ->__es.__err
+#else
 #include <ucontext.h>
+#define MB_GREG_RIP .gregs[REG_RIP]
+#define MB_GREG_RSP .gregs[REG_RSP]
+#define MB_GREG_RBP .gregs[REG_RBP]
+#define MB_GREG_RAX .gregs[REG_RAX]
+#define MB_GREG_RBX .gregs[REG_RBX]
+#define MB_GREG_RCX .gregs[REG_RCX]
+#define MB_GREG_RDX .gregs[REG_RDX]
+#define MB_GREG_RSI .gregs[REG_RSI]
+#define MB_GREG_RDI .gregs[REG_RDI]
+#define MB_GREG_R8  .gregs[REG_R8]
+#define MB_GREG_R9  .gregs[REG_R9]
+#define MB_GREG_R10 .gregs[REG_R10]
+#define MB_GREG_R11 .gregs[REG_R11]
+#define MB_GREG_R12 .gregs[REG_R12]
+#define MB_GREG_R13 .gregs[REG_R13]
+#define MB_GREG_R14 .gregs[REG_R14]
+#define MB_GREG_R15 .gregs[REG_R15]
+#define MB_GREG_ERR .gregs[REG_ERR]
+#endif
 #include <sys/mman.h>
-static struct sigaction g_old_sa;
+static struct sigaction g_old_segv;
+static struct sigaction g_old_bus;   /* macOS: a protection fault is SIGBUS */
+#define g_old_sa (*(sig == SIGBUS ? &g_old_bus : &g_old_segv))
 
 static void handler_inner(int sig, siginfo_t *info, void *ucontext);
+static void handler_body(int sig, siginfo_t *info, void *ucontext);
+static void handler_other_body(int sig, siginfo_t *info, void *ucontext);
+static void handler_stop_body(int sig, siginfo_t *info, void *ucontext);
+static void handler_foreign_body(int sig, siginfo_t *info, void *ucontext);
+static void handler(int sig, siginfo_t *info, void *ucontext);
+static void handler_other(int sig, siginfo_t *info, void *ucontext);
+static void handler_stop(int sig, siginfo_t *info, void *ucontext);
+static void handler_foreign(int sig, siginfo_t *info, void *ucontext);
 
 /* the signal mask the outermost fault on this thread arrived with */
 static __thread sigset_t g_entry_mask;
@@ -657,7 +735,7 @@ static void leave_every_handler_frame(ucontext_t *uc) {
  * No stack protector on this frame: that check itself reads %fs:0x28, which is
  * precisely what is not yet safe here. */
 __attribute__((no_stack_protector))
-static void handler(int sig, siginfo_t *info, void *ucontext) {
+static void handler_body(int sig, siginfo_t *info, void *ucontext) {
 #ifdef MB_HAVE_FSBASE
 	/* Only a fault in guest code, which the rip says and %fs does not: a
 	 * frontend has many threads faulting for their own reasons, and one of
@@ -668,7 +746,7 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
 	 * (mb_fs_swap): on a host without them this whole block is skipped. */
 	const bool guest_rip = mb_fs_swap && mb_guest_ctx
 	                       && rip_in_guest((uintptr_t)((ucontext_t *)ucontext)
-	                                       ->uc_mcontext.gregs[REG_RIP]);
+	                                       ->uc_mcontext MB_GREG_RIP);
 	/* ...or by the pointer itself, as handler_foreign asks it: code outside
 	 * the guest's memory that runs on the guest's %fs - the interop blob's
 	 * first push onto a held stack page, a guest's call to a null or wild
@@ -682,7 +760,7 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
 	const uintptr_t fs_at_fault = guest_rip ? tp_now : 0;
 	if ((guest_rip || guest_tp) && mb_guest_ctx->host_fs) mb_wrfsbase(mb_guest_ctx->host_fs);
 	const uintptr_t fault = (uintptr_t)info->si_addr;
-	const uintptr_t rip = (uintptr_t)((ucontext_t *)ucontext)->uc_mcontext.gregs[REG_RIP];
+	const uintptr_t rip = (uintptr_t)((ucontext_t *)ucontext)->uc_mcontext MB_GREG_RIP;
 	/* A %fs access with the base already lost is the repair, not a fault to
 	 * handle: reinstall and resume the instruction, exactly as the Windows
 	 * path does. Three facts have to hold together: the base is neither the
@@ -727,7 +805,7 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
 		return;
 	}
 	handler_inner(sig, info, ucontext);
-	if ((uintptr_t)((ucontext_t *)ucontext)->uc_mcontext.gregs[REG_RIP] == (uintptr_t)&mb_guarded_escape) {
+	if ((uintptr_t)((ucontext_t *)ucontext)->uc_mcontext MB_GREG_RIP == (uintptr_t)&mb_guarded_escape) {
 		/* a death: the escape puts the host's base back itself */
 		leave_every_handler_frame((ucontext_t *)ucontext);
 		return;
@@ -741,7 +819,7 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
 	else if (guest_tp) mb_wrfsbase(tp_now);
 #else
 	handler_inner(sig, info, ucontext);
-	if ((uintptr_t)((ucontext_t *)ucontext)->uc_mcontext.gregs[REG_RIP] == (uintptr_t)&mb_guarded_escape)
+	if ((uintptr_t)((ucontext_t *)ucontext)->uc_mcontext MB_GREG_RIP == (uintptr_t)&mb_guarded_escape)
 		leave_every_handler_frame((ucontext_t *)ucontext);
 #endif
 }
@@ -879,7 +957,7 @@ static bool send_to_guest(ucontext_t *uc, uintptr_t addr, bool write, bool from_
 	if (declined == addr) return false;
 	if (!g_guest_fault || !guest_protected(addr, write)) return false;
 	const mb_guest_fault_fn fn = from_host_code && g_guest_fault_entered ? g_guest_fault_entered : g_guest_fault;
-	const uintptr_t sp = (uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
+	const uintptr_t sp = (uintptr_t)uc->uc_mcontext MB_GREG_RSP;
 	const uintptr_t top = sp - 128;
 	/* A guest stack must have room for the trampoline's frame, in pages the
 	 * guest may write: a fault on its own guard page (a stack that ran out)
@@ -890,41 +968,41 @@ static bool send_to_guest(ucontext_t *uc, uintptr_t addr, bool write, bool from_
 			if (!guest_writable(a)) return false;
 	}
 	tib[MB_TIB_FAULT_FN] = (uintptr_t)fn;
-	tib[MB_TIB_FAULT_RIP] = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
-	tib[MB_TIB_FAULT_RDI] = (uintptr_t)uc->uc_mcontext.gregs[REG_RDI];
-	tib[MB_TIB_FAULT_RSI] = (uintptr_t)uc->uc_mcontext.gregs[REG_RSI];
-	uc->uc_mcontext.gregs[REG_RSP] = (greg_t)top;
-	uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)(from_host_code ? &mb_fault_tramp_host : &mb_fault_tramp_guest);
-	uc->uc_mcontext.gregs[REG_RDI] = (greg_t)addr;
-	uc->uc_mcontext.gregs[REG_RSI] = (greg_t)(write ? 1 : 0);
+	tib[MB_TIB_FAULT_RIP] = (uintptr_t)uc->uc_mcontext MB_GREG_RIP;
+	tib[MB_TIB_FAULT_RDI] = (uintptr_t)uc->uc_mcontext MB_GREG_RDI;
+	tib[MB_TIB_FAULT_RSI] = (uintptr_t)uc->uc_mcontext MB_GREG_RSI;
+	uc->uc_mcontext MB_GREG_RSP = (greg_t)top;
+	uc->uc_mcontext MB_GREG_RIP = (greg_t)(uintptr_t)(from_host_code ? &mb_fault_tramp_host : &mb_fault_tramp_guest);
+	uc->uc_mcontext MB_GREG_RDI = (greg_t)addr;
+	uc->uc_mcontext MB_GREG_RSI = (greg_t)(write ? 1 : 0);
 	return true;
 }
 
 static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 	uintptr_t fault = (uintptr_t)info->si_addr;
 	ucontext_t *uc = (ucontext_t *)ucontext;
-	bool write = (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0;
+	bool write = (uc->uc_mcontext MB_GREG_ERR & 2) != 0;
 	/* Nested in the handler: served only in the guest's own handler, whose
 	 * faults are guest faults (ask_guest opened the signal for exactly that),
 	 * and only so deep. Any other phase cannot get here with the signal
 	 * blocked, and is said all the same in case it ever does. */
 	if (g_fault_depth > 0 && (g_fault_phase != MB_PHASE_GUEST || g_fault_depth >= MB_FAULT_DEPTH_MOST)) {
-		sigsafe_report_nested(fault, (uintptr_t)uc->uc_mcontext.gregs[REG_RIP]);
+		sigsafe_report_nested(fault, (uintptr_t)uc->uc_mcontext MB_GREG_RIP);
 		signal(SIGSEGV, SIG_DFL);
 		return;  /* the instruction runs again and the default action takes it */
 	}
 	if (g_fault_depth == 0) {
 		g_outer_fault = fault;
-		g_outer_rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+		g_outer_rip = (uintptr_t)uc->uc_mcontext MB_GREG_RIP;
 		g_entry_mask = uc->uc_sigmask;
 	}
 	g_fault_depth++;
-	trail_add(fault, (uintptr_t)uc->uc_mcontext.gregs[REG_RIP],
-	          (uintptr_t)uc->uc_mcontext.gregs[REG_RSP], write ? 1 : 0);
+	trail_add(fault, (uintptr_t)uc->uc_mcontext MB_GREG_RIP,
+	          (uintptr_t)uc->uc_mcontext MB_GREG_RSP, write ? 1 : 0);
 	trail_stage(1);
 	bool tripped = write && trip(fault);
 	trail_stage(2);
-	bool asked = tripped ? false : send_to_guest(uc, fault, write, !rip_in_guest((uintptr_t)uc->uc_mcontext.gregs[REG_RIP]));
+	bool asked = tripped ? false : send_to_guest(uc, fault, write, !rip_in_guest((uintptr_t)uc->uc_mcontext MB_GREG_RIP));
 	trail_stage(3);
 	bool rethrow = !tripped && !asked;
 	if (rethrow) {
@@ -937,21 +1015,21 @@ static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 		 * end: it goes on to whoever had the signal before - a runtime turns such
 		 * faults into exceptions all day. Only a guest's own fault is one miniBox
 		 * can call unhandled (issue #82 read a handled exception as four crashes). */
-		const bool guest_code = code_in_guest((uintptr_t)uc->uc_mcontext.gregs[REG_RIP]);
+		const bool guest_code = code_in_guest((uintptr_t)uc->uc_mcontext MB_GREG_RIP);
 		const bool handler_follows = (g_old_sa.sa_flags & SA_SIGINFO)
 			|| (g_old_sa.sa_handler != SIG_DFL && g_old_sa.sa_handler != SIG_IGN);
 		mb_diag_banner(guest_code ? "unhandled fault" : "a fault in host code");
 		if (guest_code)
 			mb_diag("[tripguard] unhandled fault: addr=%p %s rip=%p, %s",
 			        (void *)fault, write ? "write" : "read/exec",
-			        (void *)uc->uc_mcontext.gregs[REG_RIP],
+			        (void *)uc->uc_mcontext MB_GREG_RIP,
 			        owner ? "inside a registered block" : "OUTSIDE every registered block");
 		else
 			mb_diag("[tripguard] fault in host code, passed on %s: addr=%p %s rip=%p, %s",
 			        handler_follows ? "to the handler that was there before (it may well be handled)"
 			                        : "to the default action (the process ends)",
 			        (void *)fault, write ? "write" : "read/exec",
-			        (void *)uc->uc_mcontext.gregs[REG_RIP],
+			        (void *)uc->uc_mcontext MB_GREG_RIP,
 			        owner ? "inside a registered block" : "outside every registered block");
 		if (owner) {
 			size_t pi = (fault - owner->addr.start) >> MB_PAGESHIFT;
@@ -960,17 +1038,17 @@ static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 		}
 		say_region(fault);
 		mb_diag(" [%d block(s) registered]\n", g_nblocks);
-		say_code_and_regs((const unsigned char *)uc->uc_mcontext.gregs[REG_RIP],
-		                  uc->uc_mcontext.gregs[REG_RSP], uc->uc_mcontext.gregs[REG_RBP],
-		                  uc->uc_mcontext.gregs[REG_RAX], uc->uc_mcontext.gregs[REG_RBX],
-		                  uc->uc_mcontext.gregs[REG_RCX], uc->uc_mcontext.gregs[REG_RDX],
-		                  uc->uc_mcontext.gregs[REG_RSI], uc->uc_mcontext.gregs[REG_RDI],
-		                  uc->uc_mcontext.gregs[REG_R8], uc->uc_mcontext.gregs[REG_R9],
-		                  uc->uc_mcontext.gregs[REG_R10], uc->uc_mcontext.gregs[REG_R11],
-		                  uc->uc_mcontext.gregs[REG_R12], uc->uc_mcontext.gregs[REG_R13],
-		                  uc->uc_mcontext.gregs[REG_R14], uc->uc_mcontext.gregs[REG_R15]);
-		if (guest_code) say_guest_stack((uintptr_t)uc->uc_mcontext.gregs[REG_RSP]);
-		const uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+		say_code_and_regs((const unsigned char *)uc->uc_mcontext MB_GREG_RIP,
+		                  uc->uc_mcontext MB_GREG_RSP, uc->uc_mcontext MB_GREG_RBP,
+		                  uc->uc_mcontext MB_GREG_RAX, uc->uc_mcontext MB_GREG_RBX,
+		                  uc->uc_mcontext MB_GREG_RCX, uc->uc_mcontext MB_GREG_RDX,
+		                  uc->uc_mcontext MB_GREG_RSI, uc->uc_mcontext MB_GREG_RDI,
+		                  uc->uc_mcontext MB_GREG_R8, uc->uc_mcontext MB_GREG_R9,
+		                  uc->uc_mcontext MB_GREG_R10, uc->uc_mcontext MB_GREG_R11,
+		                  uc->uc_mcontext MB_GREG_R12, uc->uc_mcontext MB_GREG_R13,
+		                  uc->uc_mcontext MB_GREG_R14, uc->uc_mcontext MB_GREG_R15);
+		if (guest_code) say_guest_stack((uintptr_t)uc->uc_mcontext MB_GREG_RSP);
+		const uintptr_t rip = (uintptr_t)uc->uc_mcontext MB_GREG_RIP;
 		if (guest_can_die_here(rip)) {
 			/* a hlt in user mode arrives as this fault: it is musl's a_crash(),
 			 * which its allocator runs on finding the heap corrupt */
@@ -987,8 +1065,8 @@ static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 				: mb_host_guest_death_in_handler(mb_guest_ctx,
 					"the core crashed: it %s address %p (at %p)", write ? "wrote to" : "read or ran", (void *)fault, (void *)rip);
 			if (escapable) {
-				uc->uc_mcontext.gregs[REG_RSP] = (greg_t)mb_guest_ctx->esc_rsp;
-				uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)&mb_guarded_escape;
+				uc->uc_mcontext MB_GREG_RSP = (greg_t)mb_guest_ctx->esc_rsp;
+				uc->uc_mcontext MB_GREG_RIP = (greg_t)(uintptr_t)&mb_guarded_escape;
 				rethrow = false;
 			}
 		}
@@ -1040,9 +1118,9 @@ void mb_tripguard_ensure_altstack(void) {
  * managed exception, say - goes to whoever had the signal before. */
 static struct sigaction g_old_ill, g_old_fpe;
 
-static void handler_other(int sig, siginfo_t *info, void *ucontext) {
+static void handler_other_body(int sig, siginfo_t *info, void *ucontext) {
 	ucontext_t *uc = (ucontext_t *)ucontext;
-	const uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+	const uintptr_t rip = (uintptr_t)uc->uc_mcontext MB_GREG_RIP;
 	if (guest_can_die_here(rip)) {
 #ifdef MB_HAVE_FSBASE
 		/* host C from here on, which needs the host's %fs */
@@ -1050,20 +1128,20 @@ static void handler_other(int sig, siginfo_t *info, void *ucontext) {
 #endif
 		mb_diag_banner(sig == SIGILL ? "the guest ran an illegal instruction" : "the guest divided by zero");
 		say_code_and_regs((const unsigned char *)rip,
-		                  uc->uc_mcontext.gregs[REG_RSP], uc->uc_mcontext.gregs[REG_RBP],
-		                  uc->uc_mcontext.gregs[REG_RAX], uc->uc_mcontext.gregs[REG_RBX],
-		                  uc->uc_mcontext.gregs[REG_RCX], uc->uc_mcontext.gregs[REG_RDX],
-		                  uc->uc_mcontext.gregs[REG_RSI], uc->uc_mcontext.gregs[REG_RDI],
-		                  uc->uc_mcontext.gregs[REG_R8], uc->uc_mcontext.gregs[REG_R9],
-		                  uc->uc_mcontext.gregs[REG_R10], uc->uc_mcontext.gregs[REG_R11],
-		                  uc->uc_mcontext.gregs[REG_R12], uc->uc_mcontext.gregs[REG_R13],
-		                  uc->uc_mcontext.gregs[REG_R14], uc->uc_mcontext.gregs[REG_R15]);
+		                  uc->uc_mcontext MB_GREG_RSP, uc->uc_mcontext MB_GREG_RBP,
+		                  uc->uc_mcontext MB_GREG_RAX, uc->uc_mcontext MB_GREG_RBX,
+		                  uc->uc_mcontext MB_GREG_RCX, uc->uc_mcontext MB_GREG_RDX,
+		                  uc->uc_mcontext MB_GREG_RSI, uc->uc_mcontext MB_GREG_RDI,
+		                  uc->uc_mcontext MB_GREG_R8, uc->uc_mcontext MB_GREG_R9,
+		                  uc->uc_mcontext MB_GREG_R10, uc->uc_mcontext MB_GREG_R11,
+		                  uc->uc_mcontext MB_GREG_R12, uc->uc_mcontext MB_GREG_R13,
+		                  uc->uc_mcontext MB_GREG_R14, uc->uc_mcontext MB_GREG_R15);
 		const bool escapable = sig == SIGILL
 			? mb_host_guest_death_in_handler(mb_guest_ctx, "the core ran an illegal instruction at %p", (void *)rip)
 			: mb_host_guest_death_in_handler(mb_guest_ctx, "the core divided by zero at %p", (void *)rip);
 		if (escapable) {
-				uc->uc_mcontext.gregs[REG_RSP] = (greg_t)mb_guest_ctx->esc_rsp;
-				uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)&mb_guarded_escape;
+				uc->uc_mcontext MB_GREG_RSP = (greg_t)mb_guest_ctx->esc_rsp;
+				uc->uc_mcontext MB_GREG_RIP = (greg_t)(uintptr_t)&mb_guarded_escape;
 				leave_every_handler_frame(uc);
 			return;
 		}
@@ -1084,9 +1162,9 @@ static struct sigaction g_old_stop;
 /* No stack protector on this frame either: the check reads %fs:0x28, and the
  * signal can come in while the guest's %fs is in. */
 __attribute__((no_stack_protector))
-static void handler_stop(int sig, siginfo_t *info, void *ucontext) {
+static void handler_stop_body(int sig, siginfo_t *info, void *ucontext) {
 	ucontext_t *uc = (ucontext_t *)ucontext;
-	const uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+	const uintptr_t rip = (uintptr_t)uc->uc_mcontext MB_GREG_RIP;
 #ifdef MB_HAVE_FSBASE
 	/* The stop usually comes in while the thread runs guest code, and with a
 	 * guest that keeps its own %fs (fs_swap: xemu's does) the guest's thread
@@ -1116,8 +1194,8 @@ static void handler_stop(int sig, siginfo_t *info, void *ucontext) {
 #endif
 		mb_guest_ctx->stop_pending = 0;
 		mb_host_guest_death_in_handler(mb_guest_ctx, "%s", mb_host_stop_reason(mb_guest_ctx));
-		uc->uc_mcontext.gregs[REG_RSP] = (greg_t)mb_guest_ctx->esc_rsp;
-		uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)&mb_guarded_escape;
+		uc->uc_mcontext MB_GREG_RSP = (greg_t)mb_guest_ctx->esc_rsp;
+		uc->uc_mcontext MB_GREG_RIP = (greg_t)(uintptr_t)&mb_guarded_escape;
 		leave_every_handler_frame(uc);
 		return;
 	}
@@ -1179,7 +1257,7 @@ void mb_tripguard_stop_signal_install(void) {
 static struct sigaction g_foreign[NSIG];
 
 __attribute__((no_stack_protector))
-static void handler_foreign(int sig, siginfo_t *info, void *ucontext) {
+static void handler_foreign_body(int sig, siginfo_t *info, void *ucontext) {
 	const struct sigaction *old = &g_foreign[sig];
 	/* No %fs instruction unless the probe said they exist (mb_fs_swap), as in
 	 * handler() above. Where the OS keeps rdfsbase from userspace it is an
@@ -1194,13 +1272,49 @@ static void handler_foreign(int sig, siginfo_t *info, void *ucontext) {
 	 * holds one of the guest's pointers (a transition, between the swap and
 	 * the jump) - and is not the host's own */
 	const bool guest_tp = swaps && c && c->host_fs && tp != c->host_fs
-		&& (rip_in_guest((uintptr_t)((ucontext_t *)ucontext)->uc_mcontext.gregs[REG_RIP])
+		&& (rip_in_guest((uintptr_t)((ucontext_t *)ucontext)->uc_mcontext MB_GREG_RIP)
 		    || tp == c->thread_area || (mb_early_tp && tp == mb_early_tp));
 	if (guest_tp) mb_wrfsbase(c->host_fs);
 	if (old->sa_flags & SA_SIGINFO) old->sa_sigaction(sig, info, ucontext);
 	else if (old->sa_handler != SIG_DFL && old->sa_handler != SIG_IGN) old->sa_handler(sig);
 	if (guest_tp) mb_wrfsbase(tp);
 }
+
+
+/* ---- the handlers' gs (macOS) -------------------------------------------
+ *
+ * A signal can arrive at any instruction, on a thread whose gs base is the
+ * guest's block (minibox_internal.h). The body of every handler is host C -
+ * libc, errno, thread locals - so it must run on the OS's gs; the wrapper
+ * puts it there first and, when the handler returns, decides which gs the
+ * interrupted code resumes with from where the handler pointed it:
+ *   - to the escape (a guest that died): the OS's, the escape swaps itself;
+ *   - to a fault trampoline: the guest block, which the trampoline reads its
+ *     arguments from (the host one swaps back to the OS's after);
+ *   - anywhere else: what it was when the signal arrived.
+ * No stack protector and no calls before the swap: this is the first
+ * instruction that may run on the wrong gs. */
+#ifdef __APPLE__
+#define MB_GS_WRAP(name) \
+__attribute__((no_stack_protector)) \
+static void name(int sig, siginfo_t *info, void *ucontext) { \
+	uintptr_t block = 0; \
+	if (mb_gs_in_guest()) { block = mb_gs_block_now(); mb_gs_set(mb_gs_host_now()); } \
+	name##_body(sig, info, ucontext); \
+	const uintptr_t rip = (uintptr_t)((ucontext_t *)ucontext)->uc_mcontext MB_GREG_RIP; \
+	if (rip == (uintptr_t)&mb_guarded_escape) return; \
+	if (rip == (uintptr_t)&mb_fault_tramp_guest || rip == (uintptr_t)&mb_fault_tramp_host) \
+		block = (uintptr_t)mb_thread_block(); \
+	if (block) mb_gs_set(block); \
+}
+#else
+#define MB_GS_WRAP(name) \
+static void name(int sig, siginfo_t *info, void *ucontext) { name##_body(sig, info, ucontext); }
+#endif
+MB_GS_WRAP(handler)
+MB_GS_WRAP(handler_other)
+MB_GS_WRAP(handler_stop)
+MB_GS_WRAP(handler_foreign)
 
 static void wrap_foreign_handlers(void) {
 	for (int sig = 1; sig < NSIG; sig++) {
@@ -1230,7 +1344,10 @@ static void initialize(void) {
 	sa.sa_sigaction = handler;
 	sa.sa_flags = SA_ONSTACK | SA_SIGINFO;
 	sigfillset(&sa.sa_mask);
-	if (sigaction(SIGSEGV, &sa, &g_old_sa) != 0) { perror("miniBox sigaction"); abort(); }
+	if (sigaction(SIGSEGV, &sa, &g_old_segv) != 0) { perror("miniBox sigaction"); abort(); }
+#ifdef __APPLE__
+	if (sigaction(SIGBUS, &sa, &g_old_bus) != 0) { perror("miniBox sigaction"); abort(); }
+#endif
 	struct sigaction other;
 	memset(&other, 0, sizeof(other));
 	other.sa_sigaction = handler_other;

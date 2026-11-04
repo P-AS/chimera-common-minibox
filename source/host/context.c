@@ -13,7 +13,9 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <stddef.h>
+#ifndef __APPLE__
 #include <sys/auxv.h>
+#endif
 #else
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -80,9 +82,45 @@ uintptr_t *mb_thread_block(void) { return g_tib; }
 #endif
 
 
+#ifdef __APPLE__
+/* for guarded.S: this thread's block, made at mb_prepare_thread (OS gs only) */
+MB_HIDDEN uintptr_t mb_gs_block_c(void) { return (uintptr_t)g_tib; }
+#include <pthread.h>
+/* This thread's gs base as the OS has it: &pthread_self()->tsd[0]. Nothing
+ * reads it directly, so it is found the way it is laid out - a pthread key's
+ * slot is base + 8 * key, and a value stored under a key is found in the
+ * thread's struct (the pthread_t sits at gs:0, 224 bytes before the base on
+ * macOS 27, but that is not relied on). */
+static pthread_key_t gs_key;
+static void make_gs_key(void) { pthread_key_create(&gs_key, NULL); }
+static uintptr_t os_gs_base(void) {
+	static pthread_once_t once = PTHREAD_ONCE_INIT;
+	pthread_once(&once, make_gs_key);
+	const pthread_key_t key = gs_key;
+	const uintptr_t magic = 0x6d625f6773626173ull;
+	pthread_setspecific(key, (void *)magic);
+	const uintptr_t *p = (const uintptr_t *)pthread_self();
+	uintptr_t base = 0;
+	for (int i = 0; i < 4096 && base == 0; i++)
+		if (p[i] == magic) base = (uintptr_t)&p[i] - (uintptr_t)key * 8;
+	pthread_setspecific(key, NULL);
+	return base;
+}
+#endif
+
 void mb_prepare_thread(void) {
 	init_interop_area();
-#ifndef _WIN32
+#ifdef __APPLE__
+	if (g_tib[0] != MB_GS_MAGIC) {
+		g_tib[0] = MB_GS_MAGIC;
+		g_tib[MB_TIB_SELF] = (uintptr_t)g_tib;
+		g_tib[MB_TIB_HOST_GS] = os_gs_base();
+		if (g_tib[MB_TIB_HOST_GS] == 0) {
+			fprintf(stderr, "miniBox: cannot find this thread's gs base\n");
+			abort();
+		}
+	}
+#elif !defined(_WIN32)
 	uintptr_t gs = 0;
 	if (syscall(SYS_arch_prctl, 0x1004 /*ARCH_GET_GS*/, &gs) == 0 && gs == 0) {
 		syscall(SYS_arch_prctl, 0x1001 /*ARCH_SET_GS*/, (uintptr_t)&g_tib[0]);
@@ -168,8 +206,14 @@ bool mb_fsbase_ok(void) {
 bool mb_fsbase_ok(void) {
 	static int cached = -1;
 	if (cached >= 0) return cached != 0;
+#ifdef __APPLE__
+	/* macOS gives userspace no rdfsbase/wrfsbase (they are SIGILL, Rosetta
+	 * included), so a guest with %fs-direct TLS cannot be hosted here. */
+	cached = 0;
+#else
 	cached = (getauxval(AT_HWCAP2) & HWCAP2_FSGSBASE) != 0;
 	if (!cached && getenv("MB_FORCE_FS_SWAP")) cached = 1;  /* testing only */
+#endif
 	if (getenv("MB_NO_FSGSBASE")) cached = 0;   /* testing only: probe off */
 	mb_fs_swap = cached != 0;
 	return cached != 0;
@@ -205,6 +249,14 @@ static uintptr_t call_guest_simple_fs(uintptr_t entry, mb_context *c) {
 	/* the context the fault handlers judge a fault against is the one running
 	 * now - for every guest, as the entry thunks set it */
 	mb_guest_ctx = c;
+#ifdef __APPLE__
+	/* the guest runs on its own gs (minibox_internal.h): in for the call,
+	 * and the OS's back before any host code */
+	mb_gs_to_guest();
+	const uintptr_t gs_result = f(entry, c);
+	mb_gs_to_host();
+	return gs_result;
+#endif
 #ifdef MB_HAVE_FSBASE
 	/* Guest code may use %fs-direct TLS (Rust does); give it its own thread
 	 * pointer and put the host's %fs back afterwards. On the very first entry
@@ -378,6 +430,12 @@ uintptr_t mb_thunks_get_extcall(mb_thunks *t, uintptr_t cb, mb_context *c) {
 	const bool swap_fs = mb_fs_swap && c->fs_swap;
 	emit8(&p, 0x49); emit8(&p, 0xba); emit64(&p, (uintptr_t)c);        /* mov r10, ctx */
 	emit8(&p, 0x41); emit8(&p, 0x52);                                  /* push r10 */
+#ifdef __APPLE__
+	/* the callback runs on the OS's gs (minibox_internal.h); mb_gs_to_host
+	 * keeps every register, the arguments among them */
+	emit8(&p, 0x49); emit8(&p, 0xbb); emit64(&p, (uintptr_t)&mb_gs_to_host); /* mov r11, mb_gs_to_host */
+	emit8(&p, 0x41); emit8(&p, 0xff); emit8(&p, 0xd3);                 /* call r11 */
+#endif
 	emit8(&p, 0x41); emit8(&p, 0xd9); emit8(&p, 0xba); emit32(&p, guest_fcw);   /* fnstcw [r10+guest_fcw] */
 	emit8(&p, 0x41); emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0x9a); emit32(&p, guest_mxcsr); /* stmxcsr [r10+guest_mxcsr] */
 	emit8(&p, 0x41); emit8(&p, 0xd9); emit8(&p, 0xaa); emit32(&p, host_fcw);    /* fldcw [r10+host_fcw] */
@@ -397,7 +455,15 @@ uintptr_t mb_thunks_get_extcall(mb_thunks *t, uintptr_t cb, mb_context *c) {
 		emit8(&p, 0x49); emit8(&p, 0x8b); emit8(&p, 0x02);             /* mov rax, [r10] (thread_area, live) */
 		emit8(&p, 0xf3); emit8(&p, 0x48); emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0xd0); /* wrfsbase rax */
 	}
+#ifdef __APPLE__
+	/* back on the guest's gs, with the callback's result (r11) kept */
+	emit8(&p, 0x41); emit8(&p, 0x53);                                  /* push r11: the result, across the call */
+	emit8(&p, 0x49); emit8(&p, 0xbb); emit64(&p, (uintptr_t)&mb_gs_to_guest); /* mov r11, mb_gs_to_guest */
+	emit8(&p, 0x41); emit8(&p, 0xff); emit8(&p, 0xd3);                 /* call r11 */
+	emit8(&p, 0x58);                                                   /* pop rax */
+#else
 	emit8(&p, 0x4c); emit8(&p, 0x89); emit8(&p, 0xd8);                 /* mov rax, r11 */
+#endif
 	emit8(&p, 0xc3);                                                   /* ret */
 	if ((size_t)(p - (uint8_t *)addr) > THUNK_SIZE) abort();           /* the size was checked above for THUNK_SIZE */
 	t->ext_entries[t->ext_count] = cb;
