@@ -104,7 +104,6 @@ static uintptr_t os_gs_base(void) {
 	pthread_setspecific(key, NULL);
 	return base;
 }
-#endif
 
 /* This thread's block, made if it has not been. */
 static void make_thread_block(void) {
@@ -123,6 +122,7 @@ static void make_thread_block(void) {
  * swap back to the OS's gs is told by the block's magic, and a thread left on a
  * block that has none would run host code on it. */
 MB_HIDDEN uintptr_t mb_gs_block_c(void) { make_thread_block(); return (uintptr_t)g_tib; }
+#endif
 
 void mb_prepare_thread(void) {
 	init_interop_area();
